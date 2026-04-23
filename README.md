@@ -32,7 +32,7 @@ A production-quality distributed key-value store written in Go from scratch.
 | 2 | Consistent hash ring + gRPC request forwarding | ✅ Done |
 | 3 | Write replication to R=2 replicas via gRPC | ✅ Done |
 | 4 | Raft leader election + heartbeats | ✅ Done |
-| 5 | Docker Compose cluster + demo script | 🔜 In progress |
+| 5 | Docker Compose cluster + demo script | ✅ Done |
 
 ---
 

@@ -203,6 +203,13 @@ func (h *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	snap := h.metrics.Snapshot()
 	snap["key_count"] = uint64(h.store.KeyCount())
 	snap["raft_term"] = h.raft.CurrentTerm()
+
+	puts, gets, dels, walWrites := h.store.Counts()
+	snap["put_total"] = puts
+	snap["get_total"] = gets
+	snap["delete_total"] = dels
+	snap["wal_writes"] = walWrites
+
 	writeJSON(w, snap)
 }
 

@@ -1,6 +1,6 @@
 module github.com/ryderpongracic1/distrikv
 
-go 1.26.2
+go 1.25.0
 
 require (
 	github.com/stretchr/testify v1.9.0

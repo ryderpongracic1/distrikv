@@ -1,5 +1,9 @@
 # Build output
 distrikv
+bin/
+
+# CLI config file (user-local settings)
+.distrikv.yaml
 
 # Test artifacts
 /tmp/

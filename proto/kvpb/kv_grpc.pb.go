@@ -19,10 +19,12 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	KVService_ForwardKey_FullMethodName    = "/kv.KVService/ForwardKey"
-	KVService_Replicate_FullMethodName     = "/kv.KVService/Replicate"
-	KVService_RequestVote_FullMethodName   = "/kv.KVService/RequestVote"
-	KVService_AppendEntries_FullMethodName = "/kv.KVService/AppendEntries"
+	KVService_ForwardKey_FullMethodName      = "/kv.KVService/ForwardKey"
+	KVService_Replicate_FullMethodName       = "/kv.KVService/Replicate"
+	KVService_RequestVote_FullMethodName     = "/kv.KVService/RequestVote"
+	KVService_AppendEntries_FullMethodName   = "/kv.KVService/AppendEntries"
+	KVService_PreVote_FullMethodName         = "/kv.KVService/PreVote"
+	KVService_InstallSnapshot_FullMethodName = "/kv.KVService/InstallSnapshot"
 )
 
 // KVServiceClient is the client API for KVService service.
@@ -43,6 +45,13 @@ type KVServiceClient interface {
 	// AppendEntries serves as both the Raft heartbeat and the log-replication
 	// RPC (§5.3). An empty Entries slice is a pure heartbeat.
 	AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error)
+	// PreVote is a dry-run election (Raft dissertation §9.6). The candidate
+	// solicits pre-votes without incrementing its term to avoid disrupting the
+	// cluster when a partitioned node reconnects.
+	PreVote(ctx context.Context, in *PreVoteRequest, opts ...grpc.CallOption) (*PreVoteResponse, error)
+	// InstallSnapshot sends a full state-machine snapshot to a follower that
+	// has fallen too far behind the leader's log (Raft §7).
+	InstallSnapshot(ctx context.Context, in *InstallSnapshotRequest, opts ...grpc.CallOption) (*InstallSnapshotResponse, error)
 }
 
 type kVServiceClient struct {
@@ -93,6 +102,26 @@ func (c *kVServiceClient) AppendEntries(ctx context.Context, in *AppendEntriesRe
 	return out, nil
 }
 
+func (c *kVServiceClient) PreVote(ctx context.Context, in *PreVoteRequest, opts ...grpc.CallOption) (*PreVoteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PreVoteResponse)
+	err := c.cc.Invoke(ctx, KVService_PreVote_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kVServiceClient) InstallSnapshot(ctx context.Context, in *InstallSnapshotRequest, opts ...grpc.CallOption) (*InstallSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InstallSnapshotResponse)
+	err := c.cc.Invoke(ctx, KVService_InstallSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // KVServiceServer is the server API for KVService service.
 // All implementations must embed UnimplementedKVServiceServer
 // for forward compatibility.
@@ -111,6 +140,13 @@ type KVServiceServer interface {
 	// AppendEntries serves as both the Raft heartbeat and the log-replication
 	// RPC (§5.3). An empty Entries slice is a pure heartbeat.
 	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error)
+	// PreVote is a dry-run election (Raft dissertation §9.6). The candidate
+	// solicits pre-votes without incrementing its term to avoid disrupting the
+	// cluster when a partitioned node reconnects.
+	PreVote(context.Context, *PreVoteRequest) (*PreVoteResponse, error)
+	// InstallSnapshot sends a full state-machine snapshot to a follower that
+	// has fallen too far behind the leader's log (Raft §7).
+	InstallSnapshot(context.Context, *InstallSnapshotRequest) (*InstallSnapshotResponse, error)
 	mustEmbedUnimplementedKVServiceServer()
 }
 
@@ -132,6 +168,12 @@ func (UnimplementedKVServiceServer) RequestVote(context.Context, *RequestVoteReq
 }
 func (UnimplementedKVServiceServer) AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AppendEntries not implemented")
+}
+func (UnimplementedKVServiceServer) PreVote(context.Context, *PreVoteRequest) (*PreVoteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PreVote not implemented")
+}
+func (UnimplementedKVServiceServer) InstallSnapshot(context.Context, *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method InstallSnapshot not implemented")
 }
 func (UnimplementedKVServiceServer) mustEmbedUnimplementedKVServiceServer() {}
 func (UnimplementedKVServiceServer) testEmbeddedByValue()                   {}
@@ -226,6 +268,42 @@ func _KVService_AppendEntries_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KVService_PreVote_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PreVoteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).PreVote(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_PreVote_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).PreVote(ctx, req.(*PreVoteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KVService_InstallSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InstallSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).InstallSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVService_InstallSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).InstallSnapshot(ctx, req.(*InstallSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // KVService_ServiceDesc is the grpc.ServiceDesc for KVService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -248,6 +326,14 @@ var KVService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AppendEntries",
 			Handler:    _KVService_AppendEntries_Handler,
+		},
+		{
+			MethodName: "PreVote",
+			Handler:    _KVService_PreVote_Handler,
+		},
+		{
+			MethodName: "InstallSnapshot",
+			Handler:    _KVService_InstallSnapshot_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

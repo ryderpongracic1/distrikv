@@ -21,6 +21,15 @@ service KVService {
   // AppendEntries serves as both the Raft heartbeat and the log-replication
   // RPC (§5.3). An empty Entries slice is a pure heartbeat.
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+
+  // PreVote is a dry-run election (Raft dissertation §9.6). The candidate
+  // solicits pre-votes without incrementing its term to avoid disrupting the
+  // cluster when a partitioned node reconnects.
+  rpc PreVote(PreVoteRequest) returns (PreVoteResponse);
+
+  // InstallSnapshot sends a full state-machine snapshot to a follower that
+  // has fallen too far behind the leader's log (Raft §7).
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +93,39 @@ message AppendEntriesRequest {
 }
 
 message AppendEntriesResponse {
+  uint64 term    = 1;
+  bool   success = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Raft: PreVote (dry-run election, §9.6 of Raft dissertation)
+// ---------------------------------------------------------------------------
+
+message PreVoteRequest {
+  uint64 next_term      = 1; // currentTerm+1 — not yet committed
+  string candidate_id   = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term  = 4;
+}
+
+message PreVoteResponse {
+  uint64 term         = 1;
+  bool   vote_granted = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Raft: InstallSnapshot (§7)
+// ---------------------------------------------------------------------------
+
+message InstallSnapshotRequest {
+  uint64 term                = 1;
+  string leader_id           = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term  = 4;
+  bytes  data                = 5; // gob-encoded map[string][]byte
+}
+
+message InstallSnapshotResponse {
   uint64 term    = 1;
   bool   success = 2;
 }

@@ -509,6 +509,254 @@ func (x *AppendEntriesResponse) GetSuccess() bool {
 	return false
 }
 
+type PreVoteRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NextTerm      uint64                 `protobuf:"varint,1,opt,name=next_term,json=nextTerm,proto3" json:"next_term,omitempty"` // currentTerm+1 — not yet committed
+	CandidateId   string                 `protobuf:"bytes,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"`
+	LastLogIndex  uint64                 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastLogTerm   uint64                 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PreVoteRequest) Reset() {
+	*x = PreVoteRequest{}
+	mi := &file_kv_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PreVoteRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PreVoteRequest) ProtoMessage() {}
+
+func (x *PreVoteRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_kv_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PreVoteRequest.ProtoReflect.Descriptor instead.
+func (*PreVoteRequest) Descriptor() ([]byte, []int) {
+	return file_kv_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *PreVoteRequest) GetNextTerm() uint64 {
+	if x != nil {
+		return x.NextTerm
+	}
+	return 0
+}
+
+func (x *PreVoteRequest) GetCandidateId() string {
+	if x != nil {
+		return x.CandidateId
+	}
+	return ""
+}
+
+func (x *PreVoteRequest) GetLastLogIndex() uint64 {
+	if x != nil {
+		return x.LastLogIndex
+	}
+	return 0
+}
+
+func (x *PreVoteRequest) GetLastLogTerm() uint64 {
+	if x != nil {
+		return x.LastLogTerm
+	}
+	return 0
+}
+
+type PreVoteResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	VoteGranted   bool                   `protobuf:"varint,2,opt,name=vote_granted,json=voteGranted,proto3" json:"vote_granted,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PreVoteResponse) Reset() {
+	*x = PreVoteResponse{}
+	mi := &file_kv_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PreVoteResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PreVoteResponse) ProtoMessage() {}
+
+func (x *PreVoteResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_kv_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PreVoteResponse.ProtoReflect.Descriptor instead.
+func (*PreVoteResponse) Descriptor() ([]byte, []int) {
+	return file_kv_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *PreVoteResponse) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *PreVoteResponse) GetVoteGranted() bool {
+	if x != nil {
+		return x.VoteGranted
+	}
+	return false
+}
+
+type InstallSnapshotRequest struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Term              uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	LeaderId          string                 `protobuf:"bytes,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	LastIncludedIndex uint64                 `protobuf:"varint,3,opt,name=last_included_index,json=lastIncludedIndex,proto3" json:"last_included_index,omitempty"`
+	LastIncludedTerm  uint64                 `protobuf:"varint,4,opt,name=last_included_term,json=lastIncludedTerm,proto3" json:"last_included_term,omitempty"`
+	Data              []byte                 `protobuf:"bytes,5,opt,name=data,proto3" json:"data,omitempty"` // gob-encoded map[string][]byte
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *InstallSnapshotRequest) Reset() {
+	*x = InstallSnapshotRequest{}
+	mi := &file_kv_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstallSnapshotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstallSnapshotRequest) ProtoMessage() {}
+
+func (x *InstallSnapshotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_kv_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstallSnapshotRequest.ProtoReflect.Descriptor instead.
+func (*InstallSnapshotRequest) Descriptor() ([]byte, []int) {
+	return file_kv_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *InstallSnapshotRequest) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *InstallSnapshotRequest) GetLeaderId() string {
+	if x != nil {
+		return x.LeaderId
+	}
+	return ""
+}
+
+func (x *InstallSnapshotRequest) GetLastIncludedIndex() uint64 {
+	if x != nil {
+		return x.LastIncludedIndex
+	}
+	return 0
+}
+
+func (x *InstallSnapshotRequest) GetLastIncludedTerm() uint64 {
+	if x != nil {
+		return x.LastIncludedTerm
+	}
+	return 0
+}
+
+func (x *InstallSnapshotRequest) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+type InstallSnapshotResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	Success       bool                   `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InstallSnapshotResponse) Reset() {
+	*x = InstallSnapshotResponse{}
+	mi := &file_kv_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstallSnapshotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstallSnapshotResponse) ProtoMessage() {}
+
+func (x *InstallSnapshotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_kv_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstallSnapshotResponse.ProtoReflect.Descriptor instead.
+func (*InstallSnapshotResponse) Descriptor() ([]byte, []int) {
+	return file_kv_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *InstallSnapshotResponse) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *InstallSnapshotResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
 // LogEntry is a single record in the Raft log.
 type LogEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -523,7 +771,7 @@ type LogEntry struct {
 
 func (x *LogEntry) Reset() {
 	*x = LogEntry{}
-	mi := &file_kv_proto_msgTypes[8]
+	mi := &file_kv_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -535,7 +783,7 @@ func (x *LogEntry) String() string {
 func (*LogEntry) ProtoMessage() {}
 
 func (x *LogEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_kv_proto_msgTypes[8]
+	mi := &file_kv_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -548,7 +796,7 @@ func (x *LogEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogEntry.ProtoReflect.Descriptor instead.
 func (*LogEntry) Descriptor() ([]byte, []int) {
-	return file_kv_proto_rawDescGZIP(), []int{8}
+	return file_kv_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *LogEntry) GetIndex() uint64 {
@@ -624,19 +872,38 @@ const file_kv_proto_rawDesc = "" +
 	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\"E\n" +
 	"\x15AppendEntriesResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"\x9a\x01\n" +
+	"\x0ePreVoteRequest\x12\x1b\n" +
+	"\tnext_term\x18\x01 \x01(\x04R\bnextTerm\x12!\n" +
+	"\fcandidate_id\x18\x02 \x01(\tR\vcandidateId\x12$\n" +
+	"\x0elast_log_index\x18\x03 \x01(\x04R\flastLogIndex\x12\"\n" +
+	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\"H\n" +
+	"\x0fPreVoteResponse\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
+	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"\xbb\x01\n" +
+	"\x16InstallSnapshotRequest\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1b\n" +
+	"\tleader_id\x18\x02 \x01(\tR\bleaderId\x12.\n" +
+	"\x13last_included_index\x18\x03 \x01(\x04R\x11lastIncludedIndex\x12,\n" +
+	"\x12last_included_term\x18\x04 \x01(\x04R\x10lastIncludedTerm\x12\x12\n" +
+	"\x04data\x18\x05 \x01(\fR\x04data\"G\n" +
+	"\x17InstallSnapshotResponse\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
 	"\asuccess\x18\x02 \x01(\bR\asuccess\"l\n" +
 	"\bLogEntry\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\x04R\x05index\x12\x12\n" +
 	"\x04term\x18\x02 \x01(\x04R\x04term\x12\x0e\n" +
 	"\x02op\x18\x03 \x01(\tR\x02op\x12\x10\n" +
 	"\x03key\x18\x04 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x05 \x01(\fR\x05value2\x88\x02\n" +
+	"\x05value\x18\x05 \x01(\fR\x05value2\x88\x03\n" +
 	"\tKVService\x12;\n" +
 	"\n" +
 	"ForwardKey\x12\x15.kv.ForwardKeyRequest\x1a\x16.kv.ForwardKeyResponse\x128\n" +
 	"\tReplicate\x12\x14.kv.ReplicateRequest\x1a\x15.kv.ReplicateResponse\x12>\n" +
 	"\vRequestVote\x12\x16.kv.RequestVoteRequest\x1a\x17.kv.RequestVoteResponse\x12D\n" +
-	"\rAppendEntries\x12\x18.kv.AppendEntriesRequest\x1a\x19.kv.AppendEntriesResponseB0Z.github.com/ryderpongracic1/distrikv/proto/kvpbb\x06proto3"
+	"\rAppendEntries\x12\x18.kv.AppendEntriesRequest\x1a\x19.kv.AppendEntriesResponse\x122\n" +
+	"\aPreVote\x12\x12.kv.PreVoteRequest\x1a\x13.kv.PreVoteResponse\x12J\n" +
+	"\x0fInstallSnapshot\x12\x1a.kv.InstallSnapshotRequest\x1a\x1b.kv.InstallSnapshotResponseB0Z.github.com/ryderpongracic1/distrikv/proto/kvpbb\x06proto3"
 
 var (
 	file_kv_proto_rawDescOnce sync.Once
@@ -650,33 +917,41 @@ func file_kv_proto_rawDescGZIP() []byte {
 	return file_kv_proto_rawDescData
 }
 
-var file_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_kv_proto_goTypes = []any{
-	(*ForwardKeyRequest)(nil),     // 0: kv.ForwardKeyRequest
-	(*ForwardKeyResponse)(nil),    // 1: kv.ForwardKeyResponse
-	(*ReplicateRequest)(nil),      // 2: kv.ReplicateRequest
-	(*ReplicateResponse)(nil),     // 3: kv.ReplicateResponse
-	(*RequestVoteRequest)(nil),    // 4: kv.RequestVoteRequest
-	(*RequestVoteResponse)(nil),   // 5: kv.RequestVoteResponse
-	(*AppendEntriesRequest)(nil),  // 6: kv.AppendEntriesRequest
-	(*AppendEntriesResponse)(nil), // 7: kv.AppendEntriesResponse
-	(*LogEntry)(nil),              // 8: kv.LogEntry
+	(*ForwardKeyRequest)(nil),       // 0: kv.ForwardKeyRequest
+	(*ForwardKeyResponse)(nil),      // 1: kv.ForwardKeyResponse
+	(*ReplicateRequest)(nil),        // 2: kv.ReplicateRequest
+	(*ReplicateResponse)(nil),       // 3: kv.ReplicateResponse
+	(*RequestVoteRequest)(nil),      // 4: kv.RequestVoteRequest
+	(*RequestVoteResponse)(nil),     // 5: kv.RequestVoteResponse
+	(*AppendEntriesRequest)(nil),    // 6: kv.AppendEntriesRequest
+	(*AppendEntriesResponse)(nil),   // 7: kv.AppendEntriesResponse
+	(*PreVoteRequest)(nil),          // 8: kv.PreVoteRequest
+	(*PreVoteResponse)(nil),         // 9: kv.PreVoteResponse
+	(*InstallSnapshotRequest)(nil),  // 10: kv.InstallSnapshotRequest
+	(*InstallSnapshotResponse)(nil), // 11: kv.InstallSnapshotResponse
+	(*LogEntry)(nil),                // 12: kv.LogEntry
 }
 var file_kv_proto_depIdxs = []int32{
-	8, // 0: kv.AppendEntriesRequest.entries:type_name -> kv.LogEntry
-	0, // 1: kv.KVService.ForwardKey:input_type -> kv.ForwardKeyRequest
-	2, // 2: kv.KVService.Replicate:input_type -> kv.ReplicateRequest
-	4, // 3: kv.KVService.RequestVote:input_type -> kv.RequestVoteRequest
-	6, // 4: kv.KVService.AppendEntries:input_type -> kv.AppendEntriesRequest
-	1, // 5: kv.KVService.ForwardKey:output_type -> kv.ForwardKeyResponse
-	3, // 6: kv.KVService.Replicate:output_type -> kv.ReplicateResponse
-	5, // 7: kv.KVService.RequestVote:output_type -> kv.RequestVoteResponse
-	7, // 8: kv.KVService.AppendEntries:output_type -> kv.AppendEntriesResponse
-	5, // [5:9] is the sub-list for method output_type
-	1, // [1:5] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	12, // 0: kv.AppendEntriesRequest.entries:type_name -> kv.LogEntry
+	0,  // 1: kv.KVService.ForwardKey:input_type -> kv.ForwardKeyRequest
+	2,  // 2: kv.KVService.Replicate:input_type -> kv.ReplicateRequest
+	4,  // 3: kv.KVService.RequestVote:input_type -> kv.RequestVoteRequest
+	6,  // 4: kv.KVService.AppendEntries:input_type -> kv.AppendEntriesRequest
+	8,  // 5: kv.KVService.PreVote:input_type -> kv.PreVoteRequest
+	10, // 6: kv.KVService.InstallSnapshot:input_type -> kv.InstallSnapshotRequest
+	1,  // 7: kv.KVService.ForwardKey:output_type -> kv.ForwardKeyResponse
+	3,  // 8: kv.KVService.Replicate:output_type -> kv.ReplicateResponse
+	5,  // 9: kv.KVService.RequestVote:output_type -> kv.RequestVoteResponse
+	7,  // 10: kv.KVService.AppendEntries:output_type -> kv.AppendEntriesResponse
+	9,  // 11: kv.KVService.PreVote:output_type -> kv.PreVoteResponse
+	11, // 12: kv.KVService.InstallSnapshot:output_type -> kv.InstallSnapshotResponse
+	7,  // [7:13] is the sub-list for method output_type
+	1,  // [1:7] is the sub-list for method input_type
+	1,  // [1:1] is the sub-list for extension type_name
+	1,  // [1:1] is the sub-list for extension extendee
+	0,  // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_kv_proto_init() }
@@ -690,7 +965,7 @@ func file_kv_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_kv_proto_rawDesc), len(file_kv_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   9,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

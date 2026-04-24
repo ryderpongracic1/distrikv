@@ -27,6 +27,8 @@ import (
 type RaftInterface interface {
 	HandleRequestVote(ctx context.Context, req *kvpb.RequestVoteRequest) (*kvpb.RequestVoteResponse, error)
 	HandleAppendEntries(ctx context.Context, req *kvpb.AppendEntriesRequest) (*kvpb.AppendEntriesResponse, error)
+	HandlePreVote(ctx context.Context, req *kvpb.PreVoteRequest) (*kvpb.PreVoteResponse, error)
+	HandleInstallSnapshot(ctx context.Context, req *kvpb.InstallSnapshotRequest) (*kvpb.InstallSnapshotResponse, error)
 	IsLeader() bool
 	CurrentTerm() uint64
 	Leader() string
@@ -171,6 +173,16 @@ func (g *GRPCServer) RequestVote(ctx context.Context, req *kvpb.RequestVoteReque
 // AppendEntries delegates to the Raft state machine.
 func (g *GRPCServer) AppendEntries(ctx context.Context, req *kvpb.AppendEntriesRequest) (*kvpb.AppendEntriesResponse, error) {
 	return g.raft.HandleAppendEntries(ctx, req)
+}
+
+// PreVote delegates to the Raft state machine (dry-run election, §9.6).
+func (g *GRPCServer) PreVote(ctx context.Context, req *kvpb.PreVoteRequest) (*kvpb.PreVoteResponse, error) {
+	return g.raft.HandlePreVote(ctx, req)
+}
+
+// InstallSnapshot delegates to the Raft state machine (log compaction, §7).
+func (g *GRPCServer) InstallSnapshot(ctx context.Context, req *kvpb.InstallSnapshotRequest) (*kvpb.InstallSnapshotResponse, error) {
+	return g.raft.HandleInstallSnapshot(ctx, req)
 }
 
 // ---------------------------------------------------------------------------

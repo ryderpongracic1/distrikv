@@ -49,8 +49,8 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 		return nil, fmt.Errorf("node: create data dir: %w", err)
 	}
 
-	// 2. Store (WAL + in-memory map).
-	s, err := store.New(cfg.WALPath)
+	// 2. Store (LSM-Tree engine).
+	s, err := store.New(cfg.DataDir, logger)
 	if err != nil {
 		return nil, fmt.Errorf("node: open store: %w", err)
 	}
@@ -83,13 +83,14 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 		})
 	}
 
-	// 5. Raft node (election + heartbeat).
+	// 5. Raft node (election + heartbeat + snapshots).
 	raftCfg := raft.Config{
 		NodeID:             cfg.NodeID,
 		DataDir:            cfg.DataDir,
 		ElectionTimeoutMin: cfg.ElectionTimeoutMin,
 		ElectionTimeoutMax: cfg.ElectionTimeoutMax,
 		HeartbeatInterval:  cfg.HeartbeatInterval,
+		SnapshotThreshold:  1000,
 	}
 	raftNode, err := raft.New(raftCfg, raftPeers, s, &metricsAdapter{n.metrics}, logger)
 	if err != nil {

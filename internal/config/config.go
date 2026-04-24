@@ -96,8 +96,8 @@ func LoadFromEnv() (*Config, error) {
 	cfg.NodeID = required("NODE_ID")
 	cfg.HTTPAddr = required("HTTP_ADDR")
 	cfg.GRPCAddr = required("GRPC_ADDR")
-	cfg.WALPath = required("WAL_PATH")
 	cfg.DataDir = required("DATA_DIR")
+	cfg.WALPath = os.Getenv("WAL_PATH") // optional; unused by LSM engine
 
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("config: missing required env vars: %s", strings.Join(missing, ", "))

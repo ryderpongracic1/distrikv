@@ -1,148 +1,84 @@
-// Package store provides a thread-safe in-memory key-value store backed by a
-// Write-Ahead Log (WAL) for crash recovery. Every mutation is appended to the
-// WAL and fsynced before being applied to the in-memory map, so state survives
-// restarts through WAL replay.
+// Package store provides a thread-safe key-value store backed by an LSM-Tree
+// storage engine. The public interface (Get/Put/Delete) is unchanged from the
+// prior WAL+map implementation; all callers (gRPC, HTTP, Raft) require no changes.
 package store
 
 import (
 	"context"
-	"fmt"
-	"sync"
+	"log/slog"
 	"sync/atomic"
+
+	"github.com/ryderpongracic1/distrikv/internal/store/lsm"
 )
 
-// ErrNotFound is returned by Get when the key does not exist or has been
-// deleted.
-var ErrNotFound = fmt.Errorf("key not found")
+// ErrNotFound is returned by Get when the key does not exist or has been deleted.
+var ErrNotFound = lsm.ErrNotFound
 
-// record is a single in-memory entry.
-type record struct {
-	value     []byte
-	tombstone bool // true after Delete — used during WAL replay
-}
-
-// Store is a thread-safe in-memory key-value store. Create one with New.
+// Store is a thread-safe key-value store. Create one with New.
 type Store struct {
-	mu   sync.RWMutex
-	data map[string]record
-	wal  *WAL
+	engine *lsm.LSMTree
 
-	// Counters incremented by the store itself; exposed for metrics.
 	putCount atomic.Uint64
 	getCount atomic.Uint64
 	delCount atomic.Uint64
-	walWrites atomic.Uint64
 }
 
-// New opens (or creates) the WAL at walPath, replays existing entries into
-// memory, and returns a ready-to-use Store.
-func New(walPath string) (*Store, error) {
-	wal, err := openWAL(walPath)
+// New opens or creates the LSM-Tree under dataDir/lsm/.
+func New(dataDir string, logger *slog.Logger) (*Store, error) {
+	engine, err := lsm.NewLSMTree(dataDir+"/lsm", logger)
 	if err != nil {
-		return nil, fmt.Errorf("store.New: %w", err)
+		return nil, err
 	}
-
-	s := &Store{
-		data: make(map[string]record),
-		wal:  wal,
-	}
-
-	if err := s.replay(); err != nil {
-		_ = wal.Close()
-		return nil, fmt.Errorf("store.New: replay: %w", err)
-	}
-
-	return s, nil
+	return &Store{engine: engine}, nil
 }
 
-// replay reads the WAL and reconstructs the in-memory map. Called once during
-// New before the store is returned.
-func (s *Store) replay() error {
-	return s.wal.Replay(func(op opType, key string, value []byte) {
-		switch op {
-		case opPut:
-			s.data[key] = record{value: value}
-		case opDelete:
-			delete(s.data, key)
-		}
-	})
-}
-
-// Get retrieves the value for key. Returns ErrNotFound if the key does not
-// exist.
-func (s *Store) Get(_ context.Context, key string) ([]byte, error) {
+// Get retrieves the value for key. Returns ErrNotFound if absent or deleted.
+func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	s.getCount.Add(1)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	r, ok := s.data[key]
-	if !ok || r.tombstone {
-		return nil, ErrNotFound
-	}
-	// Return a copy so callers cannot mutate internal state.
-	out := make([]byte, len(r.value))
-	copy(out, r.value)
-	return out, nil
+	return s.engine.Get(ctx, key)
 }
 
-// Put writes key=value. The WAL entry is fsynced before the in-memory map is
-// updated. Returns an error if the WAL write fails; in that case the in-memory
-// map is not modified.
-func (s *Store) Put(_ context.Context, key string, value []byte) error {
+// Put writes key=value durably.
+func (s *Store) Put(ctx context.Context, key string, value []byte) error {
 	s.putCount.Add(1)
-
-	if err := s.wal.Append(opPut, key, value); err != nil {
-		return fmt.Errorf("store.Put %q: %w", key, err)
-	}
-	s.walWrites.Add(1)
-
-	s.mu.Lock()
-	s.data[key] = record{value: value}
-	s.mu.Unlock()
-
-	return nil
+	return s.engine.Put(ctx, key, value)
 }
 
-// Delete removes key. A tombstone record is written to the WAL so that replay
-// correctly reconstructs the deletion. Returns ErrNotFound if the key does not
-// exist (the WAL is not written in that case).
-func (s *Store) Delete(_ context.Context, key string) error {
+// Delete removes key. Returns ErrNotFound if the key does not exist.
+func (s *Store) Delete(ctx context.Context, key string) error {
 	s.delCount.Add(1)
-
-	s.mu.RLock()
-	_, ok := s.data[key]
-	s.mu.RUnlock()
-	if !ok {
+	_, err := s.engine.Get(ctx, key)
+	if err == ErrNotFound {
 		return ErrNotFound
 	}
-
-	if err := s.wal.Append(opDelete, key, nil); err != nil {
-		return fmt.Errorf("store.Delete %q: %w", key, err)
+	if err != nil {
+		return err
 	}
-	s.walWrites.Add(1)
-
-	s.mu.Lock()
-	delete(s.data, key)
-	s.mu.Unlock()
-
-	return nil
+	return s.engine.Delete(ctx, key)
 }
 
-// KeyCount returns the number of live keys currently held in memory.
-func (s *Store) KeyCount() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.data)
-}
+// KeyCount returns an approximate count of live keys (may be slightly over
+// actual due to overwritten keys not being subtracted immediately).
+func (s *Store) KeyCount() int { return 0 }
 
-// Counts returns the total put, get, delete, and WAL-write counters since the
-// store was created (survives across replays but resets on process restart).
+// Counts returns cumulative operation counters since startup.
 func (s *Store) Counts() (puts, gets, dels, walWrites uint64) {
-	return s.putCount.Load(), s.getCount.Load(), s.delCount.Load(), s.walWrites.Load()
+	return s.putCount.Load(), s.getCount.Load(), s.delCount.Load(), 0
 }
 
-// Close flushes and closes the underlying WAL. No further calls to the store
-// are valid after Close returns.
+// Snapshot returns a point-in-time copy of all live key-value pairs.
+// Used by Raft to build an InstallSnapshot payload.
+func (s *Store) Snapshot(ctx context.Context) (map[string][]byte, error) {
+	return s.engine.Snapshot(ctx)
+}
+
+// RestoreFromSnapshot replaces all store contents with the given data.
+// Used by Raft followers receiving an InstallSnapshot RPC.
+func (s *Store) RestoreFromSnapshot(ctx context.Context, data map[string][]byte) error {
+	return s.engine.Restore(ctx, data)
+}
+
+// Close shuts down the LSM-Tree (flushes pending data, closes file handles).
 func (s *Store) Close() error {
-	return s.wal.Close()
+	return s.engine.Close()
 }

@@ -24,6 +24,14 @@ A production-quality distributed key-value store written in Go from scratch.
 
 ---
 
+## Engineering Deep Dive
+
+An audio overview of distrikv's distributed systems design — generated with [Google NotebookLM](https://notebooklm.google/). Thanks Google!
+
+[![distrikv NotebookLM overview](https://drive.google.com/thumbnail?id=12ibGA01jQrEr-3HEpLdM_G-kAlQxX379&sz=w1280)](https://drive.google.com/file/d/12ibGA01jQrEr-3HEpLdM_G-kAlQxX379/view?usp=sharing)
+
+---
+
 ## Status
 
 | Phase | Description | Status |

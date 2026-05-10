@@ -20,7 +20,7 @@ A production-quality distributed key-value store written in Go from scratch.
    └─────────────┘ └─────────────┘ └─────────────────┘
 ```
 
-**Stack:** Go 1.25 · gRPC + protobuf · `net/http` REST · LSM-Tree storage · Raft consensus · Docker Compose
+**Stack:** Go 1.25 · gRPC · `net/http` REST · LSM-Tree storage · Raft consensus · Docker Compose
 
 ---
 
@@ -292,7 +292,7 @@ distrikv/
 │   └── config/
 │       └── config.go        # LoadFromEnv(): typed config from env vars
 ├── proto/
-│   └── kv.proto             # KVService protobuf definitions
+│   └── kv.proto             # KVService gRPC definitions
 ├── Makefile                 # build-cli, build-node, test, install-cli
 └── docker/
     ├── Dockerfile

@@ -60,7 +60,7 @@ optimisation, chaos testing, and operational hardening.
 | P2 | WAL GC optimisation & zero-copy parsing (`sync.Pool` buffers, single-pass CRC, torn-write hardening) | ✅ Done |
 | P3 | Leveled compaction strategy + write-stall backpressure | ✅ Done |
 | P4 | Deterministic fault injection & Jepsen-style linearisability verification | ✅ Done |
-| P5 | TBD — based on P1–P4 findings | 🔲 Planned |
+| P5 | In-process sharded LRU block cache (64 MB default, configurable) | ✅ Done |
 | P6 | TBD | 🔲 Planned |
 | P7 | TBD | 🔲 Planned |
 
@@ -495,6 +495,77 @@ The chaos runner uses an explicit `http.Transport` with
 | `TestCrash_NoDataLossUnderFlushedAndUnflushed` | Mixed flushed + in-flight WAL data both survive |
 | `BenchmarkCrash_RecoveryThroughput` | WAL replay throughput for 1000-key history |
 
+### Phase 5 — In-process Sharded LRU Block Cache (2026-05-21)
+
+#### What changed
+
+The read path previously issued a `f.ReadAt` syscall for every SSTable data block
+that passed the Bloom filter.  Under a hot-key workload this means the same
+blocks are fetched from the OS page cache on every request — wasting a syscall
+and a kernel context switch per block even when the data is already in RAM.
+
+Phase 5 introduces an **in-process sharded LRU block cache** that intercepts
+`readBlock` before it touches the file:
+
+```
+Get(key)
+ └─ Bloom filter: MightContain?  no → return (no disk I/O, no cache)
+ └─ blockIndexFor(key)
+ └─ readBlock(idx):
+     ├─ cache.Get(path, offset)?  yes → BlockCacheHits++, decode, return
+     └─ no → f.ReadAt + cache.Put(path, offset, raw) + BlockCacheMisses++
+```
+
+The Bloom filter still runs first — the cache only sees keys that pass the
+filter.  On a cache miss the block is read from disk and inserted; on subsequent
+reads (same key, same block, or adjacent keys sharing a block) the `ReadAt` is
+skipped entirely.
+
+#### Design
+
+| Property | Value |
+| --- | --- |
+| Shards | 32 (`numCacheShards`) — one `sync.Mutex` per shard, zero cross-shard contention |
+| Default capacity | 64 MB (`defaultBlockCacheBytes`) — configurable via `WithBlockCacheBytes(n)` |
+| Eviction policy | LRU per shard — `container/list`, O(1) promote / evict |
+| Cache key | `(sstable-path, block-offset)` — unique across all live SSTables |
+| Stored value | Raw block bytes (pre-decode) — avoids the `ReadAt` syscall; decoding is CPU-cheap |
+| Shard routing | `FNV-1a(path + offset) % 32` — balances entries from the same SSTable across shards |
+| Disabled | `WithBlockCacheBytes(0)` — returns `nil *BlockCache`; all methods are no-ops |
+
+Entries for compacted-away SSTables are proactively evicted via `cache.Evict(path)`
+right after the compaction swap, so stale memory is freed without waiting for LRU pressure.
+
+#### Metrics
+
+Two new counters are visible via `/metrics`:
+
+| Counter | Meaning |
+| --- | --- |
+| `block_cache_hits` | `readBlock` calls served from the in-memory cache (syscall skipped) |
+| `block_cache_misses` | `readBlock` calls that required a disk read and subsequently populated the cache |
+
+`cmd/bench` now reports a `hit_rate` line in the engine-side section:
+
+```
+engine-side:   bloom_hits=240118  bloom_misses=119  bloom_fp_rate=0.04%
+               flush_bytes=42MB  compaction_bytes_written=64MB  WAF=2.52
+               compactions=6  forwarded_requests=99882  replication_errors=0
+               block_cache_hits=198432  block_cache_misses=1680  hit_rate=99.2%
+```
+
+A hit rate above 95% on a hot-key workload (`--keyspace 20`) is expected; a
+workload larger than the cache (`--keyspace 100000 --valuesize 4096`) will produce
+a lower hit rate due to natural working-set pressure.
+
+#### Phase 5 test coverage
+
+| Test | What it verifies |
+| --- | --- |
+| `TestBlockCache_HitRateAfterWarmup` | Cold pass: `BlockCacheMisses > 0`; warm pass: `BlockCacheHits ≥ cold misses`, zero misses |
+| `TestBlockCache_NilSafe` | `WithBlockCacheBytes(0)` produces no panics and all keys are still readable |
+| `TestBlockCache_EvictOnCompaction` | Post-compaction keys remain readable; cache eviction does not corrupt data |
+
 ### Operator notes
 
 - `--workers` sizes the worker pool *and* the HTTP connection pool
@@ -524,6 +595,7 @@ Tests cover:
 - **LSM-Tree correctness** — MemTable flush, SSTable read, compaction, Bloom filter false-positive rate, leveled-compaction read correctness, tombstone removal, write-stall metrics, L0-count tracking
 - **Crash recovery** — WAL replay, torn-write truncation, flushed-data survival, concurrent-write durability, restore-sentinel self-removal, mixed flushed+unflushed data
 - **Linearisability** — Porcupine-verified concurrent put/get/delete histories; both in-memory and with L0→L1 compaction in progress
+- **Block cache** — hit/miss accounting, nil-safe disabled mode, eviction correctness after compaction
 - **HTTP client** — all five endpoints, 404/5xx/unreachable/context-cancel via `httptest.NewServer`
 - **CLI commands** — all commands via mock client + buffer-backed formatters; no real HTTP servers
 

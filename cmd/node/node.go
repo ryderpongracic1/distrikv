@@ -49,8 +49,9 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 		return nil, fmt.Errorf("node: create data dir: %w", err)
 	}
 
-	// 2. Store (LSM-Tree engine).
-	s, err := store.New(cfg.DataDir, logger)
+	// 2. Store (LSM-Tree engine) — wired to node-wide metrics so bloom/WAF
+	//    counters surface in /metrics.
+	s, err := store.NewWithMetrics(cfg.DataDir, logger, n.metrics)
 	if err != nil {
 		return nil, fmt.Errorf("node: open store: %w", err)
 	}

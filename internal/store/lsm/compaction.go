@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+
+	"github.com/ryderpongracic1/distrikv/internal/metrics"
 )
 
 // ---- Min-heap for k-way merge ----------------------------------------------
@@ -104,6 +106,9 @@ type Compactor struct {
 	logger     *slog.Logger
 	threshold  int            // compact when len(readers) >= threshold
 	nextSSTSeq func() uint64 // callback into LSMTree.nextSST.Add(1)
+
+	// metrics is set by LSMTree after construction. nil → no instrumentation.
+	metrics *metrics.Metrics
 }
 
 // NewCompactor creates a Compactor.
@@ -128,6 +133,14 @@ func (c *Compactor) ShouldCompact(numSSTables int) bool {
 func (c *Compactor) Compact(ctx context.Context, readers []*SSTableReader) (*SSTableReader, error) {
 	if len(readers) == 0 {
 		return nil, nil
+	}
+
+	// Account for input bytes consumed by this compaction. Done up-front because
+	// the input files are deleted after merge; size from the SSTableReader is
+	// captured at open time.
+	var inputBytes uint64
+	for _, r := range readers {
+		inputBytes += uint64(r.size)
 	}
 
 	// Open iterators (oldest-first order).
@@ -190,6 +203,16 @@ func (c *Compactor) Compact(ctx context.Context, readers []*SSTableReader) (*SST
 		}
 	}
 
+	if c.metrics != nil {
+		c.metrics.CompactionBytesRead.Add(inputBytes)
+		if wrote > 0 {
+			if info, statErr := os.Stat(outPath); statErr == nil {
+				c.metrics.CompactionBytesWritten.Add(uint64(info.Size()))
+			}
+		}
+		c.metrics.CompactionsTotal.Add(1)
+	}
+
 	// Remove old SSTables from manifest and disk.
 	for _, r := range readers {
 		baseName := filepath.Base(r.path)
@@ -214,5 +237,10 @@ func (c *Compactor) Compact(ctx context.Context, readers []*SSTableReader) (*SST
 		return nil, nil
 	}
 
-	return OpenSSTableReader(outPath, sstSeq)
+	newReader, err := OpenSSTableReader(outPath, sstSeq)
+	if err != nil {
+		return nil, err
+	}
+	newReader.metrics = c.metrics
+	return newReader, nil
 }

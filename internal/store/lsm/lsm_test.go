@@ -7,7 +7,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/ryderpongracic1/distrikv/internal/metrics"
 	storewal "github.com/ryderpongracic1/distrikv/internal/store/wal"
 )
 
@@ -357,4 +359,95 @@ func TestLSM_SnapshotRestore(t *testing.T) {
 			t.Fatalf("Get %s: got %q want %q", k, val, want)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: metrics instrumentation
+// ---------------------------------------------------------------------------
+
+// TestLSM_MetricsBloomAndWAF drives enough writes to force at least one flush
+// and one compaction, then asserts every new counter is populated correctly
+// and the derived WAF in Snapshot() is sensible.
+func TestLSM_MetricsBloomAndWAF(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	m := &metrics.Metrics{}
+
+	// 16 KB memtable threshold + 4-SSTable compaction trigger → ~5-7 flushes
+	// triggers one compaction during a 256 KB write burst.
+	tree, err := NewLSMTree(dir, nil, WithMetrics(m), WithMaxMemBytes(16<<10))
+	if err != nil {
+		t.Fatalf("NewLSMTree: %v", err)
+	}
+	defer tree.Close()
+
+	// Write enough distinct keys to spill multiple memtables.
+	const totalKeys = 4096
+	const valueSize = 64
+	val := make([]byte, valueSize)
+	for i := range val {
+		val[i] = 'x'
+	}
+	for i := 0; i < totalKeys; i++ {
+		k := fmt.Sprintf("metrics-key-%06d", i)
+		if err := tree.Put(ctx, k, val); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	// Wait up to 5s for at least one compaction to land.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.CompactionsTotal.Load() > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Flush bytes must be > 0 (we wrote ~256KB of values + WAL/index overhead).
+	if got := m.FlushBytes.Load(); got == 0 {
+		t.Fatalf("FlushBytes = 0; want > 0 after %d writes", totalKeys)
+	}
+	if got := m.CompactionsTotal.Load(); got == 0 {
+		t.Fatalf("CompactionsTotal = 0; want ≥ 1")
+	}
+	if got := m.CompactionBytesWritten.Load(); got == 0 {
+		t.Fatalf("CompactionBytesWritten = 0; want > 0")
+	}
+	if got := m.CompactionBytesRead.Load(); got == 0 {
+		t.Fatalf("CompactionBytesRead = 0; want > 0")
+	}
+
+	// Get a never-written key — must trigger BloomMisses on at least one SSTable.
+	_, err = tree.Get(ctx, "never-written-key")
+	if err != ErrNotFound {
+		t.Fatalf("Get unknown key: err=%v want ErrNotFound", err)
+	}
+	if got := m.BloomMisses.Load(); got == 0 {
+		t.Fatalf("BloomMisses = 0 after lookup of never-written key; want > 0")
+	}
+
+	// Get a known key. After compaction the data lives in one SSTable.
+	if _, err := tree.Get(ctx, "metrics-key-000000"); err != nil {
+		t.Fatalf("Get known key: %v", err)
+	}
+	if got := m.BloomHits.Load(); got == 0 {
+		t.Fatalf("BloomHits = 0 after lookup of known key; want > 0")
+	}
+
+	// WAF must reflect compaction overhead — at least 1.0x (we definitely wrote
+	// more than user bytes; usually 2-3x for this workload).
+	snap := m.Snapshot()
+	wafMilli := snap["write_amp_factor_milli"]
+	if wafMilli < 1000 {
+		t.Fatalf("write_amp_factor_milli = %d; want ≥ 1000 (1.0x)", wafMilli)
+	}
+	t.Logf("WAF=%.2fx flush=%d compact_written=%d bloom_hits=%d bloom_misses=%d bloom_fp=%d",
+		float64(wafMilli)/1000.0,
+		snap["flush_bytes"],
+		snap["compaction_bytes_written"],
+		snap["bloom_hits"],
+		snap["bloom_misses"],
+		snap["bloom_false_positives"],
+	)
 }

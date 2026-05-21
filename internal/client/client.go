@@ -66,6 +66,21 @@ func New(cfg Config) *Client {
 	}
 }
 
+// NewWithTransport constructs a Client backed by the supplied RoundTripper.
+// Use this when you need to control connection pooling — for example, a
+// high-concurrency benchmark must size MaxIdleConnsPerHost above the default
+// 2 to avoid TCP TIME_WAIT exhaustion.
+func NewWithTransport(cfg Config, rt http.RoundTripper) *Client {
+	timeout := cfg.Timeout
+	if timeout == 0 {
+		timeout = 5 * time.Second
+	}
+	return &Client{
+		base: "http://" + cfg.Host,
+		http: &http.Client{Timeout: timeout, Transport: rt},
+	}
+}
+
 func (c *Client) url(path string) string {
 	return c.base + path
 }

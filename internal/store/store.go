@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sync/atomic"
 
+	"github.com/ryderpongracic1/distrikv/internal/metrics"
 	"github.com/ryderpongracic1/distrikv/internal/store/lsm"
 )
 
@@ -26,6 +27,17 @@ type Store struct {
 // New opens or creates the LSM-Tree under dataDir/lsm/.
 func New(dataDir string, logger *slog.Logger) (*Store, error) {
 	engine, err := lsm.NewLSMTree(dataDir+"/lsm", logger)
+	if err != nil {
+		return nil, err
+	}
+	return &Store{engine: engine}, nil
+}
+
+// NewWithMetrics opens or creates the LSM-Tree under dataDir/lsm/ and wires it
+// to the supplied *metrics.Metrics so engine-internal counters (bloom hits,
+// flush/compaction bytes) appear in the node-wide metrics snapshot.
+func NewWithMetrics(dataDir string, logger *slog.Logger, m *metrics.Metrics) (*Store, error) {
+	engine, err := lsm.NewLSMTree(dataDir+"/lsm", logger, lsm.WithMetrics(m))
 	if err != nil {
 		return nil, err
 	}

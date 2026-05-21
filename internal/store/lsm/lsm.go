@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/ryderpongracic1/distrikv/internal/metrics"
 	storewal "github.com/ryderpongracic1/distrikv/internal/store/wal"
 )
 
@@ -60,6 +61,7 @@ type LSMTree struct {
 	logger  *slog.Logger
 	maxMem  int64
 	nCompact int // SSTable count threshold
+	metrics  *metrics.Metrics // may be nil — increments become no-ops
 
 	// --- Background goroutine control ---
 	flushCh   chan struct{} // capacity 1; triggers flush goroutine
@@ -68,8 +70,28 @@ type LSMTree struct {
 	wg        sync.WaitGroup
 }
 
+// Option configures an LSMTree at construction time.
+type Option func(*LSMTree)
+
+// WithMetrics injects a *metrics.Metrics so the LSM can publish bloom-filter
+// hit/miss/false-positive counts and flush/compaction byte totals. Passing nil
+// is allowed and disables instrumentation.
+func WithMetrics(m *metrics.Metrics) Option {
+	return func(l *LSMTree) { l.metrics = m }
+}
+
+// WithMaxMemBytes overrides the memtable flush threshold. Used by tests to
+// trigger flushes without writing megabytes of data.
+func WithMaxMemBytes(n int64) Option {
+	return func(l *LSMTree) {
+		if n > 0 {
+			l.maxMem = n
+		}
+	}
+}
+
 // NewLSMTree opens or creates an LSM-Tree in dataDir.
-func NewLSMTree(dataDir string, logger *slog.Logger) (*LSMTree, error) {
+func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -101,9 +123,13 @@ func NewLSMTree(dataDir string, logger *slog.Logger) (*LSMTree, error) {
 		compactCh: make(chan struct{}, 1),
 		stopCh:   make(chan struct{}),
 	}
+	for _, opt := range opts {
+		opt(l)
+	}
 	l.compact = NewCompactor(dataDir, manifest, logger, defaultCompactN, func() uint64 {
 		return l.nextSST.Add(1)
 	})
+	l.compact.metrics = l.metrics
 	l.immFlushed = sync.NewCond(&l.mu)
 
 	// Open live SSTables from manifest (oldest → newest order from LiveFiles).
@@ -116,6 +142,7 @@ func NewLSMTree(dataDir string, logger *slog.Logger) (*LSMTree, error) {
 		if err != nil {
 			return nil, fmt.Errorf("lsm: open SSTable %q: %w", ev.Path, err)
 		}
+		r.metrics = l.metrics
 		readers = append(readers, r)
 		if ev.SSTSeq > maxSSTSeq {
 			maxSSTSeq = ev.SSTSeq
@@ -337,10 +364,17 @@ func (l *LSMTree) flushMemtable(imm *Memtable) error {
 		return fmt.Errorf("lsm: flush manifest add: %w", err)
 	}
 
+	if l.metrics != nil {
+		if info, statErr := os.Stat(outPath); statErr == nil {
+			l.metrics.FlushBytes.Add(uint64(info.Size()))
+		}
+	}
+
 	newReader, err := OpenSSTableReader(outPath, sstSeq)
 	if err != nil {
 		return fmt.Errorf("lsm: flush open new reader: %w", err)
 	}
+	newReader.metrics = l.metrics
 
 	// Atomically swap: prepend newest reader, clear imm, wake blocked writers.
 	l.mu.Lock()
@@ -491,6 +525,7 @@ func (l *LSMTree) Restore(ctx context.Context, data map[string][]byte) error {
 	l.compact = NewCompactor(l.dataDir, manifest, l.logger, l.nCompact, func() uint64 {
 		return l.nextSST.Add(1)
 	})
+	l.compact.metrics = l.metrics
 
 	// Reset all counters.
 	l.seqNum.Store(0)
@@ -611,10 +646,16 @@ func (l *LSMTree) flushMemtableDirect(mem *Memtable) error {
 		os.Remove(outPath)
 		return err
 	}
+	if l.metrics != nil {
+		if info, statErr := os.Stat(outPath); statErr == nil {
+			l.metrics.FlushBytes.Add(uint64(info.Size()))
+		}
+	}
 	r, err := OpenSSTableReader(outPath, sstSeq)
 	if err != nil {
 		return err
 	}
+	r.metrics = l.metrics
 	l.mu.Lock()
 	l.readers = append([]*SSTableReader{r}, l.readers...)
 	l.mu.Unlock()

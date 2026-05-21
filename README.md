@@ -224,6 +224,85 @@ curl         localhost:8001/metrics
 
 ---
 
+## Benchmarking (`cmd/bench`)
+
+`cmd/bench` is a standalone open-loop load generator that drives a running
+cluster over HTTP and reports HDR-histogram latency percentiles plus
+engine-side counters scraped from `/metrics`.
+
+```bash
+# 1. Start the cluster
+docker compose -f docker/docker-compose.yml up -d
+
+# 2. Run the bench (60s @ 1000 QPS, 80% PUT / 20% GET)
+go run ./cmd/bench \
+    --target   localhost:8001 \
+    --qps      1000 \
+    --duration 60s \
+    --warmup   5s \
+    --mix      80:20:0 \
+    --workers  128 \
+    --valuesize 1024
+```
+
+### Why open-loop?
+
+A naive closed-loop bench (N workers each `for { client.Put(...) }`) hides
+tail latency under saturation: when the cluster slows down, workers
+automatically slow down their request rate, so the recorded p99 reflects
+*how fast workers happened to issue requests*, not *how slow the system
+actually got*. This is called **coordinated omission**.
+
+`cmd/bench` instead generates Poisson arrivals at the configured QPS and
+records latency from each request's *scheduled* time (not its dispatch
+time). Queue wait counts as latency. If the cluster falls behind, the
+report flags `saturation: TRUE` and `max_queue_depth` climbs to the cap.
+
+### Interpreting the report
+
+```
+== distrikv bench: 1m0s @ target 1000 qps, mix=80:20:0, keyspace=100000 uniform ==
+ops:           59937      achieved_qps: 998.6    errors: 0
+latency (us):  p50=1734    p90=4403    p99=26767   p999=81151   max=108863
+engine-side:   bloom_hits=673  bloom_misses=4939  bloom_fp_rate=0.00%
+               flush_bytes=16.7MB  compaction_bytes_written=14.0MB  WAF=1.83
+               compactions=1  forwarded_requests=40107  replication_errors=0
+saturation:    false   max_queue_depth=30
+```
+
+| Metric | Meaning |
+| --- | --- |
+| `bloom_misses` | Bloom said *definitely absent* — saved a block read. Higher is better for negative lookups. |
+| `bloom_hits` | Bloom said *might be present* — block was read. Includes true hits and false positives. |
+| `bloom_fp_rate` | `false_positives / bloom_hits`. A correctly sized Bloom filter stays well under 1%. |
+| `WAF` (Write Amplification Factor) | `(flush_bytes + compaction_bytes_written) / flush_bytes`. 1.0× means no compaction overhead; 2-3× is normal for size-tiered compaction; Phase 3 (leveled) will trade higher WAF for better read amp. |
+| `forwarded_requests` | Ring routed the key to a peer instead of handling it locally. |
+| `saturation` | `TRUE` if the arrival queue reached its cap → the cluster couldn't keep up; tail latencies include queue wait. |
+
+### Phase 1 baseline (2026-05-21, 3-node docker-compose on M-series laptop)
+
+| Workload | QPS achieved | p50 | p99 | p999 | WAF | Bloom FP |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 80:20 PUT/GET, 1KB values, 60s @ 1000 QPS | 998.6 | 1.7 ms | 26.8 ms | 81.2 ms | 1.83× | 0.00% |
+
+These numbers establish the baseline for Phases 2 (WAL GC optimisation), 3
+(leveled compaction), and 4 (chaos). Any regression in p99 or WAF in a
+later phase has to be justified.
+
+### Operator notes
+
+- `--workers` sizes the worker pool *and* the HTTP connection pool
+  (`MaxIdleConnsPerHost = workers + 64`). Go's defaults cap idle conns/host
+  at 2, which causes TCP `TIME_WAIT` exhaustion under high concurrency;
+  the bench overrides this.
+- For runs above ~10k QPS on macOS, you may need to raise
+  `kern.ipc.somaxconn` and the ephemeral port range
+  (`net.inet.ip.portrange.first`).
+- Pass `--output json` for a machine-readable report (suitable for
+  piping into diff tools across runs).
+
+---
+
 ## Running Tests
 
 ```bash

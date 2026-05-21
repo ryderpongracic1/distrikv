@@ -34,6 +34,14 @@ An audio overview of distrikv's distributed systems design — generated with [G
 
 ## Status
 
+distrikv was built across two tracks. **Phases 1–7** below are the original
+developmental phases that took the project from a single-node prototype to a
+fully-distributed, CLI-equipped cluster. **Production-grade upgrade phases**
+(P1–P7) are the ongoing engineering uplift — benchmarking, storage
+optimisation, chaos testing, and operational hardening.
+
+### Original developmental phases
+
 | Phase | Description | Status |
 |---|---|---|
 | 1 | Single-node KV + WAL + HTTP REST | ✅ Done |
@@ -43,6 +51,18 @@ An audio overview of distrikv's distributed systems design — generated with [G
 | 5 | Docker Compose cluster + demo script | ✅ Done |
 | 6 | LSM-Tree storage engine + complete Raft (snapshots, pre-vote) | ✅ Done |
 | 7 | `distrikv-cli` — first-class CLI tool | ✅ Done |
+
+### Production-grade upgrade phases
+
+| Phase | Description | Status |
+|---|---|---|
+| P1 | Quantified benchmarking & metrics harness (`cmd/bench`, HDR histograms, bloom + WAF counters) | ✅ Done |
+| P2 | WAL GC optimisation & zero-copy parsing (`sync.Pool` buffers, single-pass CRC, torn-write hardening) | ✅ Done |
+| P3 | Leveled compaction strategy + write-stall backpressure | 🔲 Planned |
+| P4 | Deterministic fault injection & Jepsen-style linearisability verification | 🔲 Planned |
+| P5 | TBD — based on P1–P4 findings | 🔲 Planned |
+| P6 | TBD | 🔲 Planned |
+| P7 | TBD | 🔲 Planned |
 
 ---
 
@@ -288,6 +308,41 @@ saturation:    false   max_queue_depth=30
 These numbers establish the baseline for Phases 2 (WAL GC optimisation), 3
 (leveled compaction), and 4 (chaos). Any regression in p99 or WAF in a
 later phase has to be justified.
+
+### Phase 2 WAL allocation profile (2026-05-21, Apple M1 Max)
+
+`go test -bench=BenchmarkWAL_Append -benchmem` after the Phase 2 refactor:
+
+| Benchmark | ns/op | B/op | allocs/op | vs. original |
+| --- | ---: | ---: | ---: | --- |
+| `Append` (256B value) | 4,643–4,687 | 8 | 2 | −3 allocs (bufio.Writer, CRC hasher, []byte(key) eliminated) |
+| `Append` (64KB value) | 4,844–4,960 | 8 | 2 | same — value is passed by pointer, not copied |
+
+The 2 remaining allocs/op are baseline OS-call overhead (error interface values
+from `f.Sync`), not WAL logic. The dominant hot-path allocations from the
+original implementation are gone:
+
+| Source | Original | Phase 2 |
+| --- | --- | --- |
+| `bufio.NewWriter(f)` per Append | 1 alloc (~4 KB) | 0 — persistent `bw` on struct |
+| `crc32.NewIEEE()` per Append | 1 alloc (hash object) | 0 — `crc32.Update` rolling accumulator |
+| `[]byte(key)` for CRC pass | 1 alloc (key size) | 0 — `unsafe.Slice` zero-copy view |
+| `bufio.NewReader(f)` per Replay | 1 alloc (read buffer) | 0 — pooled `*[]byte` from `sync.Pool` |
+| `make([]byte, keyLen)` per entry | 1 alloc per WAL entry | 0 — pool buffer reused across entries |
+
+Replay delivers owned copies of values (1 alloc per entry, unavoidable since
+the Memtable tree retains value references); keys produce 1 `string(buf)` copy
+per entry (unavoidable for string immutability). All other Replay allocations
+are eliminated on the warm path.
+
+**Torn-write contract (hardened in Phase 2):**
+- `Replay` stops cleanly (`nil` return) for `io.EOF`, `io.ErrUnexpectedEOF`,
+  or CRC mismatch at any byte offset within an entry — the expected signature
+  of a sudden power loss or `kill -9`.
+- `Replay` returns a **non-nil error** only for genuine I/O failures (e.g.
+  disk read error mid-entry). Previously, all errors were silently swallowed
+  as clean truncations — a disk failure would have been misread as a torn
+  write, masking data loss from the operator.
 
 ### Operator notes
 

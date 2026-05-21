@@ -69,6 +69,16 @@ type Metrics struct {
 	// CompactionsTotal counts completed compactions.
 	CompactionsTotal atomic.Uint64
 
+	// --- Block cache counters (Phase 5 in-process LRU block cache) ----------
+
+	// BlockCacheHits counts readBlock calls satisfied from the in-memory LRU
+	// cache (i.e., f.ReadAt was skipped).
+	BlockCacheHits atomic.Uint64
+
+	// BlockCacheMisses counts readBlock calls that required a disk read
+	// (cache miss) and subsequently populated the cache.
+	BlockCacheMisses atomic.Uint64
+
 	// --- Write-stall counters (Phase 3 leveled compaction) ------------------
 
 	// WriteStallCount counts the number of write-stall events triggered by
@@ -121,5 +131,7 @@ func (m *Metrics) Snapshot() map[string]uint64 {
 		"write_stall_count":        m.WriteStallCount.Load(),
 		"write_stall_micros":       m.WriteStallMicros.Load(),
 		"l0_file_count":            uint64(m.L0FileCount.Load()),
+		"block_cache_hits":         m.BlockCacheHits.Load(),
+		"block_cache_misses":       m.BlockCacheMisses.Load(),
 	}
 }

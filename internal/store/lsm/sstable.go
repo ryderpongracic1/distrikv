@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"sort"
+
+	"github.com/ryderpongracic1/distrikv/internal/metrics"
 )
 
 // IndexEntry points to one data block within an SSTable file.
@@ -166,6 +168,9 @@ type SSTableReader struct {
 	size   int64
 	SSTSeq uint64
 	path   string // full path, used for deletion during compaction
+
+	// metrics is attached by the LSMTree after open. nil → no instrumentation.
+	metrics *metrics.Metrics
 }
 
 // OpenSSTableReader opens an SSTable file and loads its index and filter into memory.
@@ -227,10 +232,19 @@ func OpenSSTableReader(path string, sstSeq uint64) (*SSTableReader, error) {
 // Get looks up key. Returns (entry, true, nil) if found (tombstones included — caller checks).
 func (r *SSTableReader) Get(key string) (Entry, bool, error) {
 	if !r.filter.MightContain(key) {
+		if r.metrics != nil {
+			r.metrics.BloomMisses.Add(1)
+		}
 		return Entry{}, false, nil
+	}
+	if r.metrics != nil {
+		r.metrics.BloomHits.Add(1)
 	}
 	blockIdx := r.blockIndexFor(key)
 	if blockIdx < 0 {
+		if r.metrics != nil {
+			r.metrics.BloomFalsePositives.Add(1)
+		}
 		return Entry{}, false, nil
 	}
 	entries, err := r.readBlock(blockIdx)
@@ -244,6 +258,9 @@ func (r *SSTableReader) Get(key string) (Entry, bool, error) {
 		if e.Key > key {
 			break
 		}
+	}
+	if r.metrics != nil {
+		r.metrics.BloomFalsePositives.Add(1)
 	}
 	return Entry{}, false, nil
 }

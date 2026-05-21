@@ -38,20 +38,69 @@ type Metrics struct {
 
 	// ReplicationErrors counts failures when replicating a write to a replica.
 	ReplicationErrors atomic.Uint64
+
+	// --- LSM engine counters (Phase 1 benchmark harness) -------------------
+
+	// BloomHits counts SSTable lookups where the Bloom filter returned true
+	// (the key might be present).
+	BloomHits atomic.Uint64
+
+	// BloomMisses counts SSTable lookups where the Bloom filter returned false
+	// (the key is definitely absent — the filter saved a block read).
+	BloomMisses atomic.Uint64
+
+	// BloomFalsePositives counts SSTable lookups where the Bloom filter
+	// returned true but the block lookup confirmed the key was absent.
+	// (false_positive_rate = BloomFalsePositives / BloomHits)
+	BloomFalsePositives atomic.Uint64
+
+	// FlushBytes is the total bytes written by memtable→L0 flushes. This is
+	// the "user write" denominator for the Write Amplification Factor.
+	FlushBytes atomic.Uint64
+
+	// CompactionBytesWritten is the total bytes written by compaction output
+	// SSTables (numerator side of WAF).
+	CompactionBytesWritten atomic.Uint64
+
+	// CompactionBytesRead is the total bytes consumed from input SSTables
+	// during compaction.
+	CompactionBytesRead atomic.Uint64
+
+	// CompactionsTotal counts completed compactions.
+	CompactionsTotal atomic.Uint64
 }
 
 // Snapshot returns a point-in-time copy of all counters as a map suitable for
-// JSON serialisation.
+// JSON serialisation. A derived write_amp_factor field is computed at snapshot
+// time so callers don't need to do the math.
 func (m *Metrics) Snapshot() map[string]uint64 {
+	flush := m.FlushBytes.Load()
+	compWritten := m.CompactionBytesWritten.Load()
+
+	// WAF = (flush_bytes + compaction_bytes_written) / max(flush_bytes, 1)
+	// Reported as a milli-factor (e.g. 2520 = 2.52x) to fit the uint64 map.
+	var wafMilli uint64
+	if flush > 0 {
+		wafMilli = ((flush + compWritten) * 1000) / flush
+	}
+
 	return map[string]uint64{
-		"put_total":           m.PutTotal.Load(),
-		"get_total":           m.GetTotal.Load(),
-		"delete_total":        m.DeleteTotal.Load(),
-		"get_miss":            m.GetMiss.Load(),
-		"wal_writes":          m.WALWrites.Load(),
-		"raft_terms":          m.RaftTerms.Load(),
-		"leader_elections":    m.LeaderElections.Load(),
-		"forwarded_requests":  m.ForwardedRequests.Load(),
-		"replication_errors":  m.ReplicationErrors.Load(),
+		"put_total":                m.PutTotal.Load(),
+		"get_total":                m.GetTotal.Load(),
+		"delete_total":             m.DeleteTotal.Load(),
+		"get_miss":                 m.GetMiss.Load(),
+		"wal_writes":               m.WALWrites.Load(),
+		"raft_terms":               m.RaftTerms.Load(),
+		"leader_elections":         m.LeaderElections.Load(),
+		"forwarded_requests":       m.ForwardedRequests.Load(),
+		"replication_errors":       m.ReplicationErrors.Load(),
+		"bloom_hits":               m.BloomHits.Load(),
+		"bloom_misses":             m.BloomMisses.Load(),
+		"bloom_false_positives":    m.BloomFalsePositives.Load(),
+		"flush_bytes":              flush,
+		"compaction_bytes_written": compWritten,
+		"compaction_bytes_read":    m.CompactionBytesRead.Load(),
+		"compactions_total":        m.CompactionsTotal.Load(),
+		"write_amp_factor_milli":   wafMilli,
 	}
 }

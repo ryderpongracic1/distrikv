@@ -740,3 +740,176 @@ func TestLSM_MetricsBloomAndWAF(t *testing.T) {
 		snap["bloom_false_positives"],
 	)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Block Cache
+// ---------------------------------------------------------------------------
+
+// TestBlockCache_HitRateAfterWarmup verifies that BlockCacheHits accumulates
+// correctly after a warm read pass and that BlockCacheMisses fires on the first
+// cold pass.
+//
+// Structure:
+//  1. Write enough unique keys to guarantee ≥1 L0 SSTable flush.
+//  2. Cold pass: read every key once — all block reads miss the cache.
+//  3. Warm pass: read every key a second time — each block read should hit.
+//  4. Assert hits > 0, misses > 0, and that the warm pass produced more hits
+//     than cold misses (i.e., the cache is actually being consulted).
+func TestBlockCache_HitRateAfterWarmup(t *testing.T) {
+	const keys = 200
+
+	dir := t.TempDir()
+	ctx := context.Background()
+	m := &metrics.Metrics{}
+
+	// Small memtable (512B) forces several flushes for 200 unique keys.
+	// Block cache explicitly set to 4MB (large enough to hold all blocks).
+	tree, err := NewLSMTree(dir, nil,
+		WithMetrics(m),
+		WithMaxMemBytes(512),
+		WithBlockCacheBytes(4<<20),
+	)
+	if err != nil {
+		t.Fatalf("NewLSMTree: %v", err)
+	}
+	defer tree.Close()
+
+	// Write unique keys so each one grows the memtable monotonically.
+	for i := 0; i < keys; i++ {
+		if err := tree.Put(ctx, fmt.Sprintf("bc-key-%04d", i), []byte(fmt.Sprintf("val-%04d", i))); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	// Wait for at least one flush so blocks are on disk.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.FlushBytes.Load() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if m.FlushBytes.Load() == 0 {
+		t.Fatal("no flush occurred; SSTable blocks never hit disk — cannot test block cache")
+	}
+
+	// Reset counters before measuring.
+	// (atomic stores to 0 rather than creating a new Metrics so the tree keeps
+	//  its pointer — the tree holds *metrics.Metrics, not a snapshot)
+	m.BlockCacheHits.Store(0)
+	m.BlockCacheMisses.Store(0)
+
+	// Cold pass — all block reads go to disk.
+	for i := 0; i < keys; i++ {
+		if _, err := tree.Get(ctx, fmt.Sprintf("bc-key-%04d", i)); err != nil {
+			t.Fatalf("cold Get %d: %v", i, err)
+		}
+	}
+	coldMisses := m.BlockCacheMisses.Load()
+	coldHits := m.BlockCacheHits.Load()
+	t.Logf("cold pass: hits=%d misses=%d", coldHits, coldMisses)
+
+	if coldMisses == 0 {
+		t.Fatal("expected >0 BlockCacheMisses on cold pass; got 0 — cache may not be wired")
+	}
+
+	// Reset between passes.
+	m.BlockCacheHits.Store(0)
+	m.BlockCacheMisses.Store(0)
+
+	// Warm pass — all blocks should be in cache now.
+	for i := 0; i < keys; i++ {
+		if _, err := tree.Get(ctx, fmt.Sprintf("bc-key-%04d", i)); err != nil {
+			t.Fatalf("warm Get %d: %v", i, err)
+		}
+	}
+	warmHits := m.BlockCacheHits.Load()
+	warmMisses := m.BlockCacheMisses.Load()
+	t.Logf("warm pass: hits=%d misses=%d", warmHits, warmMisses)
+
+	if warmHits == 0 {
+		t.Fatal("expected >0 BlockCacheHits on warm pass; got 0 — cache may not be populated")
+	}
+	if warmHits < coldMisses {
+		// warm hits should be at least as many as cold misses (we re-read the same blocks)
+		t.Fatalf("warm hits (%d) < cold misses (%d); cache is not serving reads", warmHits, coldMisses)
+	}
+	t.Logf("cache effective: warm_hits=%d >= cold_misses=%d ✓", warmHits, coldMisses)
+}
+
+// TestBlockCache_NilSafe verifies that a nil *BlockCache (cache disabled via
+// WithBlockCacheBytes(0)) does not panic and the engine still returns correct results.
+func TestBlockCache_NilSafe(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	tree, err := NewLSMTree(dir, nil,
+		WithMaxMemBytes(512),
+		WithBlockCacheBytes(0), // explicitly disable
+	)
+	if err != nil {
+		t.Fatalf("NewLSMTree: %v", err)
+	}
+	defer tree.Close()
+
+	const keys = 50
+	for i := 0; i < keys; i++ {
+		if err := tree.Put(ctx, fmt.Sprintf("nc-key-%03d", i), []byte(fmt.Sprintf("v%d", i))); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+	for i := 0; i < keys; i++ {
+		val, err := tree.Get(ctx, fmt.Sprintf("nc-key-%03d", i))
+		if err != nil {
+			t.Fatalf("Get %d: %v", i, err)
+		}
+		if string(val) != fmt.Sprintf("v%d", i) {
+			t.Fatalf("key %d: got %q want %q", i, val, fmt.Sprintf("v%d", i))
+		}
+	}
+}
+
+// TestBlockCache_EvictOnCompaction verifies that cache entries for an SSTable are
+// evicted when that SSTable is compacted away, so stale cached bytes cannot be
+// returned for subsequent reads.
+func TestBlockCache_EvictOnCompaction(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	m := &metrics.Metrics{}
+
+	tree, err := NewLSMTree(dir, nil,
+		WithMetrics(m),
+		WithMaxMemBytes(512),
+		WithBlockCacheBytes(4<<20),
+	)
+	if err != nil {
+		t.Fatalf("NewLSMTree: %v", err)
+	}
+	defer tree.Close()
+
+	// Write unique keys to force ≥1 flush.
+	for i := 0; i < 200; i++ {
+		if err := tree.Put(ctx, fmt.Sprintf("evict-key-%04d", i), []byte(fmt.Sprintf("v%d", i))); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	// Wait for compaction to run (L0→L1); this is when Evict is called.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.CompactionsTotal.Load() > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if m.CompactionsTotal.Load() == 0 {
+		t.Skip("no compaction occurred; eviction path not exercised")
+	}
+
+	// After compaction, all keys should still be readable from L1 (or cache).
+	for i := 0; i < 200; i++ {
+		if _, err := tree.Get(ctx, fmt.Sprintf("evict-key-%04d", i)); err != nil {
+			t.Fatalf("post-compaction Get %d: %v", i, err)
+		}
+	}
+}

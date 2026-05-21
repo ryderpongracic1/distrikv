@@ -119,6 +119,16 @@ func (r *report) writeTable(w io.Writer) {
 	fmt.Fprintf(w, "               compactions=%d  forwarded_requests=%d  replication_errors=%d\n",
 		d["compactions_total"], d["forwarded_requests"], d["replication_errors"])
 
+	cacheHits := d["block_cache_hits"]
+	cacheMisses := d["block_cache_misses"]
+	cacheTotal := cacheHits + cacheMisses
+	var cacheHitPct float64
+	if cacheTotal > 0 {
+		cacheHitPct = float64(cacheHits) / float64(cacheTotal) * 100
+	}
+	fmt.Fprintf(w, "               block_cache_hits=%d  block_cache_misses=%d  hit_rate=%.1f%%\n",
+		cacheHits, cacheMisses, cacheHitPct)
+
 	satStr := "false"
 	if r.Saturated {
 		satStr = "TRUE (cluster could not keep up — tail latency reflects queue wait)"

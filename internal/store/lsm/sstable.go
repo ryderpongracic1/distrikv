@@ -171,8 +171,9 @@ type SSTableReader struct {
 	Level  int    // compaction level; set by LSMTree after OpenSSTableReader
 	path   string // full path, used for deletion during compaction
 
-	// metrics is attached by the LSMTree after open. nil → no instrumentation.
+	// metrics and cache are attached by the LSMTree after open. nil → disabled.
 	metrics *metrics.Metrics
+	cache   *BlockCache
 }
 
 // OpenSSTableReader opens an SSTable file and loads its index and filter into memory.
@@ -283,12 +284,29 @@ func (r *SSTableReader) blockIndexFor(key string) int {
 }
 
 // readBlock reads and decodes all entries from the block at index blockIdx.
+// If a BlockCache is attached, the raw block bytes are served from (or stored
+// into) the cache so that repeated reads of the same block skip the ReadAt
+// syscall.
 func (r *SSTableReader) readBlock(blockIdx int) ([]Entry, error) {
 	ie := r.index[blockIdx]
-	raw := make([]byte, ie.Length)
-	if _, err := r.f.ReadAt(raw, int64(ie.Offset)); err != nil {
-		return nil, fmt.Errorf("sstable: read block %d: %w", blockIdx, err)
+
+	var raw []byte
+	if cached, ok := r.cache.Get(r.path, ie.Offset); ok {
+		if r.metrics != nil {
+			r.metrics.BlockCacheHits.Add(1)
+		}
+		raw = cached
+	} else {
+		if r.metrics != nil {
+			r.metrics.BlockCacheMisses.Add(1)
+		}
+		raw = make([]byte, ie.Length)
+		if _, err := r.f.ReadAt(raw, int64(ie.Offset)); err != nil {
+			return nil, fmt.Errorf("sstable: read block %d: %w", blockIdx, err)
+		}
+		r.cache.Put(r.path, ie.Offset, raw)
 	}
+
 	dec, err := newBlockDecoder(raw)
 	if err != nil {
 		return nil, fmt.Errorf("sstable: decode block %d: %w", blockIdx, err)

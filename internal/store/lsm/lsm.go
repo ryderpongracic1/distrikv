@@ -68,10 +68,11 @@ import (
 var ErrNotFound = errors.New("key not found")
 
 const (
-	defaultMaxMemBytes    = 4 << 20 // 4 MB memtable flush threshold
-	defaultCompactN       = 4       // compact when len(l0) ≥ this
-	defaultL0SlowThreshold = 8      // 2× defaultCompactN: begin soft stall
-	defaultL0StopThreshold = 12     // 3× defaultCompactN: hard stop writes
+	defaultMaxMemBytes     = 4 << 20  // 4 MB memtable flush threshold
+	defaultCompactN        = 4        // compact when len(l0) ≥ this
+	defaultL0SlowThreshold = 8        // 2× defaultCompactN: begin soft stall
+	defaultL0StopThreshold = 12       // 3× defaultCompactN: hard stop writes
+	defaultBlockCacheBytes = 64 << 20 // 64 MB in-process LRU block cache
 )
 
 // LSMTree is a Log-Structured Merge-Tree key-value engine.
@@ -121,6 +122,7 @@ type LSMTree struct {
 	l0SlowThreshold  int // soft-stall threshold
 	l0StopThreshold  int // hard-stop threshold
 	metrics          *metrics.Metrics // may be nil
+	cache            *BlockCache      // may be nil (disabled when maxBytes=0)
 
 	// --- Background goroutine control ---
 	flushCh   chan struct{} // capacity 1; triggers flush goroutine
@@ -147,6 +149,17 @@ func WithMaxMemBytes(n int64) Option {
 			l.maxMem = n
 		}
 	}
+}
+
+// WithBlockCacheBytes configures the in-process LRU block cache capacity.
+// The cache holds raw SSTable block bytes so that repeated reads of the same
+// block skip the f.ReadAt syscall. The capacity is divided evenly across
+// numCacheShards shards.
+//
+// Pass 0 (or omit this option) to disable caching entirely.
+// The default when this option is absent is 64 MB.
+func WithBlockCacheBytes(n int64) Option {
+	return func(l *LSMTree) { l.cache = NewBlockCache(n) }
 }
 
 // WithL0StallConfig sets the L0 file-count thresholds for write-stall
@@ -199,6 +212,7 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 		nCompact:         defaultCompactN,
 		l0SlowThreshold:  defaultL0SlowThreshold,
 		l0StopThreshold:  defaultL0StopThreshold,
+		cache:            NewBlockCache(defaultBlockCacheBytes),
 		flushCh:          make(chan struct{}, 1),
 		compactCh:        make(chan struct{}, 1),
 		stopCh:           make(chan struct{}),
@@ -226,6 +240,7 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 		}
 		r.Level = ev.Level
 		r.metrics = l.metrics
+		r.cache = l.cache
 		if ev.SSTSeq > maxSSTSeq {
 			maxSSTSeq = ev.SSTSeq
 		}
@@ -539,6 +554,7 @@ func (l *LSMTree) flushMemtable(imm *Memtable) error {
 	}
 	newReader.Level = 0
 	newReader.metrics = l.metrics
+	newReader.cache = l.cache
 
 	// Atomically: prepend to l0, update l0Count, clear imm, wake writers.
 	l.mu.Lock()
@@ -594,6 +610,8 @@ func (l *LSMTree) runCompact(ctx context.Context) {
 
 			if newReader != nil {
 				newReader.Level = 1
+				newReader.metrics = l.metrics
+				newReader.cache = l.cache
 			}
 
 			// Replace l0 and l1 atomically, decrement l0Count, wake stalled writers.
@@ -611,6 +629,14 @@ func (l *LSMTree) runCompact(ctx context.Context) {
 			}
 			l.l0Drained.Broadcast() // wake any hard-stopped writers
 			l.mu.Unlock()
+
+			// Proactively evict cache entries for the now-deleted input SSTables.
+			for _, r := range l0snap {
+				l.cache.Evict(r.path)
+			}
+			for _, r := range l1snap {
+				l.cache.Evict(r.path)
+			}
 
 			l.logger.Info("lsm: L0→L1 compaction complete",
 				"l0_inputs", len(l0snap),
@@ -879,6 +905,7 @@ func (l *LSMTree) flushMemtableDirect(mem *Memtable) error {
 	}
 	r.Level = 0
 	r.metrics = l.metrics
+	r.cache = l.cache
 
 	l.mu.Lock()
 	l.l0 = append([]*SSTableReader{r}, l.l0...)

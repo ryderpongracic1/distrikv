@@ -180,6 +180,10 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 		if err := wipeLSMDir(dataDir); err != nil {
 			return nil, fmt.Errorf("lsm: wipe after incomplete restore: %w", err)
 		}
+		// Remove the sentinel so subsequent opens don't re-wipe.
+		if err := os.Remove(sentinelPath); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("lsm: remove restore sentinel: %w", err)
+		}
 	}
 
 	manifest, err := OpenManifest(filepath.Join(dataDir, "manifest.log"))

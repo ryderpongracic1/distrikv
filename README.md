@@ -59,7 +59,7 @@ optimisation, chaos testing, and operational hardening.
 | P1 | Quantified benchmarking & metrics harness (`cmd/bench`, HDR histograms, bloom + WAF counters) | ✅ Done |
 | P2 | WAL GC optimisation & zero-copy parsing (`sync.Pool` buffers, single-pass CRC, torn-write hardening) | ✅ Done |
 | P3 | Leveled compaction strategy + write-stall backpressure | ✅ Done |
-| P4 | Deterministic fault injection & Jepsen-style linearisability verification | 🔲 Planned |
+| P4 | Deterministic fault injection & Jepsen-style linearisability verification | ✅ Done |
 | P5 | TBD — based on P1–P4 findings | 🔲 Planned |
 | P6 | TBD | 🔲 Planned |
 | P7 | TBD | 🔲 Planned |
@@ -408,6 +408,93 @@ threshold (≤ 4 files in steady state), so read amplification stays predictable
 | `TestLCS_WriteStallMetrics` | `WriteStallCount` and `WriteStallMicros` increment correctly during soft-stall loops |
 | `TestLCS_L0CountTracking` | `l0Count` atomic, `L0FileCount` metric, and `len(l.l0)` stay consistent before and after compaction |
 
+### Phase 4 — Deterministic Fault Injection & Jepsen-style Linearisability Verification (2026-05-21)
+
+#### What changed
+
+Phase 4 adds a complete correctness verification layer consisting of three components:
+
+**1. Porcupine linearisability harness (`internal/linearizability`)**
+
+Every concurrent put/get/delete operation is bracketed with `rec.Begin(input)` /
+`rec.End(id, output)` calls that record a [Porcupine](https://github.com/anishathalye/porcupine)
+event timeline. After all goroutines finish, `rec.CheckTimeout(d)` verifies that
+the observed history is linearisable — i.e., every read returns a value consistent
+with *some* sequential ordering of the concurrent writes.
+
+The KV model treats each key as an independent register
+(`State = map[string]string`). The `PartitionEvent` hook splits the history by key
+before checking, reducing complexity from O(exp(N)) to O(K × exp(N/K)) where K is
+the keyspace size — essential for large histories.
+
+**Failed operations** (`Output.Err = true`) are modelled as no-ops: the checker
+allows the state to remain unchanged. This is exact for in-process failures
+(a panicking Put never reaches the memtable) and conservative for network-level
+errors (the server *may* have committed the write).
+
+**2. Crash recovery tests (`internal/store/lsm/crash_test.go`)**
+
+Six deterministic crash scenarios, each pairing a specific failure mode with an
+expected recovery guarantee:
+
+| Test | Failure injected | Recovery guarantee |
+| --- | --- | --- |
+| `TestCrash_WalReplayDurability` | Clean close + reopen | All 200 pre-close keys readable |
+| `TestCrash_TornWALEntry` | WAL file truncated mid-entry (simulates power-loss byte tear) | Pre-tear keys present; post-tear key absent |
+| `TestCrash_FlushedDataSurvivesTruncation` | Post-flush WAL removed | L0 SSTable survives; keys readable |
+| `TestCrash_ConcurrentWriteDurability` | 6-goroutine write storm + clean close | All successfully-acknowledged keys durable |
+| `TestCrash_RestoreSentinelRecovery` | Manually planted "restore-in-progress" sentinel | Data dir wiped on reopen; sentinel removed |
+| `TestCrash_NoDataLossUnderFlushedAndUnflushed` | Both flushed (L0 SSTable) and unflushed (WAL-only) data present | Both batches readable after close/reopen |
+
+Torn-write simulation stops goroutines directly (`close(tree.stopCh); tree.wg.Wait()`) without calling `tree.Close()`, preserving the WAL on disk for truncation. `os.Truncate` removes trailing bytes before reopening. The test is in `package lsm` (white-box) so it can reach unexported fields.
+
+The sentinel-recovery test exposed a bug: `wipeLSMDir()` removed WAL/SST/manifest files but not the sentinel itself, causing an infinite wipe loop on every subsequent open. Fixed by adding `os.Remove(sentinelPath)` after `wipeLSMDir()` succeeds in `NewLSMTree`.
+
+**3. Distributed chaos runner (`cmd/chaos`)**
+
+A standalone `cmd/chaos` binary runs a Jepsen-style chaos test against a live
+cluster over HTTP:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d
+go run ./cmd/chaos \
+  --target    localhost:8001 \
+  --duration  30s \
+  --workers   8 \
+  --keyspace  20 \
+  --put       50 \
+  --delete    5
+```
+
+The binary runs a **warmup phase** (ops issued but not recorded), then a
+**measurement phase** (all ops recorded as Porcupine events), and finally checks
+the full history for linearisability. Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | PASS — history is linearisable |
+| 1 | FAIL — non-linearisable anomaly detected |
+| 2 | UNKNOWN — check timed out (`--check-timeout`) |
+| 3 | Bad flags / startup error |
+
+The chaos runner uses an explicit `http.Transport` with
+`MaxIdleConnsPerHost = workers + 64` — the same TCP-pool fix applied in
+`cmd/bench` — so high worker counts don't generate `TIME_WAIT` storms.
+
+#### Phase 4 test coverage
+
+| Test | What it verifies |
+| --- | --- |
+| `TestLinearizability_ConcurrentOps` | 5 goroutines × 80 ops on a 5-key space; full Porcupine history is linearisable |
+| `TestLinearizability_WithLevels` | Same check after forcing L0→L1 compaction; reads exercise the full mem→L0→L1 path |
+| `TestCrash_WalReplayDurability` | 200-key WAL round-trip through close/reopen |
+| `TestCrash_TornWALEntry` | Byte-level WAL truncation; pre-tear durability, post-tear absence |
+| `TestCrash_FlushedDataSurvivesTruncation` | Flushed SSTable data outlives WAL removal |
+| `TestCrash_ConcurrentWriteDurability` | 6-writer concurrent storm; all ACK'd keys survive |
+| `TestCrash_RestoreSentinelRecovery` | Sentinel wipe + sentinel self-removal |
+| `TestCrash_NoDataLossUnderFlushedAndUnflushed` | Mixed flushed + in-flight WAL data both survive |
+| `BenchmarkCrash_RecoveryThroughput` | WAL replay throughput for 1000-key history |
+
 ### Operator notes
 
 - `--workers` sizes the worker pool *and* the HTTP connection pool
@@ -435,6 +522,8 @@ Tests cover:
 - **PersistentState round-trip** — atomic write/read of `currentTerm` + `votedFor`
 - **Concurrent store writes** — 100 goroutines, verified under `-race`
 - **LSM-Tree correctness** — MemTable flush, SSTable read, compaction, Bloom filter false-positive rate, leveled-compaction read correctness, tombstone removal, write-stall metrics, L0-count tracking
+- **Crash recovery** — WAL replay, torn-write truncation, flushed-data survival, concurrent-write durability, restore-sentinel self-removal, mixed flushed+unflushed data
+- **Linearisability** — Porcupine-verified concurrent put/get/delete histories; both in-memory and with L0→L1 compaction in progress
 - **HTTP client** — all five endpoints, 404/5xx/unreachable/context-cancel via `httptest.NewServer`
 - **CLI commands** — all commands via mock client + buffer-backed formatters; no real HTTP servers
 
@@ -448,8 +537,12 @@ distrikv/
 │   ├── node/
 │   │   ├── main.go          # Entrypoint: config → Node → Run
 │   │   └── node.go          # Node struct: wires all subsystems, owns shutdown order
-│   └── cli/
-│       └── main.go          # distrikv-cli entrypoint (ldflags version injection)
+│   ├── cli/
+│   │   └── main.go          # distrikv-cli entrypoint (ldflags version injection)
+│   ├── bench/
+│   │   └── main.go          # Open-loop load generator; HDR histograms + engine counters
+│   └── chaos/
+│       └── main.go          # Jepsen-style chaos runner; Porcupine linearisability check
 ├── cli/                     # Cobra command definitions (no internal imports)
 │   ├── root.go              # CLI struct, AppContext, Viper config loading
 │   ├── get.go / put.go / delete.go
@@ -471,6 +564,8 @@ distrikv/
 │   │   ├── log.go           # LogEntry, PersistentState (atomic write-rename)
 │   │   ├── snapshot.go      # InstallSnapshot: binary state transfer to lagging followers
 │   │   └── raft_test.go
+│   ├── linearizability/
+│   │   └── kv_model.go      # Porcupine KV model, PartitionEvent per-key split, Recorder
 │   ├── store/
 │   │   ├── store.go         # High-level KV API wrapping LSM engine
 │   │   ├── wal.go           # WAL wrapper (CRC32 framing, fsync, replay-on-truncation)
@@ -481,7 +576,9 @@ distrikv/
 │   │       ├── sstable.go   # On-disk sorted file; binary search over block index
 │   │       ├── compaction.go# Background level merging; bounds read amplification
 │   │       ├── bloom.go     # Bloom filter (FNV-1a); skips SSTables on point reads
-│   │       └── manifest.go  # SSTable metadata and level membership
+│   │       ├── manifest.go  # SSTable metadata and level membership
+│   │       ├── linearizability_test.go  # Porcupine concurrent-op correctness tests
+│   │       └── crash_test.go            # Deterministic WAL tear + restart recovery tests
 │   ├── server/
 │   │   ├── grpc_server.go   # KVService: ForwardKey, Replicate, RequestVote, AppendEntries, InstallSnapshot
 │   │   └── http_server.go   # REST handlers, ring-based routing, gRPC forwarding

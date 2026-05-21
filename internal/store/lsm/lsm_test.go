@@ -362,6 +362,295 @@ func TestLSM_SnapshotRestore(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3: Leveled Compaction Strategy (LCS) tests
+// ---------------------------------------------------------------------------
+
+// TestLCS_ReadCorrectness verifies that all written keys are readable after
+// an L0→L1 compaction, and that each key returns its latest value
+// (last writer wins).
+func TestLCS_ReadCorrectness(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	m := &metrics.Metrics{}
+
+	// 1 KB memtable + 19 B/entry ≈ 53 entries/flush; 360 total writes → ~7 flushes
+	// → at least one compaction (threshold=4).
+	tree, err := NewLSMTree(dir, nil, WithMetrics(m), WithMaxMemBytes(1<<10))
+	if err != nil {
+		t.Fatalf("NewLSMTree: %v", err)
+	}
+	defer tree.Close()
+
+	const keys = 120
+	const rounds = 3 // write each key `rounds` times; only "round-2" should survive
+
+	for round := 0; round < rounds; round++ {
+		for i := 0; i < keys; i++ {
+			k := fmt.Sprintf("lcs-key-%04d", i)
+			v := []byte(fmt.Sprintf("round-%d", round))
+			if err := tree.Put(ctx, k, v); err != nil {
+				t.Fatalf("Put round=%d i=%d: %v", round, i, err)
+			}
+		}
+	}
+
+	// Wait for at least one compaction so we exercise the L1 read path.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.CompactionsTotal.Load() > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if m.CompactionsTotal.Load() == 0 {
+		t.Fatal("no compaction occurred; check nCompact threshold or write count")
+	}
+
+	// Every key must return the final round's value.
+	want := fmt.Sprintf("round-%d", rounds-1)
+	for i := 0; i < keys; i++ {
+		k := fmt.Sprintf("lcs-key-%04d", i)
+		val, err := tree.Get(ctx, k)
+		if err != nil {
+			t.Fatalf("Get %s after compaction: %v", k, err)
+		}
+		if string(val) != want {
+			t.Fatalf("Get %s: got %q want %q", k, val, want)
+		}
+	}
+
+	t.Logf("compactions=%d flush_bytes=%d compaction_written=%d",
+		m.CompactionsTotal.Load(), m.FlushBytes.Load(), m.CompactionBytesWritten.Load())
+}
+
+// TestLCS_TombstoneDroppedAfterCompaction verifies that deleted keys return
+// ErrNotFound after L0→L1 compaction, and that no tombstone entries survive
+// in L1 SSTables (the MergeIterator drops them at the bottom level).
+func TestLCS_TombstoneDroppedAfterCompaction(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	m := &metrics.Metrics{}
+
+	// 1 KB threshold: frequent flushes ensure tombstones flush to L0 before compaction.
+	tree, err := NewLSMTree(dir, nil, WithMetrics(m), WithMaxMemBytes(1<<10))
+	if err != nil {
+		t.Fatalf("NewLSMTree: %v", err)
+	}
+	defer tree.Close()
+
+	const total = 80
+
+	// Write all keys.
+	for i := 0; i < total; i++ {
+		k := fmt.Sprintf("tomb-key-%04d", i)
+		if err := tree.Put(ctx, k, []byte("alive")); err != nil {
+			t.Fatalf("Put %s: %v", k, err)
+		}
+	}
+	// Delete even-indexed keys (write tombstones into subsequent L0 files).
+	for i := 0; i < total; i += 2 {
+		k := fmt.Sprintf("tomb-key-%04d", i)
+		if err := tree.Delete(ctx, k); err != nil {
+			t.Fatalf("Delete %s: %v", k, err)
+		}
+	}
+	// Write filler to push total flushes past compaction threshold.
+	for i := total; i < total*5; i++ {
+		k := fmt.Sprintf("tomb-fill-%04d", i)
+		if err := tree.Put(ctx, k, []byte("filler")); err != nil {
+			t.Fatalf("Put filler %s: %v", k, err)
+		}
+	}
+
+	// Wait for compaction.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.CompactionsTotal.Load() > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if m.CompactionsTotal.Load() == 0 {
+		t.Fatal("no compaction occurred")
+	}
+
+	// Deleted (even-indexed) keys must be absent.
+	for i := 0; i < total; i += 2 {
+		k := fmt.Sprintf("tomb-key-%04d", i)
+		_, err := tree.Get(ctx, k)
+		if err != ErrNotFound {
+			t.Fatalf("Get deleted %s: got err=%v, want ErrNotFound", k, err)
+		}
+	}
+	// Surviving (odd-indexed) keys must still be readable.
+	for i := 1; i < total; i += 2 {
+		k := fmt.Sprintf("tomb-key-%04d", i)
+		val, err := tree.Get(ctx, k)
+		if err != nil {
+			t.Fatalf("Get surviving %s: %v", k, err)
+		}
+		if string(val) != "alive" {
+			t.Fatalf("Get %s: got %q want %q", k, val, "alive")
+		}
+	}
+
+	// After compaction, L1 SSTables must contain zero tombstone entries.
+	tree.mu.RLock()
+	l1 := make([]*SSTableReader, len(tree.l1))
+	copy(l1, tree.l1)
+	tree.mu.RUnlock()
+
+	if len(l1) == 0 {
+		t.Fatal("no L1 SSTables after compaction; cannot verify tombstone removal")
+	}
+	for ri, r := range l1 {
+		it := r.Iterator()
+		for {
+			e, ok := it.Next()
+			if !ok {
+				break
+			}
+			if e.Tombstone {
+				t.Errorf("L1[%d]: tombstone found for key %q; should be dropped at bottom level", ri, e.Key)
+			}
+		}
+		if err := it.Err(); err != nil {
+			t.Errorf("L1[%d] iterator error: %v", ri, err)
+		}
+	}
+}
+
+// TestLCS_WriteStallMetrics verifies that maybeStallWrite correctly increments
+// WriteStallCount and WriteStallMicros when L0 files accumulate past the slow
+// threshold. An artificial l0Count prevents flushes from racing with the test.
+func TestLCS_WriteStallMetrics(t *testing.T) {
+	dir := t.TempDir()
+	m := &metrics.Metrics{}
+
+	// Use default memtable size; we won't write any data, so no background flushes.
+	tree, err := NewLSMTree(dir, nil, WithMetrics(m))
+	if err != nil {
+		t.Fatalf("NewLSMTree: %v", err)
+	}
+	defer tree.Close()
+
+	// Artificially set l0Count to the soft-stall threshold, bypassing actual flushes.
+	// The background runFlush goroutine is idle (no pending imm), so the value stays put.
+	tree.l0Count.Store(int32(tree.l0SlowThreshold))
+
+	// maybeStallWrite must loop-stall until the context expires.
+	// 100 ms >> 5 ms (one stall cycle) → at least one full cycle records metrics.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	stallErr := tree.maybeStallWrite(ctx)
+	if stallErr != context.DeadlineExceeded {
+		t.Fatalf("maybeStallWrite returned %v; want context.DeadlineExceeded", stallErr)
+	}
+
+	if got := m.WriteStallCount.Load(); got == 0 {
+		t.Fatal("WriteStallCount = 0 after stall loop; want > 0")
+	}
+	if got := m.WriteStallMicros.Load(); got == 0 {
+		t.Fatal("WriteStallMicros = 0 after stall loop; want > 0")
+	}
+	t.Logf("WriteStallCount=%d WriteStallMicros=%dµs",
+		m.WriteStallCount.Load(), m.WriteStallMicros.Load())
+}
+
+// TestLCS_L0CountTracking verifies that the l0Count atomic and the L0FileCount
+// metric are always kept in sync with the actual len(l.l0) slice — both before
+// and after a compaction drains L0.
+func TestLCS_L0CountTracking(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	m := &metrics.Metrics{}
+
+	// 74 B/entry (10 B key + 64 B value); 1 KB memtable → flush every ~13 writes.
+	tree, err := NewLSMTree(dir, nil, WithMetrics(m), WithMaxMemBytes(1<<10))
+	if err != nil {
+		t.Fatalf("NewLSMTree: %v", err)
+	}
+	defer tree.Close()
+
+	// 30 writes → ~2 flushes; nCompact=4 so no compaction yet.
+	for i := 0; i < 30; i++ {
+		k := fmt.Sprintf("l0cnt-%04d", i)
+		if err := tree.Put(ctx, k, make([]byte, 64)); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	// Wait for at least one L0 file to appear.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if tree.l0Count.Load() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Invariant: len(l0), l0Count, and L0FileCount must all agree.
+	// Read under RLock so no write can interleave.
+	tree.mu.RLock()
+	l0Len := int32(len(tree.l0))
+	l0Count := tree.l0Count.Load()
+	l0Metric := int32(m.L0FileCount.Load())
+	tree.mu.RUnlock()
+
+	if l0Len == 0 {
+		t.Fatal("no L0 files after 30 writes; expected at least one flush")
+	}
+	if l0Len != l0Count {
+		t.Errorf("pre-compaction: len(l0)=%d != l0Count=%d", l0Len, l0Count)
+	}
+	if l0Metric != l0Count {
+		t.Errorf("pre-compaction: L0FileCount=%d != l0Count=%d", l0Metric, l0Count)
+	}
+
+	// Write enough to trigger multiple compactions.
+	for i := 30; i < 300; i++ {
+		k := fmt.Sprintf("l0cnt-%04d", i)
+		if err := tree.Put(ctx, k, make([]byte, 64)); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	// Wait for at least one compaction to complete.
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.CompactionsTotal.Load() > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if m.CompactionsTotal.Load() == 0 {
+		t.Fatal("no compaction occurred after 300 writes")
+	}
+
+	// Invariant must hold after compaction too.
+	tree.mu.RLock()
+	l0Len = int32(len(tree.l0))
+	l0Count = tree.l0Count.Load()
+	l0Metric = int32(m.L0FileCount.Load())
+	tree.mu.RUnlock()
+
+	if l0Len != l0Count {
+		t.Errorf("post-compaction: len(l0)=%d != l0Count=%d", l0Len, l0Count)
+	}
+	if l0Metric != l0Count {
+		t.Errorf("post-compaction: L0FileCount=%d != l0Count=%d", l0Metric, l0Count)
+	}
+	t.Logf("compactions=%d post-compaction l0=%d l1=%d",
+		m.CompactionsTotal.Load(), l0Count,
+		func() int32 {
+			tree.mu.RLock()
+			defer tree.mu.RUnlock()
+			return int32(len(tree.l1))
+		}())
+}
+
+// ---------------------------------------------------------------------------
 // Phase 1: metrics instrumentation
 // ---------------------------------------------------------------------------
 

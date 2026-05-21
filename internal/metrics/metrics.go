@@ -68,6 +68,22 @@ type Metrics struct {
 
 	// CompactionsTotal counts completed compactions.
 	CompactionsTotal atomic.Uint64
+
+	// --- Write-stall counters (Phase 3 leveled compaction) ------------------
+
+	// WriteStallCount counts the number of write-stall events triggered by
+	// L0 file accumulation (both soft-stall delays and hard-stop waits).
+	WriteStallCount atomic.Uint64
+
+	// WriteStallMicros is the cumulative wall-clock time spent stalling
+	// incoming writes, in microseconds. Divide by WriteStallCount for the
+	// mean stall duration.
+	WriteStallMicros atomic.Uint64
+
+	// L0FileCount is a point-in-time gauge of live L0 SSTable files.
+	// Updated atomically by flushMemtable (+1) and runCompact (-n).
+	// Useful for dashboards — not a cumulative counter.
+	L0FileCount atomic.Int64
 }
 
 // Snapshot returns a point-in-time copy of all counters as a map suitable for
@@ -102,5 +118,8 @@ func (m *Metrics) Snapshot() map[string]uint64 {
 		"compaction_bytes_read":    m.CompactionBytesRead.Load(),
 		"compactions_total":        m.CompactionsTotal.Load(),
 		"write_amp_factor_milli":   wafMilli,
+		"write_stall_count":        m.WriteStallCount.Load(),
+		"write_stall_micros":       m.WriteStallMicros.Load(),
+		"l0_file_count":            uint64(m.L0FileCount.Load()),
 	}
 }

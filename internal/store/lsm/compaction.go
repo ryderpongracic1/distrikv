@@ -197,7 +197,10 @@ func (c *Compactor) Compact(ctx context.Context, readers []*SSTableReader) (*SST
 		os.Remove(outPath)
 		c.logger.Info("compaction produced empty output; no new SSTable")
 	} else {
-		if err := c.manifest.Add(outName, sstSeq); err != nil {
+		// Output goes to L1 — the level is set on the reader by the caller
+		// (runCompact), but we record level=1 in the manifest here so that
+		// on restart the SSTable is correctly placed into l1, not l0.
+		if err := c.manifest.Add(outName, sstSeq, 1 /*level=L1*/); err != nil {
 			os.Remove(outPath)
 			return nil, fmt.Errorf("compaction: manifest add: %w", err)
 		}

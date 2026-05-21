@@ -58,7 +58,7 @@ optimisation, chaos testing, and operational hardening.
 |---|---|---|
 | P1 | Quantified benchmarking & metrics harness (`cmd/bench`, HDR histograms, bloom + WAF counters) | ✅ Done |
 | P2 | WAL GC optimisation & zero-copy parsing (`sync.Pool` buffers, single-pass CRC, torn-write hardening) | ✅ Done |
-| P3 | Leveled compaction strategy + write-stall backpressure | 🔲 Planned |
+| P3 | Leveled compaction strategy + write-stall backpressure | ✅ Done |
 | P4 | Deterministic fault injection & Jepsen-style linearisability verification | 🔲 Planned |
 | P5 | TBD — based on P1–P4 findings | 🔲 Planned |
 | P6 | TBD | 🔲 Planned |
@@ -344,6 +344,70 @@ are eliminated on the warm path.
   as clean truncations — a disk failure would have been misread as a torn
   write, masking data loss from the operator.
 
+### Phase 3 — Leveled Compaction Strategy (LCS) + Write-Stall Backpressure (2026-05-21)
+
+#### What changed
+
+The LSM storage engine was restructured from a flat `readers []*SSTableReader`
+slice to a two-level model:
+
+| Level | Produced by | Key-range overlap | Read order |
+| --- | --- | --- | --- |
+| **L0** | Memtable flushes | May overlap (newest-first wins) | All L0 files checked, newest first |
+| **L1** | L0→L1 compaction | Non-overlapping | Single merged output, newest first |
+
+A compaction triggers when `len(l0) ≥ 4` (configurable). The compaction job
+merges all L0 files **plus** the existing L1 file into a single new L1 file
+using the existing k-way `MergeIterator`, which deduplicates by sequence number
+and drops tombstones (safe because L1 is always the bottom level — no L2+
+exists yet).
+
+The Manifest tracks each SSTable's level so the engine reconstructs the correct
+L0/L1 split on restart. Pre-Phase-3 manifest events default to `level=0`.
+
+#### Write-stall backpressure
+
+Unthrottled writes can produce L0 files faster than the background compaction
+goroutine can drain them. Left unchecked, this degrades read performance (more
+L0 files to scan) and eventually exhausts disk space. The new
+`maybeStallWrite` gate applies two tiers of backpressure **before** the write
+lock is taken, avoiding any lock-ordering issue:
+
+| L0 file count | Behaviour | Default threshold |
+| --- | --- | --- |
+| < `l0SlowThreshold` | No stall | — |
+| `l0SlowThreshold` ≤ n < `l0StopThreshold` | **Soft stall** — proportional sleep 5–50 ms, repeated until L0 drains | 8 files (2× compaction trigger) |
+| ≥ `l0StopThreshold` | **Hard stop** — blocks on `l0Drained` cond var until `runCompact` broadcasts | 12 files (3× compaction trigger) |
+
+Every stall event increments `metrics.WriteStallCount` and adds elapsed
+microseconds to `metrics.WriteStallMicros` — both visible via `/metrics`.
+The `l0_file_count` gauge tracks the current L0 depth in real time.
+
+Both thresholds are tunable via `WithL0StallConfig(slowThreshold, stopThreshold)`
+for tests or custom deployments.
+
+#### Read path after Phase 3
+
+```
+Get(key)
+ └─ mem (active Memtable)
+ └─ imm (immutable Memtable, non-nil only during a flush)
+ └─ l0[0], l0[1], … l0[n-1]   ← newest-first, ALL files checked (keys may overlap)
+ └─ l1[0]                      ← single merged output, non-overlapping
+```
+
+The overhead of scanning all L0 files is bounded by the compaction trigger
+threshold (≤ 4 files in steady state), so read amplification stays predictable.
+
+#### Phase 3 test coverage
+
+| Test | What it verifies |
+| --- | --- |
+| `TestLCS_ReadCorrectness` | All keys readable after L0→L1 compaction; last writer wins across rounds |
+| `TestLCS_TombstoneDroppedAfterCompaction` | Deleted keys return `ErrNotFound`; no tombstone entries in L1 SSTables |
+| `TestLCS_WriteStallMetrics` | `WriteStallCount` and `WriteStallMicros` increment correctly during soft-stall loops |
+| `TestLCS_L0CountTracking` | `l0Count` atomic, `L0FileCount` metric, and `len(l.l0)` stay consistent before and after compaction |
+
 ### Operator notes
 
 - `--workers` sizes the worker pool *and* the HTTP connection pool
@@ -370,7 +434,7 @@ Tests cover:
 - **Raft vote-granting logic** — stale term, duplicate vote, outdated log, idempotent re-vote
 - **PersistentState round-trip** — atomic write/read of `currentTerm` + `votedFor`
 - **Concurrent store writes** — 100 goroutines, verified under `-race`
-- **LSM-Tree correctness** — MemTable flush, SSTable read, compaction, Bloom filter false-positive rate
+- **LSM-Tree correctness** — MemTable flush, SSTable read, compaction, Bloom filter false-positive rate, leveled-compaction read correctness, tombstone removal, write-stall metrics, L0-count tracking
 - **HTTP client** — all five endpoints, 404/5xx/unreachable/context-cancel via `httptest.NewServer`
 - **CLI commands** — all commands via mock client + buffer-backed formatters; no real HTTP servers
 

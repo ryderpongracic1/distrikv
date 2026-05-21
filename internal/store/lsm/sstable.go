@@ -161,12 +161,14 @@ func (w *SSTableWriter) writeBuf(data []byte) error {
 
 // SSTableReader reads entries from a single SSTable file.
 // SSTSeq is used by the LSMTree to order readers: higher = newer.
+// Level is the LSM compaction level (0 = L0, 1 = L1, …); set by LSMTree after open.
 type SSTableReader struct {
 	f      *os.File
 	index  []IndexEntry
 	filter *BloomFilter
 	size   int64
 	SSTSeq uint64
+	Level  int    // compaction level; set by LSMTree after OpenSSTableReader
 	path   string // full path, used for deletion during compaction
 
 	// metrics is attached by the LSMTree after open. nil → no instrumentation.

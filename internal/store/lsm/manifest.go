@@ -14,6 +14,7 @@ type ManifestEvent struct {
 	Type   string `json:"type"`    // "add" or "remove"
 	Path   string `json:"path"`    // SSTable basename, e.g. "sst-00000001.sst"
 	SSTSeq uint64 `json:"sst_seq"` // SSTable sequence number for ordering
+	Level  int    `json:"level"`   // LSM level (0 = L0, 1 = L1, …). Defaults to 0 for pre-Phase-3 events.
 }
 
 // Manifest is the source of truth for which SSTable files are live.
@@ -53,10 +54,11 @@ func OpenManifest(path string) (*Manifest, error) {
 }
 
 // Add records a new SSTable as live and rewrites the manifest atomically.
-func (m *Manifest) Add(baseName string, sstSeq uint64) error {
+// level is the LSM level of the SSTable (0 = L0, 1 = L1, …).
+func (m *Manifest) Add(baseName string, sstSeq uint64, level int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.events = append(m.events, ManifestEvent{Type: "add", Path: baseName, SSTSeq: sstSeq})
+	m.events = append(m.events, ManifestEvent{Type: "add", Path: baseName, SSTSeq: sstSeq, Level: level})
 	return m.writeAll()
 }
 
@@ -85,10 +87,17 @@ func (m *Manifest) LiveFiles() []ManifestEvent {
 		}
 	}
 
+	levels := make(map[string]int)
+	for _, ev := range m.events {
+		if ev.Type == "add" {
+			levels[ev.Path] = ev.Level
+		}
+	}
+
 	var live []ManifestEvent
 	for path, cnt := range counts {
 		if cnt > 0 {
-			live = append(live, ManifestEvent{Path: path, SSTSeq: seqs[path]})
+			live = append(live, ManifestEvent{Path: path, SSTSeq: seqs[path], Level: levels[path]})
 		}
 	}
 	sort.Slice(live, func(i, j int) bool { return live[i].SSTSeq < live[j].SSTSeq })

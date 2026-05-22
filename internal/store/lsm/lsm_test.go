@@ -913,3 +913,102 @@ func TestBlockCache_EvictOnCompaction(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Block-cache benchmarks
+// ---------------------------------------------------------------------------
+
+// BenchmarkBlockCache_ColdVsWarm measures the per-Get cost of an uncached (cold)
+// SSTable read vs. a cached (warm) read.  Both sub-benchmarks exercise the same
+// Bloom-filter → blockIndexFor → readBlock path; the only difference is whether
+// the raw block bytes are served from the in-process LRU or from f.ReadAt.
+//
+// Set-up: write enough unique keys so the memtable flushes to ≥1 L0 SSTable,
+// then wait for the flush before starting timing.  Each benchmark iteration
+// reads the same key repeatedly; the key is chosen to be present in an SSTable
+// (not just in the memtable) so the block cache actually matters.
+func BenchmarkBlockCache_ColdVsWarm(b *testing.B) {
+	const writeKeys = 300 // enough to force ≥1 flush at a 512-B threshold
+
+	setup := func(b *testing.B, cacheBytes int64) (*LSMTree, string) {
+		b.Helper()
+		dir := b.TempDir()
+		ctx := context.Background()
+
+		tree, err := NewLSMTree(dir, nil,
+			WithMaxMemBytes(512),
+			WithBlockCacheBytes(cacheBytes),
+		)
+		if err != nil {
+			b.Fatalf("NewLSMTree: %v", err)
+		}
+
+		// Write unique keys so the memtable flushes to disk.
+		for i := 0; i < writeKeys; i++ {
+			if err := tree.Put(ctx, fmt.Sprintf("bkey-%06d", i), []byte(fmt.Sprintf("val-%06d", i))); err != nil {
+				b.Fatalf("Put %d: %v", i, err)
+			}
+		}
+
+		// Wait for quiescence: all L0 files must be compacted to L1 (l0==0)
+		// and no immutable memtable in progress (imm==nil).  Once quiescent,
+		// no new writes occur during b.N, so no further compaction fires —
+		// the L1 file handle stays open and stable for the duration.
+		// (This also avoids the latent close-before-swap race described in
+		//  the spawned task — the window simply never opens while idle.)
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			tree.mu.RLock()
+			l0empty := len(tree.l0) == 0
+			immNil := tree.imm == nil
+			l1ok := len(tree.l1) > 0
+			tree.mu.RUnlock()
+			if l0empty && immNil && l1ok {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		tree.mu.RLock()
+		l0empty := len(tree.l0) == 0
+		l1ok := len(tree.l1) > 0
+		tree.mu.RUnlock()
+		if !l0empty || !l1ok {
+			b.Fatalf("engine did not quiesce (l0=%v l1=%v); cannot benchmark block cache",
+				!l0empty, l1ok)
+		}
+
+		// The benchmark key lives in L1 (written early, definitely compacted).
+		hotKey := fmt.Sprintf("bkey-%06d", writeKeys/2)
+		return tree, hotKey
+	}
+
+	b.Run("Cold/NoCacheNoBloom", func(b *testing.B) {
+		// Disable cache entirely so every iteration goes to disk.
+		tree, hotKey := setup(b, 0)
+		defer tree.Close()
+		ctx := context.Background()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := tree.Get(ctx, hotKey); err != nil {
+				b.Fatalf("Get: %v", err)
+			}
+		}
+	})
+
+	b.Run("Warm/64MBCache", func(b *testing.B) {
+		// 64 MB cache — prime with one cold read, then benchmark warm hits.
+		tree, hotKey := setup(b, 64<<20)
+		defer tree.Close()
+		ctx := context.Background()
+		// Prime the cache.
+		if _, err := tree.Get(ctx, hotKey); err != nil {
+			b.Fatalf("prime Get: %v", err)
+		}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := tree.Get(ctx, hotKey); err != nil {
+				b.Fatalf("Get: %v", err)
+			}
+		}
+	})
+}

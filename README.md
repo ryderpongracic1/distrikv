@@ -566,6 +566,7 @@ a lower hit rate due to natural working-set pressure.
 | `TestBlockCache_NilSafe` | `WithBlockCacheBytes(0)` produces no panics and all keys are still readable |
 | `TestBlockCache_EvictOnCompaction` | Post-compaction keys remain readable; cache eviction does not corrupt data |
 | `BenchmarkBlockCache_ColdVsWarm` | Microbenchmark isolating cold `f.ReadAt` vs warm in-process cache path |
+| `TestBlockCache_ZipfHitRate` | Zipfian α=1.1 hit-rate sweep across 4 cache sizes (0, 8, 32, 64 MB); 100k-key dataset, 768 B values, reverse-scan warm + 10k measurement pass |
 
 #### Phase 5 latency profile (2026-05-21, Apple M1 Max)
 
@@ -588,6 +589,21 @@ a lower hit rate due to natural working-set pressure.
 | Mixed read/write (compaction pressure) | Compaction evicts old SSTables from both the in-process cache and triggers OS cache pressure; in-process cache survives the swap since it evicts by path, not by fd |
 
 The Phase 1 benchmark baseline used a 100k-key uniform workload where the full dataset is many times larger than any reasonable in-process cache — that workload will show minimal cache benefit. The cache targets hot-key / Zipfian workloads (`--keydist zipf`) where a small fraction of keys accounts for most reads. The `block_cache_hits` / `hit_rate` fields in `cmd/bench` output make this visible without guesswork.
+
+#### Phase 5 Zipfian hit-rate baseline (2025-05-22, Apple M4 Pro)
+
+`go test ./internal/store/lsm/ -run TestBlockCache_ZipfHitRate -v -timeout 120s`
+
+**Setup:** 100,000 keys × 768-byte values (≈ 76 MB) across 4 L1 SSTable files (~19 MB each, simulating 4 compaction rounds at the default 4 MB memtable threshold). **Distribution:** Zipfian α = 1.1 — the YCSB/RocksDB canonical exponent, where the top 1% of keys account for ~54% of reads and the top 10% account for ~88%. **Warm pass:** reverse-rank sequential scan (rank 99,999 → 0) so the LRU eviction leaves the hottest blocks resident. **Measurement:** 10,000 seeded-random (seed=42) Zipfian reads.
+
+| Cache size | Hits | Misses | Hit rate |
+| ---: | ---: | ---: | ---: |
+| 0 MB (disabled) | 0 | 10,000 | 0.0% |
+| 8 MB | 8,633 | 1,367 | **86.3%** |
+| 32 MB | 9,579 | 421 | **95.8%** |
+| 64 MB (default) | 9,920 | 80 | **99.2%** |
+
+The 86.3% figure for 8 MB is analytically consistent: 8 MB holds ~2,048 blocks, covering the top ~10,240 keys, which at α = 1.1 capture ≈ 88% of reads (harmonic sum H ≈ 6.84). The cache earns disproportionate returns on the first few megabytes — 8 MB captures 86% of the benefit that 64 MB achieves.
 
 ### Operator notes
 
@@ -618,7 +634,7 @@ Tests cover:
 - **LSM-Tree correctness** — MemTable flush, SSTable read, compaction, Bloom filter false-positive rate, leveled-compaction read correctness, tombstone removal, write-stall metrics, L0-count tracking
 - **Crash recovery** — WAL replay, torn-write truncation, flushed-data survival, concurrent-write durability, restore-sentinel self-removal, mixed flushed+unflushed data
 - **Linearizability** — Porcupine-verified concurrent put/get/delete histories; both in-memory and with L0→L1 compaction in progress
-- **Block cache** — hit/miss accounting, nil-safe disabled mode, eviction correctness after compaction
+- **Block cache** — hit/miss accounting, nil-safe disabled mode, eviction correctness after compaction, Zipfian α=1.1 hit-rate sweep (0→8→32→64 MB)
 - **HTTP client** — all five endpoints, 404/5xx/unreachable/context-cancel via `httptest.NewServer`
 - **CLI commands** — all commands via mock client + buffer-backed formatters; no real HTTP servers
 

@@ -59,7 +59,7 @@ optimisation, chaos testing, and operational hardening.
 | P1 | Quantified benchmarking & metrics harness (`cmd/bench`, HDR histograms, bloom + WAF counters) | ✅ Done |
 | P2 | WAL GC optimisation & zero-copy parsing (`sync.Pool` buffers, single-pass CRC, torn-write hardening) | ✅ Done |
 | P3 | Leveled compaction strategy + write-stall backpressure | ✅ Done |
-| P4 | Deterministic fault injection & Jepsen-style linearisability verification | ✅ Done |
+| P4 | Deterministic fault injection & Jepsen-style linearizability verification | ✅ Done |
 | P5 | In-process sharded LRU block cache (64 MB default, configurable) | ✅ Done |
 | P6 | TBD | 🔲 Planned |
 | P7 | TBD | 🔲 Planned |
@@ -408,13 +408,13 @@ threshold (≤ 4 files in steady state), so read amplification stays predictable
 | `TestLCS_WriteStallMetrics` | `WriteStallCount` and `WriteStallMicros` increment correctly during soft-stall loops |
 | `TestLCS_L0CountTracking` | `l0Count` atomic, `L0FileCount` metric, and `len(l.l0)` stay consistent before and after compaction |
 
-### Phase 4 — Deterministic Fault Injection & Jepsen-style Linearisability Verification
+### Phase 4 — Deterministic Fault Injection & Jepsen-style Linearizability Verification (2026-05-21)
 
 #### What changed
 
 Phase 4 adds a complete correctness verification layer consisting of three components:
 
-**1. Porcupine linearisability harness (`internal/linearizability`)**
+**1. Porcupine linearizability harness (`internal/linearizability`)**
 
 Every concurrent put/get/delete operation is bracketed with `rec.Begin(input)` /
 `rec.End(id, output)` calls that record a [Porcupine](https://github.com/anishathalye/porcupine)
@@ -468,7 +468,7 @@ go run ./cmd/chaos \
 
 The binary runs a **warmup phase** (ops issued but not recorded), then a
 **measurement phase** (all ops recorded as Porcupine events), and finally checks
-the full history for linearisability. Exit codes:
+the full history for linearizability. Exit codes:
 
 | Code | Meaning |
 | --- | --- |
@@ -565,6 +565,29 @@ a lower hit rate due to natural working-set pressure.
 | `TestBlockCache_HitRateAfterWarmup` | Cold pass: `BlockCacheMisses > 0`; warm pass: `BlockCacheHits ≥ cold misses`, zero misses |
 | `TestBlockCache_NilSafe` | `WithBlockCacheBytes(0)` produces no panics and all keys are still readable |
 | `TestBlockCache_EvictOnCompaction` | Post-compaction keys remain readable; cache eviction does not corrupt data |
+| `BenchmarkBlockCache_ColdVsWarm` | Microbenchmark isolating cold `f.ReadAt` vs warm in-process cache path |
+
+#### Phase 5 latency profile (2026-05-21, Apple M1 Max)
+
+`go test -bench=BenchmarkBlockCache_ColdVsWarm -benchtime=3s -count=3 -benchmem`
+
+| Path | ns/op | B/op | allocs/op | Notes |
+| --- | ---: | ---: | ---: | --- |
+| **Cold** (no cache, `ReadAt`) | 8,013 | 24,576 | 227 | OS page cache warm; SSD not involved |
+| **Warm** (in-process LRU cache) | 7,480 | 24,576 | 227 | ~7% faster; identical allocation profile |
+
+**Why the gap is small here:** the test SSTable is tiny (~6 KB) and was just written, so it is fully resident in the OS page cache. A page-cached `ReadAt` on M1 costs ~500 ns — competitive with a sharded map lookup. The 227 allocs/op are dominated by `string(...)` copies during block decoding, which happen equally on both paths. Both paths also allocate a fresh `[]byte` for the block data (cold: `make([]byte, blockLen)` inside `ReadAt`; warm: the copy returned from `cache.Get`).
+
+**When the cache earns its keep:**
+
+| Scenario | Benefit |
+| --- | --- |
+| Working set > OS page cache | Blocks are in Go heap instead of requiring kernel I/O + context switch; warm reads stay in user space |
+| High concurrency (many goroutines, same hot blocks) | Eliminates serialization on the kernel page-cache lock; sharded in-process cache has finer-grained locking |
+| Large SSTables with cold blocks (post-restart) | First access warms the in-process cache; subsequent accesses skip the syscall and kernel→user copy |
+| Mixed read/write (compaction pressure) | Compaction evicts old SSTables from both the in-process cache and triggers OS cache pressure; in-process cache survives the swap since it evicts by path, not by fd |
+
+The Phase 1 benchmark baseline used a 100k-key uniform workload where the full dataset is many times larger than any reasonable in-process cache — that workload will show minimal cache benefit. The cache targets hot-key / Zipfian workloads (`--keydist zipf`) where a small fraction of keys accounts for most reads. The `block_cache_hits` / `hit_rate` fields in `cmd/bench` output make this visible without guesswork.
 
 ### Operator notes
 
@@ -594,7 +617,7 @@ Tests cover:
 - **Concurrent store writes** — 100 goroutines, verified under `-race`
 - **LSM-Tree correctness** — MemTable flush, SSTable read, compaction, Bloom filter false-positive rate, leveled-compaction read correctness, tombstone removal, write-stall metrics, L0-count tracking
 - **Crash recovery** — WAL replay, torn-write truncation, flushed-data survival, concurrent-write durability, restore-sentinel self-removal, mixed flushed+unflushed data
-- **Linearisability** — Porcupine-verified concurrent put/get/delete histories; both in-memory and with L0→L1 compaction in progress
+- **Linearizability** — Porcupine-verified concurrent put/get/delete histories; both in-memory and with L0→L1 compaction in progress
 - **Block cache** — hit/miss accounting, nil-safe disabled mode, eviction correctness after compaction
 - **HTTP client** — all five endpoints, 404/5xx/unreachable/context-cancel via `httptest.NewServer`
 - **CLI commands** — all commands via mock client + buffer-backed formatters; no real HTTP servers
@@ -614,7 +637,7 @@ distrikv/
 │   ├── bench/
 │   │   └── main.go          # Open-loop load generator; HDR histograms + engine counters
 │   └── chaos/
-│       └── main.go          # Jepsen-style chaos runner; Porcupine linearisability check
+│       └── main.go          # Jepsen-style chaos runner; Porcupine linearizability check
 ├── cli/                     # Cobra command definitions (no internal imports)
 │   ├── root.go              # CLI struct, AppContext, Viper config loading
 │   ├── get.go / put.go / delete.go

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"sync/atomic"
 
 	"github.com/ryderpongracic1/distrikv/internal/metrics"
 )
@@ -162,6 +163,22 @@ func (w *SSTableWriter) writeBuf(data []byte) error {
 // SSTableReader reads entries from a single SSTable file.
 // SSTSeq is used by the LSMTree to order readers: higher = newer.
 // Level is the LSM compaction level (0 = L0, 1 = L1, …); set by LSMTree after open.
+//
+// Lifecycle (reference counting)
+//
+// Every SSTableReader starts with refs=1 (the "ownership" reference held by
+// l0 or l1 in the LSMTree). Callers that want to read the file concurrently
+// with a potential compaction swap must acquire a reference before releasing
+// l.mu and release it when done:
+//
+//	// Under l.mu.RLock():
+//	for _, r := range l.l0 { r.refs.Add(1) }
+//	l.mu.RUnlock()
+//	defer func() { for _, r := range l.l0 { r.Release() } }()
+//
+// runCompact calls Release on old readers after swapping them out of l0/l1.
+// The file descriptor is closed only when the reference count reaches zero,
+// which guarantees that no in-flight ReadAt can see a closed fd.
 type SSTableReader struct {
 	f      *os.File
 	index  []IndexEntry
@@ -170,6 +187,10 @@ type SSTableReader struct {
 	SSTSeq uint64
 	Level  int    // compaction level; set by LSMTree after OpenSSTableReader
 	path   string // full path, used for deletion during compaction
+
+	// refs is the reference count. Starts at 1 (ownership ref). Release()
+	// decrements; when it reaches 0 the underlying os.File is closed.
+	refs atomic.Int32
 
 	// metrics and cache are attached by the LSMTree after open. nil → disabled.
 	metrics *metrics.Metrics
@@ -226,10 +247,12 @@ func OpenSSTableReader(path string, sstSeq uint64) (*SSTableReader, error) {
 		return nil, fmt.Errorf("sstable: decode filter: %w", err)
 	}
 
-	return &SSTableReader{
+	r := &SSTableReader{
 		f: f, index: index, filter: filter,
 		size: size, SSTSeq: sstSeq, path: path,
-	}, nil
+	}
+	r.refs.Store(1) // ownership reference; decremented by Release() / Close()
+	return r, nil
 }
 
 // Get looks up key. Returns (entry, true, nil) if found (tombstones included — caller checks).
@@ -330,8 +353,22 @@ func (r *SSTableReader) Iterator() *SSTableIterator {
 	return &SSTableIterator{r: r, blockIdx: -1}
 }
 
-// Close releases the file handle.
-func (r *SSTableReader) Close() error { return r.f.Close() }
+// Release decrements the reference count. When it reaches zero the underlying
+// file descriptor is closed. Callers must not use the reader after Release
+// reduces the count to zero.
+func (r *SSTableReader) Release() {
+	if r.refs.Add(-1) == 0 {
+		_ = r.f.Close()
+	}
+}
+
+// Close is an alias for Release. It exists so that LSMTree.Close and crash
+// tests can call the familiar Close() idiom; the actual close is deferred
+// until all references are gone.
+func (r *SSTableReader) Close() error {
+	r.Release()
+	return nil
+}
 
 // ---- Iterator --------------------------------------------------------------
 

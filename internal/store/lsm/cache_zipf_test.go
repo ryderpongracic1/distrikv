@@ -36,7 +36,7 @@ package lsm
 // ║ Shards       32 (numCacheShards; FNV-1a routing)                        ║
 // ╠══════════════════════════════════════════════════════════════════════════╣
 // ║                         RESULTS                                         ║
-// ║  (Apple M4 Pro, macOS 15, Go 1.26, tmpfs; seed=42; 2025-05-22)         ║
+// ║  (Apple M1 Max, macOS 15, Go 1.26, tmpfs; seed=42; 2025-05-22)         ║
 // ║                                                                         ║
 // ║  cache_mb=0   hits=0      misses=10000  hit_rate= 0.0%                 ║
 // ║  cache_mb=8   hits=8633   misses=1367   hit_rate=86.3%                 ║

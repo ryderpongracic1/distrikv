@@ -590,7 +590,7 @@ a lower hit rate due to natural working-set pressure.
 
 The Phase 1 benchmark baseline used a 100k-key uniform workload where the full dataset is many times larger than any reasonable in-process cache — that workload will show minimal cache benefit. The cache targets hot-key / Zipfian workloads (`--keydist zipf`) where a small fraction of keys accounts for most reads. The `block_cache_hits` / `hit_rate` fields in `cmd/bench` output make this visible without guesswork.
 
-#### Phase 5 Zipfian hit-rate baseline (2025-05-22, Apple M4 Pro)
+#### Phase 5 Zipfian hit-rate baseline (2025-05-22, Apple M1 Max)
 
 `go test ./internal/store/lsm/ -run TestBlockCache_ZipfHitRate -v -timeout 120s`
 

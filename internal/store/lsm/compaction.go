@@ -216,14 +216,21 @@ func (c *Compactor) Compact(ctx context.Context, readers []*SSTableReader) (*SST
 		c.metrics.CompactionsTotal.Add(1)
 	}
 
-	// Remove old SSTables from manifest and disk.
+	// Remove old SSTables from the manifest and unlink their files from disk.
+	//
+	// We do NOT close the SSTableReader file descriptors here.  Closing them
+	// inside Compact() would race with concurrent Get calls that snapshotted
+	// the same readers under l.mu.RLock() and are still mid-ReadAt.  On Unix,
+	// os.Remove unlinks the directory entry but the inode (and the data it
+	// holds) remains accessible to any open file descriptor until all fds are
+	// closed.  The caller (runCompact) owns the lifecycle: it calls
+	// r.Release() on the old readers after swapping them out of l0/l1, and
+	// any concurrent Gets that acquired a reference before the swap will close
+	// the fd when they call their deferred Release().
 	for _, r := range readers {
 		baseName := filepath.Base(r.path)
 		if err := c.manifest.Remove(baseName); err != nil {
 			c.logger.Error("compaction: manifest remove failed", "file", baseName, "err", err)
-		}
-		if err := r.Close(); err != nil {
-			c.logger.Warn("compaction: close old reader", "err", err)
 		}
 		if err := os.Remove(r.path); err != nil && !os.IsNotExist(err) {
 			c.logger.Warn("compaction: remove old SSTable", "path", r.path, "err", err)

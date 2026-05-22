@@ -308,13 +308,30 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 // Get retrieves the value for key. Returns ErrNotFound if absent or deleted.
 // Read path: mem → imm → L0 (newest-first) → L1 (newest-first).
 func (l *LSMTree) Get(_ context.Context, key string) ([]byte, error) {
-	// Snapshot all state atomically under RLock.
+	// Snapshot all state and acquire SSTableReader references atomically under
+	// RLock.  Acquiring refs before releasing the lock guarantees that
+	// runCompact cannot call Release() and close the underlying file descriptor
+	// while we are still mid-ReadAt.  See SSTableReader.Release for details.
 	l.mu.RLock()
 	mem := l.mem
 	imm := l.imm
 	l0 := l.l0
 	l1 := l.l1
+	for _, r := range l0 {
+		r.refs.Add(1)
+	}
+	for _, r := range l1 {
+		r.refs.Add(1)
+	}
 	l.mu.RUnlock()
+	defer func() {
+		for _, r := range l0 {
+			r.Release()
+		}
+		for _, r := range l1 {
+			r.Release()
+		}
+	}()
 
 	// 1. Active memtable.
 	if e, ok := mem.Get(key); ok {
@@ -638,6 +655,18 @@ func (l *LSMTree) runCompact(ctx context.Context) {
 				l.cache.Evict(r.path)
 			}
 
+			// Release the ownership reference for each old reader. After the
+			// swap above, no new Get/Snapshot can snapshot these readers.
+			// Any concurrent Get that acquired a reference before the swap
+			// still holds it and will call Release when it finishes, safely
+			// closing the fd only after the last reference is gone.
+			for _, r := range l0snap {
+				r.Release()
+			}
+			for _, r := range l1snap {
+				r.Release()
+			}
+
 			l.logger.Info("lsm: L0→L1 compaction complete",
 				"l0_inputs", len(l0snap),
 				"l1_inputs", len(l1snap),
@@ -665,12 +694,28 @@ func compactInputOrder(l0, l1 []*SSTableReader) []*SSTableReader {
 // Snapshot returns a full copy of all live (non-tombstone) key-value pairs.
 // Used by Raft to capture state machine state for InstallSnapshot.
 func (l *LSMTree) Snapshot(_ context.Context) (map[string][]byte, error) {
+	// Acquire SSTableReader references before releasing the lock for the same
+	// reason as Get: prevents runCompact from closing fds while we iterate.
 	l.mu.RLock()
 	mem := l.mem
 	imm := l.imm
 	l0 := l.l0
 	l1 := l.l1
+	for _, r := range l0 {
+		r.refs.Add(1)
+	}
+	for _, r := range l1 {
+		r.refs.Add(1)
+	}
 	l.mu.RUnlock()
+	defer func() {
+		for _, r := range l0 {
+			r.Release()
+		}
+		for _, r := range l1 {
+			r.Release()
+		}
+	}()
 
 	out := make(map[string][]byte)
 

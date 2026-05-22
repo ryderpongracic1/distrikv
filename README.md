@@ -344,7 +344,7 @@ are eliminated on the warm path.
   as clean truncations — a disk failure would have been misread as a torn
   write, masking data loss from the operator.
 
-### Phase 3 — Leveled Compaction Strategy (LCS) + Write-Stall Backpressure (2026-05-21)
+### Phase 3 — Leveled Compaction Strategy (LCS) + Write-Stall Backpressure
 
 #### What changed
 
@@ -408,7 +408,7 @@ threshold (≤ 4 files in steady state), so read amplification stays predictable
 | `TestLCS_WriteStallMetrics` | `WriteStallCount` and `WriteStallMicros` increment correctly during soft-stall loops |
 | `TestLCS_L0CountTracking` | `l0Count` atomic, `L0FileCount` metric, and `len(l.l0)` stay consistent before and after compaction |
 
-### Phase 4 — Deterministic Fault Injection & Jepsen-style Linearisability Verification (2026-05-21)
+### Phase 4 — Deterministic Fault Injection & Jepsen-style Linearisability Verification
 
 #### What changed
 
@@ -495,7 +495,7 @@ The chaos runner uses an explicit `http.Transport` with
 | `TestCrash_NoDataLossUnderFlushedAndUnflushed` | Mixed flushed + in-flight WAL data both survive |
 | `BenchmarkCrash_RecoveryThroughput` | WAL replay throughput for 1000-key history |
 
-### Phase 5 — In-process Sharded LRU Block Cache (2026-05-21)
+### Phase 5 — In-process Sharded LRU Block Cache
 
 #### What changed
 

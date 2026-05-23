@@ -309,6 +309,23 @@ These numbers establish the baseline for Phases 2 (WAL GC optimisation), 3
 (leveled compaction), and 4 (chaos). Any regression in p99 or WAF in a
 later phase has to be justified.
 
+### Throughput ceiling (2025-05-22, 3-node docker-compose, Apple M1 Max 32 GB)
+
+Measured with `cmd/bench` open-loop Poisson arrivals against a healthy 3-node
+cluster; Zipfian α=1.1, 100k-key space, 256 B values.  "Not saturated" means
+`max_queue_depth ≪ cap` and achieved QPS ≈ target QPS.
+
+| Workload | Target QPS | Achieved | p50 | p99 | Saturated? |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 100% writes (PUT) | 1,200 | **1,191 /s** | 3 ms | 70 ms | No |
+| 100% reads (GET) | 6,000 | **5,977 /s** | 0.5 ms | 11 ms | No |
+| 20% write / 80% read | 3,000 | **2,996 /s** | 1 ms | 70 ms | No |
+
+Write throughput is bounded by WAL fsync + gRPC replication to ring-replica
+nodes (each PUT incurs one fsync on the ring-primary and one gRPC round-trip to
+each replica before returning). Read throughput is limited only by ring lookup,
+LSM block reads, and HTTP round-trip overhead; no replication is required.
+
 ### Phase 2 WAL allocation profile (2026-05-21, Apple M1 Max)
 
 `go test -bench=BenchmarkWAL_Append -benchmem` after the Phase 2 refactor:

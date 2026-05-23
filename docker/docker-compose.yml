@@ -10,6 +10,9 @@ services:
       WAL_PATH: /data/wal.log
       DATA_DIR: /data
       PEERS: "node2=node2:9002,node3=node3:9003"
+      ELECTION_TIMEOUT_MIN: "500ms"
+      ELECTION_TIMEOUT_MAX: "1000ms"
+      HEARTBEAT_INTERVAL: "150ms"
     ports:
       - "8001:8001"
       - "9001:9001"
@@ -27,6 +30,9 @@ services:
       WAL_PATH: /data/wal.log
       DATA_DIR: /data
       PEERS: "node1=node1:9001,node3=node3:9003"
+      ELECTION_TIMEOUT_MIN: "500ms"
+      ELECTION_TIMEOUT_MAX: "1000ms"
+      HEARTBEAT_INTERVAL: "150ms"
     ports:
       - "8002:8002"
       - "9002:9002"
@@ -44,6 +50,9 @@ services:
       WAL_PATH: /data/wal.log
       DATA_DIR: /data
       PEERS: "node1=node1:9001,node2=node2:9002"
+      ELECTION_TIMEOUT_MIN: "500ms"
+      ELECTION_TIMEOUT_MAX: "1000ms"
+      HEARTBEAT_INTERVAL: "150ms"
     ports:
       - "8003:8003"
       - "9003:9003"

@@ -148,8 +148,16 @@ If the ring-primary itself is unreachable, the forwarding node answers
 primary whose host has vanished (which never sends a TCP RST, leaving the gRPC
 channel stuck in `CONNECTING`) can no longer outlast the HTTP `WriteTimeout` and
 leave the client with no response at all. `503` still means "the primary took the
-write but a replica did not ACK"; `502` means "the primary could not be reached,
-so nothing was written".
+write but a replica did not ACK"; `502` means "the primary could not be reached".
+
+Whether a 502 means anything was written is a separate question, and the response
+answers it rather than leaving it to be inferred: every 502 carries a
+`forward_outcome` field, `"never-sent"` when the request provably never left this
+node and `"unknown"` when the RPC failed in a way that may have been applied
+before the response was lost. The distinction is not cosmetic — the
+linearizability model needs it, and cannot derive it downstream. Phase 4's
+*How failed operations are modelled* below carries the decision table and the
+proof behind each row.
 
 Reads are served from the ring-primary's local store and are never replicated,
 so a node on the minority side of a partition still answers reads while
@@ -701,9 +709,9 @@ collapsing them into one is how a correct store gets reported as broken:
 
 | Outcome | When | Encoding | What the checker may conclude |
 | --- | --- | --- | --- |
-| **Never applied** | The transport delivered nothing: a refused connection, an unresolvable or unroutable host — what a client sees while a node is down | `Output{Err: true}` — no-op | The value cannot appear. A read that returns it is an anomaly |
+| **Never applied** | The transport delivered nothing: a connection refused before the request could be written, an address that was never dialed. Either observed by the client directly, or reported by the forwarding node as `forward_outcome: never-sent` | `Output{Err: true}` — no-op | The value cannot appear. A read that returns it is an anomaly |
 | **Applied anyway** | HTTP 503: the ring-primary wrote to its own store and then failed to replicate. There is no rollback, and reads are served by that primary | `Output{Err: true, Applied: true}` — the write happened | The value is present. A read that *misses* it is an anomaly |
-| **Unknown** | The connection died mid-request, a deadline expired, a forwarding hop failed after the request may already have been applied | `Recorder.EndUnknown` — a **pending operation** | Either. It may be linearized anywhere, including after the whole history |
+| **Unknown** | The connection died mid-request, a deadline expired, or a forwarding hop failed in a way that may already have been applied — `forward_outcome: unknown` | `Recorder.EndUnknown` — a **pending operation** | Either. It may be linearized anywhere, including after the whole history |
 
 Pending is Porcupine's treatment of an unfinished operation and Jepsen's `:info`.
 Porcupine's event API cannot express it by dropping the return — an unmatched call
@@ -713,12 +721,19 @@ that API uses each event's index as its timestamp, that is the equivalent of
 `Return = +∞`: the operation's interval extends past everything observed, so
 "anywhere or nowhere" is exactly what the checker gets to choose from.
 
-The classification reads the **error chain**, not the message. `internal/client`
-returns a typed `*StatusError`, so 503 (applied), 502 (the forward hop failed) and
-other 5xx (unknown) are separated by `errors.As` on the status code;
-transport failures are separated by `errors.Is` down to the `syscall.Errno`.
+The classification reads the **error chain**, not the message, wherever a chain
+exists. `internal/client` returns a typed `*StatusError`, so 503 (applied), 502
+(the forward hop failed) and other 5xx (unknown) are separated by `errors.As` on
+the status code; transport failures the client observes itself are separated by
+`errors.Is` down to the `syscall.Errno`.
 `TestClassifyWriteEffectDecidesFromTheChain` proves it by wrapping each error in a
 shell whose text names nothing, so a correct answer can only come from the chain.
+
+Within the 502 class there is no chain to read — a gRPC failure keeps neither —
+so the *forwarding node* classifies it and sends a typed `forward_outcome` field,
+which the runner reads in preference to the prose. That is the subject of *How a
+502 is separated, and where* below, including why the decision cannot be made
+anywhere else and what makes `"never-sent"` a proof rather than a guess.
 
 *What the first real fault-injection runs found.* Measured 2026-08-16 against a
 live 3-node docker-compose cluster on an Apple M4 Pro (Colima VM, 8 CPU / 8 GB),
@@ -752,9 +767,32 @@ The checker was right. It detected precisely the caveat the CAP section above
 states in bold — *a refused write is not an undone write* — and the model was the
 thing that did not encode it. The fix is the three-outcome table above:
 `internal/linearizability` learned `Applied` and `EndUnknown`, and the runner
-learned to tell the classes apart. Both runs above should now PASS, which is the
-point: **a FAIL is now a real consistency bug**, and the printed note says so
-instead of telling the operator to discount anomalies near a fault window.
+learned to tell the classes apart.
+
+*What re-running them then found.* The refused-but-applied encoding worked — 18,623
+and 20,474 writes classified, and **no FAIL**, so the false anomalies were gone.
+But both runs came back `UNKNOWN (timeout)`, and for an instructive reason: the
+same release bounded the forward RPC with its own deadline, and its rewritten 502
+body no longer quoted the underlying transport failure. The runner's text scan was
+the only thing separating never-sent from ambiguous, so *every* forward to a downed
+primary became a pending operation — 27,356 and 20,519 of them, each overlapping
+every later operation on its key.
+
+| Nemesis | Ops | Errors | Refused-but-applied | Indeterminate writes | Verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `kill-restart` (SIGKILL) | 282,708 | 68,119 | 18,623 | 27,356 | `UNKNOWN` (60.1s) |
+| `stop-restart` (SIGTERM) | 259,793 | 57,641 | 20,474 | 20,519 | `UNKNOWN` (60.1s) |
+
+No `--check-timeout` fixes that shape of failure: the search space is combinatorial
+in the number of pending operations, not linear in time. Two fixes composed into a
+regression, and each was individually correct — which is what made the response a
+typed `forward_outcome` field rather than a bigger budget or a restored substring.
+With never-sent forwards classified as no-ops again, the pending count falls to the
+genuinely ambiguous handful and both runs should reach a verdict.
+
+The standing property is unchanged and is the point: **a FAIL is now a real
+consistency bug**, and the printed note says so instead of telling the operator to
+discount anomalies near a fault window.
 
 For the record, the pre-fix artefact this replaces was also measured, on a single
 local node (Linux x86-64, Intel Xeon 6975P-C, 4 cores), 3 runs per nemesis,
@@ -770,22 +808,88 @@ for `docker compose`:
 correct history, 2 runs in 3. Those are now pending operations and cannot reject
 anything on their own.
 
-*The one place a message is still load-bearing, and why.* A 502 from
-`forwardRequest` hides two causes behind one code: a hop that was never made, and
-a `ForwardKey` RPC that failed *after* the primary may have applied the mutation.
-The status code cannot separate them, and the second is genuinely ambiguous — so
-502 is unknown by default. That default is expensive: a pending operation overlaps
-every later operation on its key, and a fault window produces thousands of
-forwarded writes to a node that is down, which would push the checker into a
-timeout instead of a verdict. So within the 502 class only, the runner inspects
-the response *body* for a transport failure that provably delivered nothing
-("connection refused", "no such host", "no route to host", "network is
-unreachable"), because gRPC's failure crossed two process boundaries as text and
-there is no chain left on this side of them. It is bounded in the safe direction:
-an unrecognised body stays unknown, so the worst case of gRPC rewording its errors
-is a slower check, never a wrong verdict. Making that distinction typed means
-having the server itself separate never-sent from ambiguous — a change in
-`internal/server`, not here.
+*How a 502 is separated, and where.* A 502 from `forwardRequest` hides two causes
+behind one code: a hop that was never made, and a `ForwardKey` RPC that failed
+*after* the primary may have applied the mutation. The status code cannot separate
+them, and the second is genuinely ambiguous — so 502 alone would have to be
+unknown. That default is expensive: a pending operation overlaps every later
+operation on its key, and a fault window produces thousands of forwarded writes to
+a node that is down, which pushes the checker into a timeout instead of a verdict.
+Both nemesis runs did exactly that, at 20,519 and 27,356 pending operations.
+
+So the forwarding node decides, and says so: every 502 carries a
+`forward_outcome` field, `"never-sent"` or `"unknown"`, and the runner reads it
+in preference to the prose. The decision belongs there because that is the last
+point at which the error still has its gRPC code, and the message has not yet
+been flattened into a sentence.
+
+It is also, measurably, the last point at which the error has *any* identity. A
+grpc-go RPC failure is a `*status.Error` carrying a code and a string and nothing
+else: `errors.Unwrap` returns nil, and `errors.Is` against `syscall.ECONNREFUSED`
+and `errors.As` against `*net.OpError` and `*net.DNSError` all fail.
+`TestForwardErrorsCarryNoTypedCause` asserts that, so a future grpc-go that starts
+preserving the cause will fail the test and invite the stronger implementation.
+There is therefore no chain to reach for on either side of the HTTP boundary — the
+code plus the message is the whole of the available evidence, and what changed is
+not the kind of evidence but where it is read and what crosses the wire.
+
+What the code buys is the proof. A gRPC stream is only created once the HTTP/2
+transport is `READY`, so an error raised *inside* transport creation cannot have
+carried any part of the request — and grpc-go frames exactly those errors
+distinctively:
+
+```
+code = Unavailable  desc = connection error: desc = "transport: Error while dialing:
+                             dial tcp 127.0.0.1:45983: connect: connection refused"
+```
+
+Requiring that framing *and* a delivery-impossible cause is what makes
+`"never-sent"` a claim rather than a guess. A connection that broke after the
+request went out reads differently — `transport is closing`, `error reading from
+server: EOF`, `connection reset by peer` — and stays unknown, correctly, because
+those may have been applied. The framing is also what defuses the trap that
+`codes.Unavailable` is a legal *application* code: a primary that could not reach
+a replica can produce a message quoting `connection refused` from its own fan-out,
+and without the framing requirement that would read as never-sent — the same
+mistake, one layer up, that made the runner classify refused-but-applied writes as
+no-ops.
+
+| gRPC code | message signature | outcome |
+| --- | --- | --- |
+| `Unavailable` | dial framing **and** `connection refused` / `no such host` / `no route to host` / `network is unreachable` | **never-sent** |
+| `Unavailable` | `name resolver error` — no address was ever dialed | **never-sent** |
+| `Unavailable` | anything else: broken stream, draining connection, remote-generated status | unknown |
+| `DeadlineExceeded` | any — the 2s bound can fire after the primary applied the write | unknown |
+| `Canceled` | any — the caller gave up; the server may not have | unknown |
+| anything else | any — a code only the remote can produce implies delivery | unknown |
+
+Two cases are left unknown deliberately even though they are *probably*
+never-sent. A dial that fails with `i/o timeout` also could not have created a
+transport, but "probably" is not the bar for a never-sent claim. And a blackholed
+address — a host that completes the TCP handshake but never finishes the HTTP/2
+one, which is what a stopped container looks like — surfaces as
+`DeadlineExceeded` with a message about waiting for a load-balancer update that
+names no transport failure at all. The asymmetry justifies the caution: a wrong
+`"never-sent"` tells the model a write did not happen when it may have, which can
+invent an anomaly out of correct behaviour, whereas a wrong `"unknown"` costs only
+checker time.
+
+The runner's side of the contract is three-valued rather than two, and the
+distinction between the last two is the point. A recognised value is trusted. A
+value present but *unrecognised* is unknown, and the text is **not** consulted — a
+server that speaks this field is authoritative even when its answer is
+unintelligible, and substituting a weaker signal that might contradict it would be
+worse than declining to answer. Only an *absent* field falls back to scanning the
+message, for a server predating the field.
+
+That fallback is retained, and its limits are the epilogue to this argument. Two
+of its four markers could never have fired on this path: gRPC reports an
+unresolvable target as `name resolver error: produced zero addresses`, not "no
+such host", and an unroutable address as a plain `DeadlineExceeded` naming no
+route at all. Matching wording chosen by a library two hops away, for an audience
+of humans, is what the typed field replaces. It stays bounded in the safe
+direction regardless — an unrecognised body is unknown — so a rewording costs
+checker time, never a verdict.
 
 Ordering inside the classifier matters for the same reason. A 503's body quotes
 the replication failure underneath it, which during an outage reads
@@ -796,8 +900,8 @@ the `stop-restart` run above reported 0 indeterminate writes while failing.
 
 The report accounts for both classes separately — `refused-but-applied` for writes
 the primary kept, `indeterminate writes` for pending ones — so an operator can see
-which mechanism a run exercised. (The verbatim report above predates this change
-and has no `refused-but-applied` row.)
+which mechanism a run exercised. (The first pair of runs above predates the row and
+reports no `refused-but-applied` count; the re-run pair has it.)
 
 *Why keys carry a per-run nonce.* `KVModel.Init` is an empty map, so a recorded
 history has to start against an empty keyspace. Keys are therefore prefixed with

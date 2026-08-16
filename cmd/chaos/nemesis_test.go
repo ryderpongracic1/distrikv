@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -896,6 +897,125 @@ func TestProvablyNeverSentClassifiesRealClientErrors(t *testing.T) {
 	}
 }
 
+// TestClassifyForwardOutcomeReadsTheTypedField covers the 502 classifier that
+// decides whether a forwarded write becomes a cheap no-op or a pending operation.
+//
+// The stakes are asymmetric and both directions are pinned here. Reading
+// never-sent for a write that may have landed tells the model the write did not
+// happen and can invent an anomaly out of correct behaviour. Reading unknown for
+// a write that provably never left costs only checker time — but at fault-window
+// volume it costs all of it: 20k+ pending operations on a 20-key space is what
+// turned the verdict into a timeout.
+func TestClassifyForwardOutcomeReadsTheTypedField(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want writeEffect
+		why  string
+	}{
+		{
+			name: "typed never-sent",
+			body: `{"error":"primary node2 unreachable: forward RPC was not delivered","forward_outcome":"never-sent"}`,
+			want: effectNotApplied,
+			why:  "the server proved it; modelling a no-op is exact",
+		},
+		{
+			name: "typed unknown",
+			body: `{"error":"primary node2 unreachable: forward RPC did not complete within 2s","forward_outcome":"unknown"}`,
+			want: effectUnknown,
+			why:  "the server declined to claim delivery either way",
+		},
+		{
+			// Precedence, and the reason this field exists. The server said it
+			// could not prove delivery; the prose happens to quote a refused
+			// connection from somewhere else. The typed verdict wins, because it
+			// was made with the gRPC code in hand and the text was not.
+			name: "typed unknown outranks prose naming a refusal",
+			body: `{"error":"forward RPC: rpc error: code = Unavailable desc = replicate to node3: connect: connection refused","forward_outcome":"unknown"}`,
+			want: effectUnknown,
+			why:  "the typed field is authoritative; the fallback must not override it",
+		},
+		{
+			name: "unrecognised value does not fall back to prose",
+			body: `{"error":"dial tcp 172.18.0.3:9002: connect: connection refused","forward_outcome":"banana"}`,
+			want: effectUnknown,
+			why: "a server that speaks this field is authoritative even when its answer is " +
+				"unintelligible; a weaker signal must not be substituted for it",
+		},
+		{
+			name: "empty value",
+			body: `{"error":"x","forward_outcome":""}`,
+			want: effectUnknown,
+			why:  "present but says nothing",
+		},
+		{
+			name: "wrong type for the field",
+			body: `{"error":"x","forward_outcome":7}`,
+			want: effectUnknown,
+			why:  "unmarshalling fails, and the fallback finds nothing either",
+		},
+		{
+			name: "absent field falls back to prose",
+			body: `{"error":"forward RPC: rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing dial tcp 172.18.0.3:9002: connect: connection refused\""}`,
+			want: effectNotApplied,
+			why:  "a server predating the field still names the refusal",
+		},
+		{
+			name: "absent field, prose names nothing",
+			body: `{"error":"forward RPC: rpc error: code = DeadlineExceeded desc = context deadline exceeded"}`,
+			want: effectUnknown,
+			why:  "neither channel proves anything",
+		},
+		{
+			name: "explicit null falls back to prose",
+			body: `{"error":"dial tcp 172.18.0.3:9002: connect: connection refused","forward_outcome":null}`,
+			want: effectNotApplied,
+			why:  "null is indistinguishable from absent, and absent means fall back",
+		},
+		{
+			name: "truncated body",
+			body: `{"error":"forward RPC to primary node2: connection ref`,
+			want: effectUnknown,
+			why:  "a body that does not parse and does not contain a whole marker asserts nothing",
+		},
+		{
+			name: "empty body",
+			body: "",
+			want: effectUnknown,
+			why:  "nothing to read",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyForwardOutcome(tc.body); got != tc.want {
+				t.Errorf("classifyForwardOutcome(%q) = %v, want %v — %s", tc.body, got, tc.want, tc.why)
+			}
+			// The same answer must come out of the full write classifier, which is
+			// what finishWrite actually calls.
+			err := &clientpkg.StatusError{StatusCode: http.StatusBadGateway, Body: tc.body}
+			if got := classifyWriteEffect(err); got != tc.want {
+				t.Errorf("classifyWriteEffect(502 %q) = %v, want %v — %s", tc.body, got, tc.want, tc.why)
+			}
+		})
+	}
+}
+
+// TestForwardOutcomeConstantsMatchTheServer guards the wire contract. The two
+// packages cannot share a type — cmd/chaos deliberately talks to a cluster over
+// HTTP rather than importing its internals — so the strings are duplicated, and a
+// rename on one side has to fail here rather than silently in production.
+//
+// internal/server's TestForwardToRefusedPrimaryIsNeverSent and
+// TestForwardToUnreachablePrimaryFailsFast assert the producing half against a
+// real gRPC channel; these are the exact bodies they produce.
+func TestForwardOutcomeConstantsMatchTheServer(t *testing.T) {
+	if forwardOutcomeNeverSent != "never-sent" {
+		t.Errorf("never-sent constant drifted to %q", forwardOutcomeNeverSent)
+	}
+	if forwardOutcomeUnknown != "unknown" {
+		t.Errorf("unknown constant drifted to %q", forwardOutcomeUnknown)
+	}
+}
+
 // TestClassifyWriteEffect covers one error class per case. The three effects are
 // not interchangeable: getting one wrong either invents an anomaly (a correct
 // read of a refused value reported as a violation) or hides one (a lost write
@@ -907,16 +1027,19 @@ func TestClassifyWriteEffect(t *testing.T) {
 	// The bodies below are the shapes the server actually produces: writeError
 	// wraps the message in JSON, and the 503's message carries the replication
 	// failure — including, during an outage, the refused connection to the dead
-	// replica.
+	// replica. The forward* bodies without a forward_outcome field are what a
+	// server predating that field sent, and are kept to pin the fallback.
 	const (
 		replicationRefused = `{"error":"replication to replicas failed: rpc error: code = Unavailable ` +
 			`desc = connection error: desc = \"transport: Error while dialing dial tcp 172.18.0.3:9002: ` +
 			`connect: connection refused\""}`
-		forwardRefused  = `{"error":"forward RPC: rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing dial tcp 172.18.0.3:9002: connect: connection refused\""}`
-		forwardDeadline = `{"error":"forward RPC: rpc error: code = DeadlineExceeded desc = context deadline exceeded"}`
-		forwardClosing  = `{"error":"forward RPC: rpc error: code = Unavailable desc = transport is closing"}`
-		noPeerClient    = `{"error":"no gRPC client for node node2"}`
-		storeFailure    = `{"error":"primary put \"k\": wal: write: no space left on device"}`
+		forwardNeverSentBody = `{"error":"primary node2 unreachable: forward RPC was not delivered","forward_outcome":"never-sent"}`
+		forwardUnknownBody   = `{"error":"primary node2 unreachable: forward RPC did not complete within 2s","forward_outcome":"unknown"}`
+		forwardRefused       = `{"error":"forward RPC: rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing dial tcp 172.18.0.3:9002: connect: connection refused\""}`
+		forwardDeadline      = `{"error":"forward RPC: rpc error: code = DeadlineExceeded desc = context deadline exceeded"}`
+		forwardClosing       = `{"error":"forward RPC: rpc error: code = Unavailable desc = transport is closing"}`
+		noPeerClient         = `{"error":"no gRPC client for node node2"}`
+		storeFailure         = `{"error":"primary put \"k\": wal: write: no space left on device"}`
 	)
 
 	tests := []struct {
@@ -942,20 +1065,29 @@ func TestClassifyWriteEffect(t *testing.T) {
 			why: "the primary wrote locally before replicating and does not roll back",
 		},
 		{
-			name: "502 forward to a dead node", err: statusErr(502, forwardRefused), want: effectNotApplied,
-			why: "the forward hop was refused, so the primary never saw the request",
+			name: "502 typed never-sent", err: statusErr(502, forwardNeverSentBody), want: effectNotApplied,
+			why: "the server proved the forward hop was refused before anything was written",
 		},
 		{
-			name: "502 forward deadline", err: statusErr(502, forwardDeadline), want: effectUnknown,
+			name: "502 typed unknown", err: statusErr(502, forwardUnknownBody), want: effectUnknown,
+			why: "the server could not prove delivery either way",
+		},
+		{
+			name: "502 legacy body, forward to a dead node", err: statusErr(502, forwardRefused), want: effectNotApplied,
+			why: "a server predating forward_outcome still names the refusal in its prose",
+		},
+		{
+			name: "502 legacy body, forward deadline", err: statusErr(502, forwardDeadline), want: effectUnknown,
 			why: "the RPC may have been applied before the deadline expired",
 		},
 		{
-			name: "502 transport closing mid-call", err: statusErr(502, forwardClosing), want: effectUnknown,
+			name: "502 legacy body, transport closing mid-call", err: statusErr(502, forwardClosing), want: effectUnknown,
 			why: "the connection died after the request went out",
 		},
 		{
-			name: "502 with no peer client", err: statusErr(502, noPeerClient), want: effectUnknown,
-			why: "nothing was sent, but the body names no transport failure — unknown is the safe read",
+			name: "502 legacy body, no peer client", err: statusErr(502, noPeerClient), want: effectUnknown,
+			why: "nothing was sent, but a legacy body names no transport failure — unknown is the safe read. " +
+				"A current server sends forward_outcome=never-sent for this case",
 		},
 		{
 			name: "500 local store failure", err: statusErr(500, storeFailure), want: effectUnknown,

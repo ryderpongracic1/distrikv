@@ -3,6 +3,8 @@ module github.com/ryderpongracic1/distrikv
 go 1.25.0
 
 require (
+	github.com/HdrHistogram/hdrhistogram-go v1.2.0
+	github.com/anishathalye/porcupine v1.1.0
 	github.com/google/btree v1.1.3
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
@@ -15,8 +17,6 @@ require (
 )
 
 require (
-	github.com/HdrHistogram/hdrhistogram-go v1.2.0 // indirect
-	github.com/anishathalye/porcupine v1.1.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect

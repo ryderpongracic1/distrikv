@@ -134,6 +134,14 @@ Both paths are kept rather than deleted because they are the natural landing spo
 
 Because the data path is ring-based and never consults Raft leadership, the storm cost nothing but log volume and wasted CPU — which is why it went unnoticed until the container logs were read directly. `internal/raft/cluster_test.go` now stands an in-process 3-node cluster up and fails if the term advances more than once over three seconds, both on an idle cluster and with per-RPC latency injected above the send interval.
 
+**Field validation (2026-08-16, commit e59a545).** Measured on a live 3-node
+docker-compose cluster (Apple M4 Pro, Colima VM 8 CPU / 8 GB) with accumulated
+data volumes from prior bench and chaos runs: one election at startup
+(term 5130 → 5131 — the inherited term being a fossil of the storm era), then term
+**flat for 2+ minutes**, all three nodes agreeing on the same leader, exactly one
+leader at all times. Before the fix: ~1.7 terms/second, indefinitely, since the
+project's first boot.
+
 **Intentional deviations from the paper (important for reviewers):**
 
 1. **Data writes bypass Raft consensus.** Writes flow through the consistent-hash ring, not through the Raft log. Raft here is a leader-election and failure-detection mechanism only. This means Raft's "if committed, all future leaders have it" guarantee does **not** apply to data. Under partition the ring-primary and its replicas can diverge.
@@ -591,6 +599,12 @@ for 80+ minutes, where a clean-slate cluster on the identical binary served
 forward errors (503s and 502s) because the writes never returned — the stalled
 node was a black hole, not a slow node.
 
+**Validated on dirty volumes (2026-08-16, commit e59a545).** The same accumulated
+data volumes (bench + chaos residue) that produced 287 ops / 164 errors before the
+fix now produce **122,551 ops / 30 s with 0 errors**, PASS in 58 ms. The
+compaction-arm-at-open fix converts a permanent write outage into a sub-100 ms
+recovery window.
+
 Measured on Linux with `internal/store/lsm/recovery_availability_test.go`, a store
 closed with 13 live L0 SSTables and reopened with production defaults:
 
@@ -905,7 +919,40 @@ in the number of pending operations, not linear in time. Two fixes composed into
 regression, and each was individually correct — which is what made the response a
 typed `forward_outcome` field rather than a bigger budget or a restored substring.
 With never-sent forwards classified as no-ops again, the pending count falls to the
-genuinely ambiguous handful and both runs should reach a verdict.
+genuinely ambiguous handful and the checker reaches a verdict.
+
+*What the final runs found (2026-08-16, commit e59a545).* With the typed
+`forward_outcome` field, the election storm fixed (heartbeats now unconditional),
+and the recovery deadlock resolved (compaction armed at open), both nemesis modes
+pass — including `kill-restart`, the first PASS ever on this project:
+
+| Nemesis | Ops | Errors | Refused-but-applied | Indeterminate writes | Check duration | Verdict |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| `kill-restart` (SIGKILL) | 323,477 | 129,081 | 48,283 | 11 | 222 ms | **PASS** |
+| `stop-restart` (SIGTERM) | 37,678 | — | 5,159 | 178 | 6.4 s | **PASS** |
+
+The kill-restart run is the capstone — highest throughput of any chaos run on this
+project (323k ops / 60 s *with* faults injected, 4/4 strikes landing, fault windows
+~5.4 s each on node2/node3). The 11 indeterminate writes (down from 27,356 before
+the `forward_outcome` fix) are the genuinely ambiguous handful: connections that
+broke mid-flight where neither side can prove delivery. The checker places them in
+222 ms — three orders of magnitude under the 60 s timeout that the UNKNOWN runs hit.
+
+The stop-restart run's lower throughput (37,678 ops) reflects the state of the
+cluster at the time of that intermediate run: the election storm was still active
+(~1.7 terms/s) and the recovery deadlock was still present, depressing throughput
+on every restart. Those defects are fixed in the final run above; the intermediate
+result is kept for the A/B evidence it provides.
+
+The progression tells the story of the harness working as designed — each stage
+exposed a real defect:
+
+| Stage | Defect exposed | Fix |
+| --- | --- | --- |
+| Pre-model-fix **FAIL** | Refused-but-applied writes modelled as no-ops | Three-outcome model (`Applied`, `EndUnknown`) |
+| Post-model-fix **UNKNOWN** | Never-sent forwards lost their classification | Typed `forward_outcome` field on 502 |
+| Post-forward-outcome **PASS** (stop-restart) | — (stop-restart passed; kill-restart still depressed) | — |
+| Final **PASS** (kill-restart) | Election storm + recovery deadlock suppressed throughput and recovery | Unconditional heartbeats + compaction armed at open |
 
 The standing property is unchanged and is the point: **a FAIL is now a real
 consistency bug**, and the printed note says so instead of telling the operator to

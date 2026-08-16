@@ -24,14 +24,14 @@ type NodeStatusResult struct {
 // Error() always writes to a separate io.Writer (normally os.Stderr).
 // This separation keeps stdout machine-parseable even when errors occur.
 type Formatter interface {
-	KeyValue(key, value string)               // get
-	PutResult(key, value string)              // put
-	DeleteResult(key string)                  // delete
-	Status(s *client.StatusResponse)          // status single-node
-	AllStatus(nodes []NodeStatusResult)       // status --all
-	Metrics(m client.MetricsResponse)         // metrics
-	WatchLine(ts time.Time, key, val string)  // watch (val="[deleted]" for removal)
-	Error(msg string)                         // always stderr, always plain text
+	KeyValue(key, value string)              // get
+	PutResult(key, value string)             // put
+	DeleteResult(key string)                 // delete
+	Status(s *client.StatusResponse)         // status single-node
+	AllStatus(nodes []NodeStatusResult)      // status --all
+	Metrics(m client.MetricsResponse)        // metrics
+	WatchLine(ts time.Time, key, val string) // watch (val="[deleted]" for removal)
+	Error(msg string)                        // always stderr, always plain text
 }
 
 // tabwriter settings — uniform across all tables.

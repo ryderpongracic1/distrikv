@@ -104,7 +104,7 @@ type Compactor struct {
 	dataDir    string
 	manifest   *Manifest
 	logger     *slog.Logger
-	threshold  int            // compact when len(readers) >= threshold
+	threshold  int           // compact when len(readers) >= threshold
 	nextSSTSeq func() uint64 // callback into LSMTree.nextSST.Add(1)
 
 	// metrics is set by LSMTree after construction. nil → no instrumentation.

@@ -9,15 +9,15 @@ import (
 
 // report is the structured summary emitted at the end of a bench run.
 type report struct {
-	Target       string             `json:"target"`
-	QPSRequested float64            `json:"qps_requested"`
-	QPSAchieved  float64            `json:"qps_achieved"`
-	Duration     string             `json:"duration"`
-	Mix          string             `json:"mix"`
-	Keyspace     int                `json:"keyspace"`
-	KeyDist      string             `json:"keydist"`
-	ValueSize    int                `json:"value_size"`
-	Workers      int                `json:"workers"`
+	Target       string  `json:"target"`
+	QPSRequested float64 `json:"qps_requested"`
+	QPSAchieved  float64 `json:"qps_achieved"`
+	Duration     string  `json:"duration"`
+	Mix          string  `json:"mix"`
+	Keyspace     int     `json:"keyspace"`
+	KeyDist      string  `json:"keydist"`
+	ValueSize    int     `json:"value_size"`
+	Workers      int     `json:"workers"`
 
 	Ops    uint64 `json:"ops"`
 	Errors uint64 `json:"errors"`

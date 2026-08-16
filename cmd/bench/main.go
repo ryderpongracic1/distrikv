@@ -31,18 +31,18 @@ import (
 
 func main() {
 	var (
-		targets    = flag.String("target", "localhost:8001", "comma-separated host:port list of cluster nodes (HTTP)")
-		qps        = flag.Float64("qps", 0, "target ops/sec, open-loop (required)")
-		duration   = flag.Duration("duration", 60*time.Second, "measurement window after warmup")
-		warmup     = flag.Duration("warmup", 10*time.Second, "warmup window, results discarded")
-		mix        = flag.String("mix", "20:80:0", "put:get:delete ratio")
-		keyspace   = flag.Int("keyspace", 100_000, "number of distinct keys")
-		keyDist    = flag.String("keydist", "uniform", "uniform|zipf|sequential")
-		valueSize  = flag.Int("valuesize", 256, "bytes per value")
-		workers    = flag.Int("workers", 256, "concurrent worker pool size")
-		queueCap   = flag.Int("queue-cap", 0, "arrival queue capacity (default: workers*4)")
-		output     = flag.String("output", "table", "table|json")
-		clientTO   = flag.Duration("client-timeout", 10*time.Second, "per-request HTTP timeout")
+		targets   = flag.String("target", "localhost:8001", "comma-separated host:port list of cluster nodes (HTTP)")
+		qps       = flag.Float64("qps", 0, "target ops/sec, open-loop (required)")
+		duration  = flag.Duration("duration", 60*time.Second, "measurement window after warmup")
+		warmup    = flag.Duration("warmup", 10*time.Second, "warmup window, results discarded")
+		mix       = flag.String("mix", "20:80:0", "put:get:delete ratio")
+		keyspace  = flag.Int("keyspace", 100_000, "number of distinct keys")
+		keyDist   = flag.String("keydist", "uniform", "uniform|zipf|sequential")
+		valueSize = flag.Int("valuesize", 256, "bytes per value")
+		workers   = flag.Int("workers", 256, "concurrent worker pool size")
+		queueCap  = flag.Int("queue-cap", 0, "arrival queue capacity (default: workers*4)")
+		output    = flag.String("output", "table", "table|json")
+		clientTO  = flag.Duration("client-timeout", 10*time.Second, "per-request HTTP timeout")
 	)
 	flag.Parse()
 
@@ -65,11 +65,11 @@ func main() {
 	// "256 workers stomp 2 pooled conns → TIME_WAIT storm" pathology.
 	perHost := *workers + 64
 	transport := &http.Transport{
-		MaxIdleConns:          perHost * len(hostList),
-		MaxIdleConnsPerHost:   perHost,
-		MaxConnsPerHost:       perHost,
-		IdleConnTimeout:       90 * time.Second,
-		DisableKeepAlives:     false,
+		MaxIdleConns:        perHost * len(hostList),
+		MaxIdleConnsPerHost: perHost,
+		MaxConnsPerHost:     perHost,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
 		DialContext: (&net.Dialer{
 			Timeout:   2 * time.Second,
 			KeepAlive: 30 * time.Second,

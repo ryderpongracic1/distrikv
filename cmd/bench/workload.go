@@ -48,8 +48,8 @@ type workload struct {
 	rngPool sync.Pool
 
 	// zipf state — only used if keyDist == "zipf".
-	zipfMu sync.Mutex
-	zipf   *mathrand.Zipf
+	zipfMu  sync.Mutex
+	zipf    *mathrand.Zipf
 	zipfRng *mathrand.Rand
 }
 

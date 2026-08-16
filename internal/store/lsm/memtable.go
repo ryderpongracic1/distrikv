@@ -28,8 +28,8 @@ func entryLess(a, b Entry) bool { return a.Key < b.Key }
 type Memtable struct {
 	tree    *btree.BTreeG[Entry]
 	w       *storewal.WAL
-	walPath string        // path to this memtable's WAL file; deleted after flush
-	size    atomic.Int64  // approximate byte count of live entries
+	walPath string       // path to this memtable's WAL file; deleted after flush
+	size    atomic.Int64 // approximate byte count of live entries
 	maxSize int64
 	mu      sync.RWMutex
 	seqGen  *atomic.Uint64 // global sequence counter; shared with LSMTree

@@ -177,8 +177,8 @@ func TestWAL_ReplaySeesFreshCopies(t *testing.T) {
 // tornCases enumerates every byte offset within an entry where the file could
 // be truncated by a crash.
 func tornCases(t *testing.T) []struct {
-	name      string
-	truncate  func(full []byte) []byte
+	name     string
+	truncate func(full []byte) []byte
 } {
 	full := encodeEntry(OpPut, "mykey", []byte("myvalue"))
 	// full layout: [1:op][4:keylen][5:key][4:vallen][7:value][4:crc] = 25 bytes
@@ -300,7 +300,7 @@ func TestWAL_PoolBufferGrowth(t *testing.T) {
 	for i, sz := range sizes {
 		val := make([]byte, sz)
 		for j := range val {
-			val[j] = byte((i * sz + j) & 0xFF)
+			val[j] = byte((i*sz + j) & 0xFF)
 		}
 		expected = append(expected, val)
 		require.NoError(t, w.Append(OpPut, "key", val))

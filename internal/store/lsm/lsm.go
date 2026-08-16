@@ -137,14 +137,14 @@ type LSMTree struct {
 	// without taking the mutex. It is always updated under mu before Unlock.
 	l0Count atomic.Int32
 
-	dataDir          string
-	logger           *slog.Logger
-	maxMem           int64
-	nCompact         int // L0 file count threshold for compaction
-	l0SlowThreshold  int // soft-stall threshold
-	l0StopThreshold  int // hard-stop threshold
-	metrics          *metrics.Metrics // may be nil
-	cache            *BlockCache      // may be nil (disabled when maxBytes=0)
+	dataDir         string
+	logger          *slog.Logger
+	maxMem          int64
+	nCompact        int              // L0 file count threshold for compaction
+	l0SlowThreshold int              // soft-stall threshold
+	l0StopThreshold int              // hard-stop threshold
+	metrics         *metrics.Metrics // may be nil
+	cache           *BlockCache      // may be nil (disabled when maxBytes=0)
 
 	// --- Background goroutine control ---
 	flushCh   chan struct{} // capacity 1; triggers flush goroutine
@@ -227,17 +227,17 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 	}
 
 	l := &LSMTree{
-		manifest:         manifest,
-		dataDir:          dataDir,
-		logger:           logger,
-		maxMem:           defaultMaxMemBytes,
-		nCompact:         defaultCompactN,
-		l0SlowThreshold:  defaultL0SlowThreshold,
-		l0StopThreshold:  defaultL0StopThreshold,
-		cache:            NewBlockCache(defaultBlockCacheBytes),
-		flushCh:          make(chan struct{}, 1),
-		compactCh:        make(chan struct{}, 1),
-		stopCh:           make(chan struct{}),
+		manifest:        manifest,
+		dataDir:         dataDir,
+		logger:          logger,
+		maxMem:          defaultMaxMemBytes,
+		nCompact:        defaultCompactN,
+		l0SlowThreshold: defaultL0SlowThreshold,
+		l0StopThreshold: defaultL0StopThreshold,
+		cache:           NewBlockCache(defaultBlockCacheBytes),
+		flushCh:         make(chan struct{}, 1),
+		compactCh:       make(chan struct{}, 1),
+		stopCh:          make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(l)

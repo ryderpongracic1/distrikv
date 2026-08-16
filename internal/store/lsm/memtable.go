@@ -33,6 +33,13 @@ type Memtable struct {
 	maxSize int64
 	mu      sync.RWMutex
 	seqGen  *atomic.Uint64 // global sequence counter; shared with LSMTree
+
+	// liveKeysAtSeal is the engine's approximate live-key count at the instant
+	// this memtable was sealed (rotated out of the write path). flushMemtable
+	// persists it to the manifest so the count survives restart. It is written
+	// once under LSMTree.mu before the memtable is published as l.imm and read
+	// after re-acquiring that lock, so it needs no synchronisation of its own.
+	liveKeysAtSeal int64
 }
 
 // NewMemtable creates a Memtable with the given WAL and flush threshold.
@@ -46,11 +53,37 @@ func NewMemtable(w *storewal.WAL, walPath string, seqGen *atomic.Uint64, maxSize
 	}
 }
 
+// livePutDelta returns the change in the live-key count caused by inserting a
+// non-tombstone entry over (old, replaced) as reported by ReplaceOrInsert.
+//
+// The classification is memtable-local: when the key is not resident in this
+// memtable (!replaced) the entry is assumed to be a brand-new key, because
+// answering "does this key exist in an SSTable?" would require a full read-path
+// traversal on every write. See LSMTree.LiveKeys for the resulting drift.
+func livePutDelta(old Entry, replaced bool) int {
+	if !replaced || old.Tombstone {
+		return 1
+	}
+	return 0
+}
+
+// liveDeleteDelta returns the change in the live-key count caused by inserting
+// a tombstone over (old, replaced). Same memtable-local caveat as livePutDelta:
+// a tombstone for a key not resident here is assumed to have covered a live key.
+func liveDeleteDelta(old Entry, replaced bool) int {
+	if replaced && old.Tombstone {
+		return 0 // already deleted in this memtable — no live key removed
+	}
+	return -1
+}
+
 // Put writes key=value. WAL is fsynced before the tree is updated.
-func (m *Memtable) Put(key string, value []byte) error {
+// liveDelta is the (approximate) change in the engine's live-key count: +1 when
+// this write created a live key, 0 when it overwrote one.
+func (m *Memtable) Put(key string, value []byte) (liveDelta int, err error) {
 	seq := m.seqGen.Add(1)
 	if err := m.w.Append(storewal.OpPut, key, value); err != nil {
-		return fmt.Errorf("memtable: WAL put %q: %w", key, err)
+		return 0, fmt.Errorf("memtable: WAL put %q: %w", key, err)
 	}
 	m.mu.Lock()
 	old, replaced := m.tree.ReplaceOrInsert(Entry{Key: key, Value: value, SeqNum: seq})
@@ -59,14 +92,16 @@ func (m *Memtable) Put(key string, value []byte) error {
 	}
 	m.size.Add(int64(len(key) + len(value)))
 	m.mu.Unlock()
-	return nil
+	return livePutDelta(old, replaced), nil
 }
 
 // Delete writes a tombstone. WAL is fsynced before the tree is updated.
-func (m *Memtable) Delete(key string) error {
+// liveDelta is the (approximate) change in the engine's live-key count: -1 when
+// this tombstone covered a live key, 0 when the key was already tombstoned here.
+func (m *Memtable) Delete(key string) (liveDelta int, err error) {
 	seq := m.seqGen.Add(1)
 	if err := m.w.Append(storewal.OpDelete, key, nil); err != nil {
-		return fmt.Errorf("memtable: WAL delete %q: %w", key, err)
+		return 0, fmt.Errorf("memtable: WAL delete %q: %w", key, err)
 	}
 	m.mu.Lock()
 	old, replaced := m.tree.ReplaceOrInsert(Entry{Key: key, Tombstone: true, SeqNum: seq})
@@ -75,7 +110,7 @@ func (m *Memtable) Delete(key string) error {
 	}
 	m.size.Add(int64(len(key)))
 	m.mu.Unlock()
-	return nil
+	return liveDeleteDelta(old, replaced), nil
 }
 
 // Get retrieves the entry for key. Tombstones are returned — caller checks.
@@ -101,8 +136,12 @@ func (m *Memtable) Ascend(fn func(e Entry) bool) {
 // ReplayWAL replays a WAL file into this memtable's tree without writing to
 // the active WAL (used during startup recovery). seqGen is advanced for each
 // replayed entry so new writes receive higher sequence numbers.
-func (m *Memtable) ReplayWAL(w *storewal.WAL) error {
-	return w.Replay(func(op storewal.OpType, key string, value []byte) {
+//
+// liveDelta is the net (approximate) change in the engine's live-key count
+// implied by the replayed entries, so the caller can rebuild the count for
+// writes that were not yet captured in an SSTable at shutdown/crash time.
+func (m *Memtable) ReplayWAL(w *storewal.WAL) (liveDelta int64, err error) {
+	err = w.Replay(func(op storewal.OpType, key string, value []byte) {
 		seq := m.seqGen.Add(1)
 		m.mu.Lock()
 		switch op {
@@ -112,13 +151,16 @@ func (m *Memtable) ReplayWAL(w *storewal.WAL) error {
 				m.size.Add(-int64(len(old.Key) + len(old.Value)))
 			}
 			m.size.Add(int64(len(key) + len(value)))
+			liveDelta += int64(livePutDelta(old, replaced))
 		case storewal.OpDelete:
 			old, replaced := m.tree.ReplaceOrInsert(Entry{Key: key, Tombstone: true, SeqNum: seq})
 			if replaced {
 				m.size.Add(-int64(len(old.Key) + len(old.Value)))
 			}
 			m.size.Add(int64(len(key)))
+			liveDelta += int64(liveDeleteDelta(old, replaced))
 		}
 		m.mu.Unlock()
 	})
+	return liveDelta, err
 }

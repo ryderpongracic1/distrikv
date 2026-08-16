@@ -14,6 +14,10 @@ func (c *CLI) newDeleteCmd() *cobra.Command {
 		Short: "Delete a key from the cluster",
 		Long: `Delete a key from the cluster.
 
+Deletes are idempotent: the storage engine writes a tombstone without checking
+whether the key exists, so deleting a key that was never there also succeeds.
+Run "get <key>" first if you need to know whether the key existed.
+
 Without --confirm, prompts for confirmation in interactive mode.
 In non-interactive (piped) mode, --confirm (-y) is required.`,
 		RunE: c.runDelete,

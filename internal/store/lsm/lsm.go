@@ -37,6 +37,18 @@
 // Stall events and cumulative delay are recorded in metrics.WriteStallCount
 // and metrics.WriteStallMicros, visible via the /metrics HTTP endpoint.
 //
+// # Engine counters
+//
+// Two counters back observability fields the node serves over HTTP:
+//
+//   - LiveKeys — approximate live (non-tombstoned) key count, served as
+//     /status key_count. Maintained incrementally from the memtable's
+//     replaced/tombstone state so the write path stays read-free and
+//     allocation-free; persisted at each flush via the manifest and rebuilt
+//     from WAL replay at open. See LSMTree.LiveKeys for the accuracy contract.
+//   - WALAppends — fsync'd WAL appends since open, served as /metrics
+//     wal_writes. Mirrored into metrics.WALWrites when metrics are wired.
+//
 // # Goroutine model
 //
 //   - runFlush:   sole writer of l.l0 (prepend) and l.imm (set nil)
@@ -110,6 +122,16 @@ type LSMTree struct {
 	seqNum  atomic.Uint64 // global write sequence; shared with Memtables
 	nextSST atomic.Uint64 // SSTable file sequence number
 	walSeq  atomic.Uint64 // WAL file sequence number
+
+	// liveKeys is the approximate number of live (non-tombstoned) keys in the
+	// engine. See LiveKeys for the accuracy contract and how it is persisted.
+	// May go negative transiently; LiveKeys clamps on read.
+	liveKeys atomic.Int64
+
+	// walAppends counts fsync'd WAL appends since this engine was opened. One
+	// append per successful Put/Delete (including snapshot-restore writes);
+	// WAL replay is not an append and is not counted.
+	walAppends atomic.Uint64
 
 	// l0Count mirrors len(l.l0) as an atomic so maybeStallWrite can read it
 	// without taking the mutex. It is always updated under mu before Unlock.
@@ -271,6 +293,16 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 	l.walSeq.Store(maxWalSeq)
 
 	// Replay existing WAL files into a fresh Memtable.
+	//
+	// Live-key count recovery: seed from the count the last flush recorded in
+	// the manifest (which describes exactly the SSTable set on disk), then let
+	// each replayed WAL apply the deltas for writes that never reached an
+	// SSTable. Manifests written before the field existed report no count, in
+	// which case the WAL deltas alone are the best available estimate.
+	if seeded, ok := manifest.LastLiveKeys(); ok {
+		l.liveKeys.Store(seeded)
+	}
+
 	activeWalSeq := l.walSeq.Add(1)
 	activeWalPath := filepath.Join(dataDir, fmt.Sprintf("wal-%04d.log", activeWalSeq))
 	activeWAL, err := storewal.Open(activeWalPath)
@@ -284,10 +316,12 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 		if err != nil {
 			return nil, fmt.Errorf("lsm: open WAL %q for replay: %w", wf, err)
 		}
-		if err := l.mem.ReplayWAL(w); err != nil {
+		delta, err := l.mem.ReplayWAL(w)
+		if err != nil {
 			w.Close()
 			return nil, fmt.Errorf("lsm: replay WAL %q: %w", wf, err)
 		}
+		l.liveKeys.Add(delta)
 		w.Close()
 	}
 
@@ -395,9 +429,11 @@ func (l *LSMTree) Put(ctx context.Context, key string, value []byte) error {
 func (l *LSMTree) putInternal(_ context.Context, key string, value []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if err := l.mem.Put(key, value); err != nil {
+	delta, err := l.mem.Put(key, value)
+	if err != nil {
 		return err
 	}
+	l.recordWrite(delta)
 	if l.mem.IsFull() {
 		return l.rotateMemtable()
 	}
@@ -413,17 +449,75 @@ func (l *LSMTree) Delete(ctx context.Context, key string) error {
 }
 
 // deleteInternal is the lock-holding delete path, shared by Delete and Restore.
+//
+// Deletes are blind tombstone writes: the engine does not check whether the key
+// exists first. Doing so would require a full read-path traversal (memtable →
+// immutable memtable → every L0 file → L1) per delete, and doing it atomically
+// would mean holding the write lock across those disk reads. Callers that need
+// existence semantics must Get first and accept the race.
 func (l *LSMTree) deleteInternal(_ context.Context, key string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if err := l.mem.Delete(key); err != nil {
+	delta, err := l.mem.Delete(key)
+	if err != nil {
 		return err
 	}
+	l.recordWrite(delta)
 	if l.mem.IsFull() {
 		return l.rotateMemtable()
 	}
 	return nil
 }
+
+// recordWrite folds one successful memtable write into the engine-wide
+// counters: a fsync'd WAL append, plus that write's live-key delta.
+//
+// The caller holds l.mu for the memtable write itself, not for these counters —
+// they are atomic so that Get-path callers and the HTTP handlers can read them
+// without taking the lock.
+func (l *LSMTree) recordWrite(liveDelta int) {
+	l.walAppends.Add(1)
+	if l.metrics != nil {
+		l.metrics.WALWrites.Add(1)
+	}
+	if liveDelta != 0 {
+		l.liveKeys.Add(int64(liveDelta))
+	}
+}
+
+// LiveKeys returns the approximate number of live (non-tombstoned) keys.
+//
+// Accuracy contract — the count is exact for a workload of distinct keys, and
+// drifts in exactly two cases, both of which need a read to classify:
+//
+//   - Overwriting a key that is no longer in the active memtable (it has been
+//     flushed to an SSTable) counts as a new key: the count drifts UP.
+//   - Deleting a key that does not exist, or is not in the active memtable,
+//     counts as removing a live key: the count drifts DOWN.
+//
+// Classifying either case correctly would require a full read-path traversal
+// on the write hot path, which costs more than the field is worth. The value is
+// therefore published as approximate (see /status key_count) rather than made
+// exact.
+//
+// Durability: each memtable flush records the count in the manifest, and any
+// WAL still on disk at open replays its deltas on top, so the count survives
+// close/reopen and crash recovery without a startup scan of the SSTables. Data
+// directories written before the manifest field existed start from their WAL
+// contents alone.
+//
+// The internal counter is signed and may go negative under a delete-heavy
+// approximation; the returned value is clamped at zero.
+func (l *LSMTree) LiveKeys() int64 {
+	if n := l.liveKeys.Load(); n > 0 {
+		return n
+	}
+	return 0
+}
+
+// WALAppends returns the number of fsync'd WAL appends since this engine was
+// opened — one per successful Put/Delete. WAL replay is not counted.
+func (l *LSMTree) WALAppends() uint64 { return l.walAppends.Load() }
 
 // maybeStallWrite applies write-stall backpressure when L0 is filling up.
 // Must be called WITHOUT l.mu held.
@@ -493,6 +587,10 @@ func (l *LSMTree) rotateMemtable() error {
 	}
 
 	l.imm = l.mem
+	// Seal the live-key count for the memtable leaving the write path. Its
+	// flush will persist this value to the manifest; every write from here on
+	// lands in the new WAL and is re-applied by replay at open.
+	l.imm.liveKeysAtSeal = l.liveKeys.Load()
 	l.mem = NewMemtable(newWAL, walPath, &l.seqNum, l.maxMem)
 
 	select {
@@ -554,7 +652,7 @@ func (l *LSMTree) flushMemtable(imm *Memtable) error {
 		return fmt.Errorf("lsm: flush close writer: %w", err)
 	}
 
-	if err := l.manifest.Add(outName, sstSeq, 0 /*level=L0*/); err != nil {
+	if err := l.manifest.AddWithLiveKeys(outName, sstSeq, 0 /*level=L0*/, imm.liveKeysAtSeal); err != nil {
 		os.Remove(outPath)
 		return fmt.Errorf("lsm: flush manifest add: %w", err)
 	}
@@ -576,6 +674,7 @@ func (l *LSMTree) flushMemtable(imm *Memtable) error {
 	// Atomically: prepend to l0, update l0Count, clear imm, wake writers.
 	l.mu.Lock()
 	l.l0 = append([]*SSTableReader{newReader}, l.l0...)
+	l0Depth := len(l.l0)
 	l.l0Count.Store(int32(len(l.l0)))
 	if l.metrics != nil {
 		l.metrics.L0FileCount.Store(int64(len(l.l0)))
@@ -588,8 +687,11 @@ func (l *LSMTree) flushMemtable(imm *Memtable) error {
 		l.logger.Warn("lsm: remove flushed WAL", "path", imm.walPath, "err", err)
 	}
 
+	// l0Depth is captured under the lock above: reading len(l.l0) here would
+	// race with runCompact clearing l.l0, and would also be off by one because
+	// l.l0 already includes the reader appended above.
 	l.logger.Info("lsm: memtable flushed to L0", "sst", outName,
-		"size", imm.SizeBytes(), "l0_depth", len(l.l0)+1)
+		"size", imm.SizeBytes(), "l0_depth", l0Depth)
 
 	select {
 	case l.compactCh <- struct{}{}:
@@ -826,6 +928,12 @@ func (l *LSMTree) Restore(ctx context.Context, data map[string][]byte) error {
 	l.seqNum.Store(0)
 	l.nextSST.Store(0)
 	l.walSeq.Store(0)
+	// The store is now empty; the putInternal loop below re-counts every key
+	// in the snapshot as it is written.
+	l.liveKeys.Store(0)
+	// walAppends is deliberately NOT reset: it counts fsync'd WAL appends made
+	// by this process, and the restore writes below are real appends. It is a
+	// process-lifetime IO counter, not a property of the logical store.
 
 	activeWalSeq := l.walSeq.Add(1)
 	activeWalPath := filepath.Join(l.dataDir, fmt.Sprintf("wal-%04d.log", activeWalSeq))
@@ -940,10 +1048,15 @@ func (l *LSMTree) flushMemtableDirect(mem *Memtable) error {
 		os.Remove(outPath)
 		return err
 	}
-	if err := l.manifest.Add(outName, sstSeq, 0 /*L0*/); err != nil {
+	// Close is the one flush of a memtable that was never sealed by a rotation,
+	// so the count to persist is simply the current one: every write is either
+	// already in an SSTable or in the memtable being flushed here, and this
+	// memtable's WAL is removed below.
+	if err := l.manifest.AddWithLiveKeys(outName, sstSeq, 0 /*L0*/, l.liveKeys.Load()); err != nil {
 		os.Remove(outPath)
 		return err
 	}
+
 	r, err := OpenSSTableReader(outPath, sstSeq)
 	if err != nil {
 		return err

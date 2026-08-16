@@ -22,7 +22,8 @@ type Metrics struct {
 	// GetMiss counts Get calls that returned ErrNotFound.
 	GetMiss atomic.Uint64
 
-	// WALWrites counts the number of fsync'd WAL appends.
+	// WALWrites counts the number of fsync'd WAL appends. Maintained by the LSM
+	// engine (one per successful Put/Delete); recovery replay is not counted.
 	WALWrites atomic.Uint64
 
 	// RaftTerms counts the number of term increments (candidate elections

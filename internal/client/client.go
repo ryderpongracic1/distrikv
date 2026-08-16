@@ -37,12 +37,17 @@ type PutRequest struct {
 }
 
 // StatusResponse matches the server's /status JSON exactly, including key_count.
+//
+// KeyCount is an approximation maintained by the storage engine, which is why the
+// server also sends key_count_approximate; see store.Store.KeyCount for the
+// accuracy contract.
 type StatusResponse struct {
-	NodeID   string `json:"node_id"`
-	Leader   string `json:"leader"`
-	Term     uint64 `json:"term"`
-	Role     string `json:"role"`
-	KeyCount int    `json:"key_count"`
+	NodeID              string `json:"node_id"`
+	Leader              string `json:"leader"`
+	Term                uint64 `json:"term"`
+	Role                string `json:"role"`
+	KeyCount            int    `json:"key_count"`
+	KeyCountApproximate bool   `json:"key_count_approximate"`
 }
 
 // MetricsResponse is a flat map of counter name to uint64 value.

@@ -94,21 +94,31 @@ Every `Put` and `Delete` is appended to a binary WAL file **before** the MemTabl
 
 ### Raft (`internal/raft`)
 
-Full implementation covering:
+**Raft here is a leader-election and failure-detection mechanism, not a data replication mechanism.** Read that before the feature list below — it is the single most important thing to know about this package, and the feature list is easy to misread without it.
+
+**Live in production traffic:**
 
 - Randomised election timeouts (150–300 ms) with **pre-vote phase** — a candidate first checks it can win a real election before incrementing its term, preventing a rejoining partitioned node from disrupting a stable leader.
 - `RequestVote` with log-up-to-date check, majority-vote election, term-based split-brain prevention.
-- `AppendEntries` heartbeats (75 ms) and log replication.
-- `InstallSnapshot` — the leader can ship a binary state snapshot to a lagging follower that has fallen too far behind, replacing full log replay.
+- `AppendEntries` **heartbeats only** (75 ms). Heartbeats carry no entries, so they serve purely as a liveness signal and a leader-authority assertion.
 - Atomic persistence of `currentTerm`/`votedFor` via write-temp-then-`os.Rename`.
+
+**Implemented but dormant — exercised by unit tests, never by a running cluster:**
+
+- **Log replication.** `AppendEntries` entry handling, `applyEntryLocked`, and the `nextIndex`/`matchIndex` bookkeeping are all implemented, but nothing in the system ever proposes an entry to the Raft log. Client writes go to the storage engine directly (see deviation 1). Consequence: `r.log` stays empty for the lifetime of the process.
+- **Snapshot delivery.** `InstallSnapshot` and the snapshot codec work, and `internal/raft/snapshot_test.go` covers them. But snapshots are triggered by log growth past `snapshotThreshold: 1000`, and since the log never grows, that trigger never fires. No `InstallSnapshot` RPC is ever sent outside tests.
+
+Both paths are kept rather than deleted because they are the natural landing spot if writes are ever moved onto the Raft log. They are listed here so that "distrikv implements InstallSnapshot" is not mistaken for "distrikv ships snapshots between nodes at runtime" — it doesn't.
 
 **Intentional deviations from the paper (important for reviewers):**
 
-1. **Data writes bypass Raft consensus.** Writes flow through the consistent-hash ring's `ReplicationManager`, not through the Raft log. Raft here is a leader-election and failure-detection mechanism only. This means Raft's "if committed, all future leaders have it" guarantee does **not** apply to data. Under partition the ring-primary and its replicas can diverge.
+1. **Data writes bypass Raft consensus.** Writes flow through the consistent-hash ring, not through the Raft log. Raft here is a leader-election and failure-detection mechanism only. This means Raft's "if committed, all future leaders have it" guarantee does **not** apply to data. Under partition the ring-primary and its replicas can diverge.
 
-2. **No log truncation on leader change.** A new leader doesn't truncate uncommitted follower entries. Mitigation: all reads route to the ring-primary, so stale reads are bounded to the in-flight crash window.
+2. **The Raft log is never written, so log-based guarantees are vacuous.** There is no log truncation on leader change because there are no entries to truncate, and no commit index advancing because nothing is proposed. Mitigation for data: all reads route to the ring-primary, so stale reads are bounded to the in-flight crash window.
 
 3. **Static membership.** No membership-change protocol. Adding/removing a node requires a cluster restart.
+
+The package doc comment at the top of `internal/raft/raft.go` states the same deviations for anyone reading the code first.
 
 ### CAP Position
 
@@ -122,11 +132,15 @@ With R=2 and both-replicas-must-ACK writes, the system is **CP**: it refuses wri
 PUT    /keys/{key}   body: {"value": "..."}
 GET    /keys/{key}
 DELETE /keys/{key}
-GET    /status       → {node_id, leader, term, role, key_count}
-GET    /metrics      → atomic counters (put_total, get_miss, raft_terms, …)
+GET    /status       → {node_id, leader, term, role, key_count, key_count_approximate}
+GET    /metrics      → atomic counters (put_total, get_miss, wal_writes, raft_terms, …)
 ```
 
 All error responses: `{"error": "..."}`.
+
+**`DELETE` is idempotent and never returns 404.** The storage engine writes tombstones blindly, so deleting a key that does not exist returns `200 {"status":"ok"}`. The previous behaviour — a `Get` before the `Delete` to synthesise a 404 — was removed because it was racy (another writer could insert or remove the key between the two calls, so the answer was never authoritative) and cost a full read-path traversal through the memtable, every L0 SSTable and L1 on every delete. This matches RocksDB, Cassandra and DynamoDB `DeleteItem`. `distrikv-cli delete <key>` therefore reports success for keys that were never there; use `get` first if you need to know.
+
+**`key_count` is approximate**, which is why `/status` also returns `key_count_approximate: true`. The LSM engine maintains the count incrementally: it is exact for a workload of distinct keys, drifts up when a key that has already been flushed to an SSTable is overwritten, and drifts down when a key that does not exist is deleted. Classifying either case correctly would require a read on the write hot path. The count is recorded in the manifest at each memtable flush and re-applied from the WAL at startup, so it survives restarts and crash recovery without scanning the SSTables. `wal_writes` is the engine's real count of fsync'd WAL appends — one per successful `PUT`/`DELETE`.
 
 ### Quick start (single node)
 
@@ -216,7 +230,7 @@ Errors always go to stderr — stdout is never polluted regardless of output mod
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | Key not found |
+| 1 | Key not found (`get` and `watch` only — `delete` is idempotent, see the HTTP API notes) |
 | 2 | Node unreachable |
 | 3 | Bad arguments |
 | 4 | Server error (5xx) |
@@ -309,7 +323,7 @@ These numbers establish the baseline for Phases 2 (WAL GC optimisation), 3
 (leveled compaction), and 4 (chaos). Any regression in p99 or WAF in a
 later phase has to be justified.
 
-### Throughput ceiling (2025-05-22, 3-node docker-compose, Apple M1 Max 32 GB)
+### Throughput ceiling (2026-05-22, 3-node docker-compose, Apple M1 Max 32 GB)
 
 Measured with `cmd/bench` open-loop Poisson arrivals against a healthy 3-node
 cluster; Zipfian α=1.1, 100k-key space, 256 B values.  "Not saturated" means
@@ -607,7 +621,7 @@ a lower hit rate due to natural working-set pressure.
 
 The Phase 1 benchmark baseline used a 100k-key uniform workload where the full dataset is many times larger than any reasonable in-process cache — that workload will show minimal cache benefit. The cache targets hot-key / Zipfian workloads (`--keydist zipf`) where a small fraction of keys accounts for most reads. The `block_cache_hits` / `hit_rate` fields in `cmd/bench` output make this visible without guesswork.
 
-#### Phase 5 Zipfian hit-rate baseline (2025-05-22, Apple M1 Max)
+#### Phase 5 Zipfian hit-rate baseline (2026-05-22, Apple M1 Max)
 
 `go test ./internal/store/lsm/ -run TestBlockCache_ZipfHitRate -v -timeout 120s`
 

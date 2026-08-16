@@ -159,6 +159,12 @@ repair. Closing that hole properly means either two-phase commit across the
 replica set or routing data writes through the Raft log; both are out of scope
 for the current design (see "Intentional deviations from the paper" above).
 
+This is not a theoretical caveat: it is what the first real fault-injection runs
+detected. The linearizability checker rejected both a SIGKILL and a SIGTERM run
+purely because refused-but-applied writes were being read back afterwards — see
+Phase 4's "How failed operations are modelled" for the A/B evidence and the model
+change it forced.
+
 Three smaller guarantees, stated because they are load-bearing:
 
 - **Replicas do not re-replicate.** A replicated mutation is applied straight to
@@ -543,10 +549,15 @@ The KV model treats each key as an independent register
 before checking, reducing complexity from O(exp(N)) to O(K × exp(N/K)) where K is
 the keyspace size — essential for large histories.
 
-**Failed operations** (`Output.Err = true`) are modelled as no-ops: the checker
-allows the state to remain unchanged. This is exact for in-process failures
-(a panicking Put never reaches the memtable) and conservative for network-level
-errors (the server *may* have committed the write).
+**Failed operations** are classified rather than assumed. A failed read
+constrains nothing. A failed *write* is modelled as a no-op only when it provably
+never reached the store; a write distrikv refused with 503 after applying it
+locally is modelled as **applied** (`Output.Applied`), and a write whose effect is
+unknown becomes a **pending operation** (`Recorder.EndUnknown`) the checker may
+place anywhere or nowhere. Recording every failure as a no-op — the original
+model — is exact for in-process failures but reports a correct store as broken
+under replication; see "How failed operations are modelled" below for the
+evidence that forced the change.
 
 **2. Crash recovery tests (`internal/store/lsm/crash_test.go`)**
 
@@ -675,45 +686,110 @@ timestamps, and `up_at`/`up_at_offset_ms`/`down_ms` all `null` together for a
 window whose victim never came back. An interrupted run reports `interrupted` and
 the truncated duration its verdict actually covers.
 
-*How failed operations are modelled.* Ops that fail inside a fault window are
-recorded with `Output.Err = true`, which the KV model treats as a no-op — so
-failing requests cannot on their own make a history illegal. That is verified by
-`TestKVModelTreatsFailedOpsAsNoOps` in `cmd/chaos`, which pins the transition
-directly rather than trusting the prose.
+*How failed operations are modelled.* A failed operation is **classified, not
+assumed**. A read that fails constrains nothing — the value it returned is not
+asserted — but a *write* that fails has three possible effects on the store, and
+collapsing them into one is how a correct store gets reported as broken:
 
-That treatment is exactly right for a *read*, and for a write that provably never
-reached a server — a refused connection, which is what a client sees for the
-whole time a node is down. It is **not** sound for a write whose outcome is
-unknown: a write that was appended and fsynced microseconds before its node was
-SIGKILLed really did take effect, and after WAL recovery a later read will see
-it, while the model insists the write never happened. Those writes are therefore
-counted separately as `indeterminate_writes`, and a FAIL alongside a non-zero
-count prints a note telling you to check the anomaly against the fault windows
-before believing it.
+| Outcome | When | Encoding | What the checker may conclude |
+| --- | --- | --- | --- |
+| **Never applied** | The transport delivered nothing: a refused connection, an unresolvable or unroutable host — what a client sees while a node is down | `Output{Err: true}` — no-op | The value cannot appear. A read that returns it is an anomaly |
+| **Applied anyway** | HTTP 503: the ring-primary wrote to its own store and then failed to replicate. There is no rollback, and reads are served by that primary | `Output{Err: true, Applied: true}` — the write happened | The value is present. A read that *misses* it is an anomaly |
+| **Unknown** | The connection died mid-request, a deadline expired, a forwarding hop failed after the request may already have been applied | `Recorder.EndUnknown` — a **pending operation** | Either. It may be linearized anywhere, including after the whole history |
 
-That failure mode is not hypothetical — it reproduces, and the fault *strength*
-is what decides how often it appears. Measured 2026-08-16 on a single local node
-(Linux x86-64, Intel Xeon 6975P-C, 4 cores), 3 runs per nemesis with identical
-flags — `--duration 9s --warmup 1s --workers 4 --keyspace 5 --put 50 --delete 5
---nemesis-services node1 --nemesis-interval 2s --nemesis-downtime 1s` — each run
-landing 3 of 3 strikes on a real node, with a test stub standing in for
-`docker compose` because the container has no compose plugin:
+Pending is Porcupine's treatment of an unfinished operation and Jepsen's `:info`.
+Porcupine's event API cannot express it by dropping the return — an unmatched call
+is a dead end for the checker, pinned by `TestKVModelRequiresAReturnForEveryCall`
+— so `EndUnknown` synthesizes a return placed after every other event. Because
+that API uses each event's index as its timestamp, that is the equivalent of
+`Return = +∞`: the operation's interval extends past everything observed, so
+"anywhere or nowhere" is exactly what the checker gets to choose from.
 
-| Nemesis | Indeterminate writes (3 runs) | Verdicts |
+The classification reads the **error chain**, not the message. `internal/client`
+returns a typed `*StatusError`, so 503 (applied), 502 (the forward hop failed) and
+other 5xx (unknown) are separated by `errors.As` on the status code;
+transport failures are separated by `errors.Is` down to the `syscall.Errno`.
+`TestClassifyWriteEffectDecidesFromTheChain` proves it by wrapping each error in a
+shell whose text names nothing, so a correct answer can only come from the chain.
+
+*What the first real fault-injection runs found.* Measured 2026-08-16 against a
+live 3-node docker-compose cluster on an Apple M4 Pro (Colima VM, 8 CPU / 8 GB),
+60s, 8 workers, 20-key space, `--put 50 --delete 5`, victims `node2,node3`,
+`--nemesis-interval 10s --nemesis-downtime 5s`, 4 of 4 strikes landing — the first
+runs with write replication actually wired:
+
+| Nemesis | Ops | Errors | Indeterminate writes | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| `kill-restart` (SIGKILL) | 242,476 | 47,266 | 13 | **FAIL** |
+| `stop-restart` (SIGTERM) | 288,377 | 65,932 | **0** | **FAIL** |
+
+```
+  fault windows (kill-restart)          fault windows (stop-restart)
+    #1  node2  down +0s     up +5.4s      #1  node2  down +0s     up +5.4s
+    #2  node2  down +15.4s  up +20.8s     #2  node3  down +15.4s  up +20.8s
+    #3  node2  down +30.8s  up +36.2s     #3  node3  down +30.8s  up +36.2s
+    #4  node3  down +46.2s  up +51.7s     #4  node2  down +46.2s  up +51.6s
+```
+
+The graceful nemesis is the ablation. SIGTERM drains in-flight requests, so it
+produced **zero** unknown-outcome writes — and the history was still rejected.
+That eliminates the torn-connection artefact as the cause and leaves exactly one
+mechanism: while a replica was down, the ring-primary answered 503 for writes it
+had **already applied to its own store**, the model recorded each of them as a
+no-op, and the next read of that key — served by the same primary — returned the
+refused value. With a 20-key space and tens of thousands of refused writes per
+run, that is not a probabilistic artefact; it happens in every fault window.
+
+The checker was right. It detected precisely the caveat the CAP section above
+states in bold — *a refused write is not an undone write* — and the model was the
+thing that did not encode it. The fix is the three-outcome table above:
+`internal/linearizability` learned `Applied` and `EndUnknown`, and the runner
+learned to tell the classes apart. Both runs above should now PASS, which is the
+point: **a FAIL is now a real consistency bug**, and the printed note says so
+instead of telling the operator to discount anomalies near a fault window.
+
+For the record, the pre-fix artefact this replaces was also measured, on a single
+local node (Linux x86-64, Intel Xeon 6975P-C, 4 cores), 3 runs per nemesis,
+`--duration 9s --warmup 1s --workers 4 --keyspace 5`, with a test stub standing in
+for `docker compose`:
+
+| Nemesis | Indeterminate writes (3 runs) | Verdicts (pre-fix) |
 | --- | --- | --- |
 | `kill-restart` (SIGKILL) | 9, 9, 12 | PASS, **FAIL**, **FAIL** |
 | `stop-restart` (SIGTERM) | 0, 0, 1 | PASS, PASS, PASS |
 
-The graceful stop drains in-flight requests, so almost no write is left in an
-unknown state. The hard kill cuts requests mid-flight, and ~10 writes per run that
-were durable-but-unacknowledged are enough to make the model reject an otherwise
-correct history — 2 runs in 3 here, so the artefact is probabilistic, not
-deterministic. Those SIGKILL FAILs are a **known artefact of the model, not a
-consistency bug**, and the `kill-restart` / `stop-restart` pair is how you tell
-the two apart: an anomaly that survives the graceful nemesis is real. Making
-SIGKILL runs verdict-clean requires teaching the model a third outcome for an
-indeterminate write (Jepsen's `:info`), which is a change to
-`internal/linearizability`, not to this runner.
+~10 durable-but-unacknowledged writes per run were enough to reject an otherwise
+correct history, 2 runs in 3. Those are now pending operations and cannot reject
+anything on their own.
+
+*The one place a message is still load-bearing, and why.* A 502 from
+`forwardRequest` hides two causes behind one code: a hop that was never made, and
+a `ForwardKey` RPC that failed *after* the primary may have applied the mutation.
+The status code cannot separate them, and the second is genuinely ambiguous — so
+502 is unknown by default. That default is expensive: a pending operation overlaps
+every later operation on its key, and a fault window produces thousands of
+forwarded writes to a node that is down, which would push the checker into a
+timeout instead of a verdict. So within the 502 class only, the runner inspects
+the response *body* for a transport failure that provably delivered nothing
+("connection refused", "no such host", "no route to host", "network is
+unreachable"), because gRPC's failure crossed two process boundaries as text and
+there is no chain left on this side of them. It is bounded in the safe direction:
+an unrecognised body stays unknown, so the worst case of gRPC rewording its errors
+is a slower check, never a wrong verdict. Making that distinction typed means
+having the server itself separate never-sent from ambiguous — a change in
+`internal/server`, not here.
+
+Ordering inside the classifier matters for the same reason. A 503's body quotes
+the replication failure underneath it, which during an outage reads
+`…connect: connection refused` from the fan-out to the dead replica. The status
+code therefore has to be consulted *first*: the message-text path used to see that
+body and declare a refused-but-applied write "provably never sent", which is why
+the `stop-restart` run above reported 0 indeterminate writes while failing.
+
+The report accounts for both classes separately — `refused-but-applied` for writes
+the primary kept, `indeterminate writes` for pending ones — so an operator can see
+which mechanism a run exercised. (The verbatim report above predates this change
+and has no `refused-but-applied` row.)
 
 *Why keys carry a per-run nonce.* `KVModel.Init` is an empty map, so a recorded
 history has to start against an empty keyspace. Keys are therefore prefixed with
@@ -728,16 +804,21 @@ and the measured keys start cold in the block cache and Bloom filters because
 warmup no longer touches them.
 
 *What this test can and cannot detect today.* A kill-restart nemesis is the test
-that can actually catch replica divergence — two copies of a key disagreeing
-after a crash and recovery. That requires more than one copy to exist. Writes are
-currently routed to a single owner per key, so killing the owner of a key makes
-that key **unavailable**, not inconsistent: requests fail with refused
-connections, which the model records as no-ops. What this run does exercise today
-is real and worth having — crash recovery under concurrent load, WAL replay
-correctness (every run above logged 4 `wal_replayed` opens: one at startup plus
-one per restart), and the absence of stale reads across a restart — but the
-divergence-detection value of the nemesis is unlocked by write replication, not by
-this runner.
+that can actually catch replica divergence — two copies of a key disagreeing after
+a crash and recovery — and with write replication wired, more than one copy now
+exists, so that is live. Killing a node exercises three things at once: crash
+recovery under concurrent load, WAL replay correctness (each restart logs a
+`wal_replayed` open), and whether a replica that missed writes while it was down
+can serve a stale value afterwards.
+
+What it still cannot detect is bounded by where reads go. Reads are served by the
+ring-primary only, so a replica that fell behind is invisible to the checker until
+it becomes the primary for that key — the divergence the CAP section documents
+(no anti-entropy, no hinted handoff, no read repair) is real but unobserved by this
+history. Killing the *primary* of a key makes that key unavailable rather than
+inconsistent, which the model records as a no-op or a pending operation depending
+on how the request failed. Closing that gap means reading from replicas, which the
+current design deliberately does not do.
 
 Exit codes:
 
@@ -792,14 +873,29 @@ cluster:
 | `TestComposeNemesisBuildsExpectedArgv` | `kill-restart` and `stop-restart` emit the expected `docker compose` argv, healing with `start` |
 | `TestComposeNemesisWrapsFailuresWithTheCommand` | A docker failure names the command that produced it |
 | `TestParseNemesisFlags` | Flag parsing and rejection of unusable nemesis configurations |
-| `TestKVModelTreatsFailedOpsAsNoOps` | Porcupine model contract: a failed op is a no-op, so ops failing inside a fault window cannot alone make a history illegal |
-| `TestKVModelRequiresAReturnForEveryCall` | An unmatched call is a dead end for the checker, which is why `finishWrite` always records a return |
+| `TestKVModelTreatsFailedOpsAsNoOps` | Porcupine model contract: a write that never reached the store is a no-op, and one known applied is not |
+| `TestKVModelRequiresAReturnForEveryCall` | An unmatched call is a dead end for the checker, which is why an unknown outcome goes through `EndUnknown` rather than dropping the return |
 | `TestMakeKeysAreRunScoped` | Warmup and measured keyspaces are separated by a run nonce, so unrecorded warmup writes cannot make a recorded history look illegal |
 | `TestProvablyNeverSentClassifiesRealClientErrors` | A refused write from `internal/client` is classified through `errors.Is`/`errors.As` on the preserved chain, not by message text |
-| `TestWriteIsIndeterminate` | Never-sent writes are separated from unknown-outcome writes, which feed `indeterminate_writes` |
+| `TestClassifyWriteEffect` | One case per error class: 503 applied, 502 never-sent vs ambiguous, other 5xx unknown, refused/unresolvable never sent, reset/timeout/cancelled unknown, unrecognised shapes unknown |
+| `TestClassifyWriteEffectDecidesFromTheChain` | Each error wrapped in a shell whose message names nothing still classifies correctly, so the status code and syscall are read from the chain |
+| `TestNeverSentTextIsBoundedToDeliveryFailures` | The one remaining message path admits only failures that delivered nothing; anything ambiguous falls through to unknown |
 | `TestClassifyDeleteErr` | A 404 delete is recorded as applied; every other failure survives |
-| `TestFinishWriteRecordsFailuresAsErrEvenWhenCancelled` | Shutdown-cancelled writes are recorded as failures, but excluded from the reported error counts |
+| `TestFinishWriteEncodesEachOutcome` | End-to-end encoding, asserted through the checker: for each failure class, whether a later read may see the value and whether it may miss it |
 | `TestFinishWriteToleratesANilRecorder` | Statistics are still counted when history recording is off |
+| `TestVerdictNotesMatchTheEncoding` | The printed guidance matches the current encoding — a FAIL is reported as real, and the superseded "failed writes are no-ops" explanation is gone |
+
+Model semantics (`internal/linearizability`) — the three outcomes a failed write
+can have, each asserted by running a hand-built history through the checker:
+
+| Test | What it verifies |
+| --- | --- |
+| `TestRefusedButAppliedWriteIsNotAnAnomaly` | The observed failure shape: a 503-refused put or delete followed by a read of its effect is legal, including a concurrent read of the pre-refusal value |
+| `TestNeverSentWriteStaysANoOp` | A write that provably never reached the store did not happen — a read returning its value is still illegal |
+| `TestLostAcknowledgedWriteStillFails` | The relaxation does not leak: an acknowledged write that disappears, and a stale read after a known-applied write, both still FAIL |
+| `TestPendingWriteIsUnconstrained` | A pending write is legal whether or not any read observes it, may linearize between two reads, and does not license a lost write on another key |
+| `TestPendingReturnsComeAfterEveryRecordedEvent` | The mechanism: a pending operation recorded first is still placeable after 20 later reads that never observed it |
+| `TestDescribeOperationLabelsEachOutcome` | A failing history distinguishes "the store confirmed this" from "we never found out" |
 
 ### Phase 5 — In-process Sharded LRU Block Cache
 

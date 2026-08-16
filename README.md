@@ -725,6 +725,8 @@ The chaos runner uses an explicit `http.Transport` with
 
 #### Phase 4 test coverage
 
+In-process linearizability and crash-recovery tests (`internal/store`):
+
 | Test | What it verifies |
 | --- | --- |
 | `TestLinearizability_ConcurrentOps` | 5 goroutines × 80 ops on a 5-key space; full Porcupine history is linearisable |
@@ -736,6 +738,39 @@ The chaos runner uses an explicit `http.Transport` with
 | `TestCrash_RestoreSentinelRecovery` | Sentinel wipe + sentinel self-removal |
 | `TestCrash_NoDataLossUnderFlushedAndUnflushed` | Mixed flushed + in-flight WAL data both survive |
 | `BenchmarkCrash_RecoveryThroughput` | WAL replay throughput for 1000-key history |
+
+Nemesis suite (`cmd/chaos`) — the fault injector and the accounting a verdict
+rests on. Docker is never invoked: the scheduler is driven against a fake
+nemesis, and the compose driver's command execution is injected, so the
+guarantees below are asserted deterministically rather than by observing a live
+cluster:
+
+| Test | What it verifies |
+| --- | --- |
+| `TestSchedulerAlternatesDisruptAndHeal` | Strike loop runs disrupt → outage → heal in order, one recorded window per strike |
+| `TestSchedulerHealsWhenCancelledMidOutage` | Cancellation during an outage still heals — a run cannot exit leaving a node down |
+| `TestSchedulerHealsAfterPanic` | A panicking disrupt heals on the way out and does not take the run down |
+| `TestSchedulerHealsEvenWhenDisruptFails` | A failed disrupt is still healed, since it may have landed partially |
+| `TestSchedulerRecordsHealFailure` | A heal that fails is recorded in the window, not swallowed |
+| `TestSchedulerDoesNotStrikeAfterCancellation` | No new strike begins once the run context is done |
+| `TestSchedulerDisruptIsDetachedFromTheRunContext` | An in-flight disrupt is not interrupted by shutdown, so `disrupt_error` means "failed", never "interrupted" |
+| `TestSchedulerVictimsComeOnlyFromTheConfiguredSet` | Victims are drawn only from `--nemesis-services` |
+| `TestSchedulerNoopWithoutVictimsOrNemesis` | Absent a nemesis or targets the scheduler is inert; default invocations are unchanged |
+| `TestFaultWindowReports` | Fault-window accounting: down/up offsets and duration; an unhealed window reports `up_at`, `up_at_offset_ms` and `down_ms` as null together |
+| `TestCountInjectedExcludesFailedStrikes` | `faults_injected` counts landed outages only — a failed disrupt is not an outage |
+| `TestFormatFaultWindows` | Human-readable window lines carry index, victim, offsets and duration |
+| `TestComposeNemesisPreflight` | Preflight validation: targets must be services the compose file defines, and an unreachable daemon fails the run at startup (exit 3) rather than mid-measurement |
+| `TestComposeNemesisBuildsExpectedArgv` | `kill-restart` and `stop-restart` emit the expected `docker compose` argv, healing with `start` |
+| `TestComposeNemesisWrapsFailuresWithTheCommand` | A docker failure names the command that produced it |
+| `TestParseNemesisFlags` | Flag parsing and rejection of unusable nemesis configurations |
+| `TestKVModelTreatsFailedOpsAsNoOps` | Porcupine model contract: a failed op is a no-op, so ops failing inside a fault window cannot alone make a history illegal |
+| `TestKVModelRequiresAReturnForEveryCall` | An unmatched call is a dead end for the checker, which is why `finishWrite` always records a return |
+| `TestMakeKeysAreRunScoped` | Warmup and measured keyspaces are separated by a run nonce, so unrecorded warmup writes cannot make a recorded history look illegal |
+| `TestProvablyNeverSentClassifiesRealClientErrors` | A refused write from `internal/client` is classified through `errors.Is`/`errors.As` on the preserved chain, not by message text |
+| `TestWriteIsIndeterminate` | Never-sent writes are separated from unknown-outcome writes, which feed `indeterminate_writes` |
+| `TestClassifyDeleteErr` | A 404 delete is recorded as applied; every other failure survives |
+| `TestFinishWriteRecordsFailuresAsErrEvenWhenCancelled` | Shutdown-cancelled writes are recorded as failures, but excluded from the reported error counts |
+| `TestFinishWriteToleratesANilRecorder` | Statistics are still counted when history recording is off |
 
 ### Phase 5 — In-process Sharded LRU Block Cache
 

@@ -12,6 +12,24 @@ import (
 	"time"
 )
 
+// Error contract.
+//
+// Every error this package returns is matchable with errors.Is against one of
+// the sentinels below, except two deliberate pass-throughs: a cancelled or
+// expired request context is returned unchanged (so callers can tell SIGINT
+// from a network failure), and a malformed response body is returned as
+// "unexpected response: %w" over the json error.
+//
+// Wrapping preserves the cause. ErrUnreachable in particular is joined to the
+// transport error rather than replacing it, so both of these hold on the same
+// value:
+//
+//	errors.Is(err, ErrUnreachable)         // this package's classification
+//	errors.Is(err, syscall.ECONNREFUSED)   // the cause underneath it
+//	errors.As(err, &opErr)                 // *net.OpError, *net.DNSError, ...
+//
+// Callers must classify with errors.Is/errors.As. The message text is not part
+// of the contract — do not match on substrings.
 var (
 	ErrNotFound    = errors.New("key not found")
 	ErrUnreachable = errors.New("node unreachable")
@@ -91,7 +109,8 @@ func (c *Client) url(path string) string {
 }
 
 // do executes the request. Context cancellation from the caller passes through
-// unchanged; other network errors are wrapped as ErrUnreachable.
+// unchanged; other network errors are wrapped as ErrUnreachable with the
+// transport error kept in the chain.
 func (c *Client) do(req *http.Request) (*http.Response, error) {
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -102,7 +121,17 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 		}
 		var urlErr *url.Error
 		if errors.As(err, &urlErr) {
-			return nil, fmt.Errorf("%w: %v", ErrUnreachable, urlErr.Err)
+			// Two %w verbs, so the result carries both the sentinel and the
+			// cause: errors.Is(err, ErrUnreachable) classifies it, and
+			// errors.Is(err, syscall.ECONNREFUSED) / errors.As(err, &opErr)
+			// still reach the network error underneath. A single %v here would
+			// render the cause as text and truncate the chain at the sentinel,
+			// forcing consumers into substring matching.
+			//
+			// %w and %v format identically, so the message is unchanged.
+			// urlErr.Err rather than urlErr keeps url.Error's method-and-URL
+			// prefix ("Get \"http://host/keys/k\": ") out of that message.
+			return nil, fmt.Errorf("%w: %w", ErrUnreachable, urlErr.Err)
 		}
 		return nil, err
 	}

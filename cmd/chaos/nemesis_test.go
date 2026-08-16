@@ -765,8 +765,8 @@ func TestClassifyDeleteErr(t *testing.T) {
 
 // TestProvablyNeverSentUsesTypedErrors covers the classifier the trustworthiness
 // of indeterminate_writes rests on. The typed path is the contract; the
-// substring path is the fallback that carries client-produced errors today,
-// because internal/client stringifies the cause and breaks the error chain.
+// substring path behind it is a last resort for errors that arrive as text with
+// no chain left to inspect.
 func TestProvablyNeverSentUsesTypedErrors(t *testing.T) {
 	t.Run("typed, chain preserved", func(t *testing.T) {
 		refused := &net.OpError{
@@ -799,20 +799,106 @@ func TestProvablyNeverSentUsesTypedErrors(t *testing.T) {
 		}
 	})
 
-	t.Run("substring fallback, chain flattened", func(t *testing.T) {
-		// The shape internal/client actually produces today.
-		flattened := fmt.Errorf("%w: dial tcp 127.0.0.1:8002: connect: connection refused",
-			clientpkg.ErrUnreachable)
-		if errors.Is(flattened, syscall.ECONNREFUSED) {
-			t.Skip("internal/client now preserves the error chain — the fallback is no longer load-bearing")
+	t.Run("substring fallback, no chain to inspect", func(t *testing.T) {
+		// An error that reached the classifier as text only — one that crossed
+		// a process boundary, or came from outside this repo. internal/client
+		// no longer produces this shape (see
+		// TestProvablyNeverSentClassifiesRealClientErrors), but the fallback
+		// still has to carry it.
+		textOnly := errors.New("dial tcp 127.0.0.1:8002: connect: connection refused")
+		if errors.Is(textOnly, syscall.ECONNREFUSED) {
+			t.Fatal("test setup error: this error is supposed to have no chain")
 		}
-		if !provablyNeverSent(flattened) {
-			t.Error("the substring fallback must still classify a flattened refused dial")
+		if !provablyNeverSent(textOnly) {
+			t.Error("the substring fallback must still classify a chainless refused dial")
 		}
 	})
 }
 
+// opaqueError keeps err reachable through Unwrap while replacing its message
+// with text that matches none of the fallback substrings. A classification that
+// survives this wrapper can only have come from the typed path.
+type opaqueError struct{ err error }
+
+func (o opaqueError) Error() string { return "write failed" }
+func (o opaqueError) Unwrap() error { return o.err }
+
+// TestProvablyNeverSentClassifiesRealClientErrors is the end-to-end proof that
+// the typed path now covers client-originated errors.
+//
+// internal/client used to wrap dial failures as fmt.Errorf("%w: %v",
+// ErrUnreachable, urlErr.Err): the %v rendered the transport error as text, so
+// ErrUnreachable was the deepest identity in the chain and this classifier could
+// only recognise a refused connection by reading the message. Now that the
+// client joins the cause with a second %w, errors.Is and errors.As reach through
+// to the syscall — asserted here against a real refused dial rather than a
+// hand-built error, so the two packages' contracts are checked together.
+func TestProvablyNeverSentClassifiesRealClientErrors(t *testing.T) {
+	// Reserve a port, then release it, so connections to it are refused.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a port: %v", err)
+	}
+	host := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("release the port: %v", err)
+	}
+
+	c := clientpkg.New(clientpkg.Config{Host: host, Timeout: 2 * time.Second})
+	ctx := context.Background()
+
+	writes := map[string]func() error{
+		"put":    func() error { return c.Put(ctx, "k", "v") },
+		"delete": func() error { return classifyDeleteErr(c.Delete(ctx, "k")) },
+	}
+
+	for name, write := range writes {
+		t.Run(name, func(t *testing.T) {
+			err := write()
+			if err == nil {
+				t.Fatal("a write to a closed port must fail")
+			}
+
+			// The sentinel still classifies it...
+			if !errors.Is(err, clientpkg.ErrUnreachable) {
+				t.Errorf("errors.Is(err, ErrUnreachable) = false for %v", err)
+			}
+			// ...and the cause is reachable through the sentinel, by value...
+			if !errors.Is(err, syscall.ECONNREFUSED) {
+				t.Errorf("errors.Is(err, ECONNREFUSED) = false for %v; the client flattened the chain", err)
+			}
+			// ...and by type.
+			var opErr *net.OpError
+			if !errors.As(err, &opErr) {
+				t.Errorf("errors.As(err, **net.OpError) = false for %v; the client flattened the chain", err)
+			} else if opErr.Op != "dial" {
+				t.Errorf("opErr.Op = %q, want \"dial\"", opErr.Op)
+			}
+
+			if !provablyNeverSent(err) {
+				t.Errorf("a refused client write must classify as never sent, got indeterminate for %v", err)
+			}
+			if writeIsIndeterminate(err) {
+				t.Errorf("a refused client write is provably a no-op, not indeterminate: %v", err)
+			}
+
+			// The classification must come from the chain, not the message: hide
+			// the text and it still holds.
+			hidden := opaqueError{err: err}
+			if strings.Contains(hidden.Error(), "refused") {
+				t.Fatal("test setup error: the opaque message still names the cause")
+			}
+			if !provablyNeverSent(hidden) {
+				t.Error("classification fell back to substring matching; the typed path is not doing the work")
+			}
+		})
+	}
+}
+
 func TestWriteIsIndeterminate(t *testing.T) {
+	// Message-only errors, so these rows exercise the substring fallback and the
+	// 404/nil short-circuits. The typed path against a real client error is
+	// covered by TestProvablyNeverSentClassifiesRealClientErrors.
 	tests := []struct {
 		err  error
 		want bool

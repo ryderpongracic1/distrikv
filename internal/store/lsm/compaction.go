@@ -88,7 +88,10 @@ func (m *MergeIterator) Next() (Entry, bool) {
 		m.prevKey = e.Key
 
 		// Drop tombstones — we treat every compaction as bottom-level.
-		// This is safe because we always compact ALL SSTables together.
+		// This is safe because every SSTable this merge does not consume was
+		// flushed after the input set was snapshotted, and is therefore newer
+		// than every input: a dropped tombstone can never uncover an older
+		// value that survives outside the merge output.
 		if e.Tombstone {
 			continue
 		}

@@ -8,8 +8,9 @@
 //	         → L0 SSTable (disk, on memtable flush)
 //	         → L1 SSTable (disk, after L0→L1 compaction)
 //	Reads   → Memtable → Immutable Memtable → L0 SSTables → L1 SSTables
-//	Compact → background goroutine: all L0 + all L1 → single new L1 SSTable
-//	          when len(l0) ≥ compactThreshold
+//	Compact → background goroutine: the L0 files present when the merge starts,
+//	          plus all L1 → single new L1 SSTable, when len(l0) ≥ compactThreshold.
+//	          L0 files flushed while the merge runs are retained, not merged.
 //
 // # Level semantics
 //
@@ -19,8 +20,17 @@
 // all L1 files, ensuring the newest version of any key is returned even when
 // L0 is not yet compacted.
 //
+// A compaction snapshots its input set and then merges without holding the lock,
+// so a memtable flush can publish a new L0 file while the merge is in flight.
+// That file is strictly newer than every merge input and its entries are not in
+// the merge output, so installCompactionResult removes only the files it
+// actually merged and retains the rest at L0 — ahead of the new L1 file in the
+// read path, which is their correct precedence.
+//
 // Tombstones are dropped during L0→L1 compaction. This is safe because L1 is
-// treated as the bottom level (there is no L2+). When future phases add L2+,
+// treated as the bottom level (there is no L2+), and because every file the
+// merge does not consume is newer than every file it does: a dropped tombstone
+// can never resurrect a value from a retained file. When future phases add L2+,
 // tombstone preservation for non-bottom levels will need to be added to the
 // MergeIterator.
 //
@@ -717,7 +727,9 @@ func (l *LSMTree) runCompact(ctx context.Context) {
 				continue
 			}
 
-			// Compact all L0 + all L1 into a single new L1 SSTable.
+			// Compact the L0 files snapshotted above plus all L1 into a single
+			// new L1 SSTable. Files flushed after this snapshot are retained by
+			// installCompactionResult rather than merged.
 			// Pass them oldest-first: l1 reversed + l0 reversed.
 			allReaders := compactInputOrder(l0snap, l1snap)
 
@@ -734,20 +746,7 @@ func (l *LSMTree) runCompact(ctx context.Context) {
 			}
 
 			// Replace l0 and l1 atomically, decrement l0Count, wake stalled writers.
-			l.mu.Lock()
-			prevL0 := len(l.l0)
-			l.l0 = nil
-			if newReader != nil {
-				l.l1 = []*SSTableReader{newReader}
-			} else {
-				l.l1 = nil
-			}
-			l.l0Count.Store(0)
-			if l.metrics != nil {
-				l.metrics.L0FileCount.Store(0)
-			}
-			l.l0Drained.Broadcast() // wake any hard-stopped writers
-			l.mu.Unlock()
+			l.installCompactionResult(l0snap, l1snap, newReader)
 
 			// Proactively evict cache entries for the now-deleted input SSTables.
 			for _, r := range l0snap {
@@ -772,8 +771,67 @@ func (l *LSMTree) runCompact(ctx context.Context) {
 			l.logger.Info("lsm: L0→L1 compaction complete",
 				"l0_inputs", len(l0snap),
 				"l1_inputs", len(l1snap),
-				"l0_cleared", prevL0,
 			)
+		}
+	}
+}
+
+// installCompactionResult publishes a finished compaction into the level state:
+// the merged output becomes L1, and the merged inputs leave L0.
+//
+// l0Inputs and l1Inputs are the reader sets the compaction actually merged,
+// snapshotted before the merge ran without the lock. l.l0 may have grown in the
+// meantime: runFlush prepends every newly flushed SSTable, and a flush that
+// lands while the merge is in flight produces a table whose entries are NOT in
+// newReader. Such a table must be retained — dropping it makes every key whose
+// newest version lives there unreadable for the rest of the process lifetime,
+// even though the file is still on disk and still live in the manifest. Only
+// readers that were merge inputs are removed from L0.
+//
+// Retained tables stay ahead of the compaction output in the read path, which is
+// the correct precedence: they are newer than everything the merge consumed, and
+// Get checks all of L0 before any of L1.
+func (l *LSMTree) installCompactionResult(l0Inputs, l1Inputs []*SSTableReader, newReader *SSTableReader) {
+	merged := make(map[*SSTableReader]struct{}, len(l0Inputs)+len(l1Inputs))
+	for _, r := range l0Inputs {
+		merged[r] = struct{}{}
+	}
+	for _, r := range l1Inputs {
+		merged[r] = struct{}{}
+	}
+
+	l.mu.Lock()
+	retained := make([]*SSTableReader, 0, len(l.l0))
+	for _, r := range l.l0 { // newest-first; filtering preserves that order
+		if _, wasInput := merged[r]; !wasInput {
+			retained = append(retained, r)
+		}
+	}
+	l.l0 = retained
+	if newReader != nil {
+		l.l1 = []*SSTableReader{newReader}
+	} else {
+		l.l1 = nil
+	}
+	l.l0Count.Store(int32(len(l.l0)))
+	if l.metrics != nil {
+		l.metrics.L0FileCount.Store(int64(len(l.l0)))
+	}
+	l.l0Drained.Broadcast() // wake any hard-stopped writers
+	needMore := l.compact.ShouldCompact(len(l.l0))
+	l.mu.Unlock()
+
+	if len(retained) > 0 {
+		l.logger.Info("lsm: retained L0 SSTables flushed during compaction",
+			"retained", len(retained))
+	}
+
+	// Tables retained above were never merged, so re-arm compaction rather than
+	// waiting for the next flush to signal it.
+	if needMore {
+		select {
+		case l.compactCh <- struct{}{}:
+		default:
 		}
 	}
 }

@@ -21,6 +21,21 @@
 // After all operations complete, call rec.Check() or rec.CheckTimeout() to
 // verify the recorded history is linearizable.
 //
+// # The three outcomes of a failed write
+//
+// A write that returns an error has three possible effects on the store, and
+// the harness encodes each one differently. Collapsing them into a single
+// "failed" case is what makes a correct store look broken:
+//
+//   - It provably did not take effect (a refused connection: nothing was ever
+//     delivered). Record Output{Err: true}. The model treats it as a no-op.
+//   - It provably did take effect (distrikv answers HTTP 503 when the primary
+//     applied a mutation locally and then could not replicate it; there is no
+//     rollback). Record Output{Err: true, Applied: true}. The model applies it.
+//   - Its effect is unknown (the connection died mid-request; a deadline
+//     expired). Call Recorder.EndUnknown, which makes it a *pending*
+//     operation — see that method for how, and why a no-op is unsound here.
+//
 // # Per-key partitioning
 //
 // The model uses porcupine's PartitionEvent hook to split the history by key
@@ -48,17 +63,38 @@ type Input struct {
 // Output is the return-side descriptor of one KV operation.
 type Output struct {
 	Value string // get: returned value; "" means key absent or non-get op
-	Err   bool   // true → the operation returned an error; result is unknown
+	Err   bool   // true → the operation returned an error
+
+	// Applied records that a *write* took effect even though it returned an
+	// error, so the model must apply it rather than treat it as a no-op. It is
+	// only consulted when Err is set, and only for put and delete.
+	//
+	// This is not a hedge — it is a positive claim, and the caller needs
+	// evidence for it. distrikv's HTTP 503 is exactly that evidence: the
+	// ring-primary writes to its own store first and only then fans the
+	// mutation out to the replicas, so a 503 ("replication to replicas failed")
+	// is reported over a mutation that is already durable on the primary, and
+	// there is no rollback. Since reads are served by the primary too, a later
+	// read of that key returning the refused value is correct behaviour. See
+	// the README's "CAP Position" — "a refused write is not an undone write".
+	Applied bool
+
+	// Deferred marks a return synthesized by Recorder.EndUnknown. It carries no
+	// meaning for the model's Step function (EndUnknown also sets Applied); it
+	// exists so DescribeOperation can label the operation honestly in a failing
+	// history rather than claiming the store confirmed anything.
+	Deferred bool
 }
 
 // KVModel is a Porcupine model for a multi-key KV store that operates on
 // string values. State is map[string]string; an absent key means no value.
 //
-// Failed operations (Output.Err == true) are treated as no-ops: the state
-// is not modified. This is the correct assumption for operations that return
-// before the server has a chance to process them (network timeout, etc.).
-// For in-process LSM tests it is exact: a failed Put never reaches the
-// memtable.
+// A write recorded with Output.Err is a no-op *unless* Output.Applied is set,
+// in which case the model applies it — see Output.Applied for why an errored
+// write can be known-applied, and Recorder.EndUnknown for the third case,
+// where the effect is unknown and neither encoding is sound.
+//
+// A failed read constrains nothing: the value it returned is not asserted.
 //
 // PartitionEvent splits the history by key so Porcupine checks each key's
 // sub-history independently. This is sound because each KV key is an
@@ -79,10 +115,15 @@ var KVModel = porcupine.Model{
 			return ns
 		}
 
+		// writeFailed reports whether a write should be modelled as having had
+		// no effect: it returned an error and the caller has no evidence the
+		// mutation landed.
+		writeFailed := out.Err && !out.Applied
+
 		switch in.Op {
 		case "put":
-			if out.Err {
-				return true, s // failed: conservatively model as no-op
+			if writeFailed {
+				return true, s
 			}
 			ns := clone()
 			ns[in.Key] = in.Value
@@ -97,7 +138,7 @@ var KVModel = porcupine.Model{
 			}
 			return out.Value == v, s
 		case "delete":
-			if out.Err {
+			if writeFailed {
 				return true, s
 			}
 			ns := clone()
@@ -152,6 +193,12 @@ var KVModel = porcupine.Model{
 		in := inp.(Input)
 		out := outp.(Output)
 		if out.Err {
+			switch {
+			case out.Deferred:
+				return fmt.Sprintf("%s(%q) -> UNKNOWN (pending: may be linearized anywhere)", in.Op, in.Key)
+			case out.Applied:
+				return fmt.Sprintf("%s(%q, %q) -> ERR but applied", in.Op, in.Key, in.Value)
+			}
 			return fmt.Sprintf("%s(%q) -> ERR", in.Op, in.Key)
 		}
 		switch in.Op {
@@ -173,11 +220,15 @@ var KVModel = porcupine.Model{
 type Recorder struct {
 	mu     sync.Mutex
 	events []porcupine.Event
-	nextID int64 // atomic for Begin; protected by mu for append
+	// deferredReturns holds the returns of pending operations. They are appended
+	// after every recorded event when the history is checked; see EndUnknown.
+	deferredReturns []porcupine.Event
+	nextID          int64 // atomic for Begin; protected by mu for append
 }
 
 // Begin records the invocation of an operation and returns a unique call ID.
-// The caller must call End(id, out) when the operation returns.
+// The caller must call End(id, out) or EndUnknown(id) when the operation
+// returns.
 func (r *Recorder) Begin(inp Input) int {
 	id := int(atomic.AddInt64(&r.nextID, 1)) - 1
 	r.mu.Lock()
@@ -201,24 +252,68 @@ func (r *Recorder) End(id int, out Output) {
 	r.mu.Unlock()
 }
 
+// EndUnknown records a *write* whose effect on the store the caller could not
+// determine — the connection died mid-request, a deadline expired, a forwarding
+// hop failed after the request may already have been applied.
+//
+// Neither of End's encodings is sound here. Output{Err: true} claims the write
+// did not happen, so a later read that correctly returns the value is reported
+// as an anomaly. Output{Err: true, Applied: true} claims it did, so a later read
+// that correctly returns the old value is reported as an anomaly. Only one
+// treatment asserts nothing: Porcupine's pending operation, Jepsen's :info.
+//
+// A pending operation is an invocation with no observed return, so the checker
+// may place it anywhere after its call — including after every other operation
+// in the history, which is indistinguishable from it never having happened.
+// "Anywhere or nowhere" is exactly the knowledge the caller has.
+//
+// Porcupine's event API cannot express that by simply omitting the return: a
+// call with no matching return is a dead end for the checker rather than a
+// pending operation (pinned by TestKVModelRequiresAReturnForEveryCall in
+// cmd/chaos). What it does support is time: the event API uses each event's
+// index as its timestamp, so placing this operation's return after every other
+// event in the history is the equivalent of the operation-API's Return = +∞ —
+// the operation's interval extends past everything that was observed.
+//
+// The cost is search space. A pending operation overlaps every later operation
+// on its key, so a history with many of them can push the checker into a
+// timeout (UNKNOWN) instead of a verdict. That is the honest failure mode: the
+// caller should keep the unknown class small by classifying precisely, not by
+// guessing an outcome.
+func (r *Recorder) EndUnknown(id int) {
+	r.mu.Lock()
+	r.deferredReturns = append(r.deferredReturns, porcupine.Event{
+		Kind: porcupine.ReturnEvent,
+		// Applied so the write is a state transition wherever it lands;
+		// Deferred so a failing history says "pending" rather than implying the
+		// store confirmed it.
+		Value: Output{Err: true, Applied: true, Deferred: true},
+		Id:    id,
+	})
+	r.mu.Unlock()
+}
+
+// history returns the full event list to check: everything recorded, followed by
+// the returns of pending operations.
+func (r *Recorder) history() []porcupine.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	h := make([]porcupine.Event, 0, len(r.events)+len(r.deferredReturns))
+	h = append(h, r.events...)
+	h = append(h, r.deferredReturns...)
+	return h
+}
+
 // Check verifies that the recorded history is linearizable.
 // Returns true if linearizable. Blocks until the check completes.
 func (r *Recorder) Check() bool {
-	r.mu.Lock()
-	events := make([]porcupine.Event, len(r.events))
-	copy(events, r.events)
-	r.mu.Unlock()
-	return porcupine.CheckEvents(KVModel, events)
+	return porcupine.CheckEvents(KVModel, r.history())
 }
 
-// CheckTimeout verifies linearizability with a time limit. Returns (true, nil)
-// if linearizable, (false, nil) if not, or (false, err) on timeout.
+// CheckTimeout verifies linearizability with a time limit. Returns (true, false)
+// if linearizable, (false, false) if not, or (false, true) on timeout.
 func (r *Recorder) CheckTimeout(d time.Duration) (ok bool, timedOut bool) {
-	r.mu.Lock()
-	events := make([]porcupine.Event, len(r.events))
-	copy(events, r.events)
-	r.mu.Unlock()
-	res := porcupine.CheckEventsTimeout(KVModel, events, d)
+	res := porcupine.CheckEventsTimeout(KVModel, r.history(), d)
 	switch res {
 	case porcupine.Ok:
 		return true, false
@@ -229,9 +324,17 @@ func (r *Recorder) CheckTimeout(d time.Duration) (ok bool, timedOut bool) {
 	}
 }
 
-// Len returns the number of recorded events (each op produces 2 events).
+// Len returns the number of events in the history that would be checked — two
+// per operation, counting the synthesized return of a pending one.
 func (r *Recorder) Len() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.events)
+	return len(r.events) + len(r.deferredReturns)
+}
+
+// Pending returns the number of operations recorded through EndUnknown.
+func (r *Recorder) Pending() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.deferredReturns)
 }

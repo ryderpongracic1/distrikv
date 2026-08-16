@@ -143,6 +143,14 @@ and must treat the write as refused. Both client entry points behave identically
 peer via gRPC `ForwardKey` share a single primary-write path, so they cannot
 drift apart on durability or on failure semantics.
 
+If the ring-primary itself is unreachable, the forwarding node answers
+`502 Bad Gateway` within ~2s: the forward RPC carries its own deadline, so a
+primary whose host has vanished (which never sends a TCP RST, leaving the gRPC
+channel stuck in `CONNECTING`) can no longer outlast the HTTP `WriteTimeout` and
+leave the client with no response at all. `503` still means "the primary took the
+write but a replica did not ACK"; `502` means "the primary could not be reached,
+so nothing was written".
+
 Reads are served from the ring-primary's local store and are never replicated,
 so a node on the minority side of a partition still answers reads while
 refusing writes. That is the right trade-off for a store where a stale read is

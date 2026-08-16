@@ -555,14 +555,169 @@ go run ./cmd/chaos \
 
 The binary runs a **warmup phase** (ops issued but not recorded), then a
 **measurement phase** (all ops recorded as Porcupine events), and finally checks
-the full history for linearizability. Exit codes:
+the full history for linearizability.
+
+*Fault injection (nemesis).* Load alone does not make a chaos test. With
+`--nemesis` the runner kills and restarts cluster members *during the
+measurement phase*, so the history is checked against a cluster that is actually
+losing and regaining nodes:
+
+```bash
+go run ./cmd/chaos \
+  --target            localhost:8001 \
+  --duration          60s \
+  --nemesis           kill-restart \
+  --nemesis-services  node2,node3 \
+  --nemesis-interval  10s \
+  --nemesis-downtime  5s
+```
+
+The nemesis loop picks a random victim from `--nemesis-services`, takes it down,
+leaves it down for `--nemesis-downtime`, brings it back, waits
+`--nemesis-interval`, and repeats. The first strike lands immediately so short
+runs still see a fault. It never runs during warmup — warmup exists to fill
+connection pools, not to be measured — and it heals its victim on **every path
+the runner controls**: a completed cycle, the run deadline, SIGINT/SIGTERM, a
+failed disrupt, or a panic in the nemesis loop. It cannot cover what it never
+runs through: a `SIGKILL` of the runner itself, or a `Heal` that fails, which is
+reported as `heal error` on the window.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--nemesis` | `none` | `none` \| `kill-restart` \| `stop-restart` |
+| `--nemesis-services` | *(empty)* | Comma-separated compose service names to draw victims from. Required unless `--nemesis=none` |
+| `--nemesis-interval` | `10s` | Delay between the end of one outage and the start of the next |
+| `--nemesis-downtime` | `5s` | How long a victim stays down |
+| `--nemesis-compose-file` | `docker/docker-compose.yml` | Compose file the nemesis operates on |
+
+`kill-restart` runs `docker compose kill` (SIGKILL) — a real crash, no graceful
+drain, recovery driven entirely by what reached disk. `stop-restart` runs
+`docker compose stop` (SIGTERM) and is a strictly weaker fault, useful for
+A/B-ing whether an anomaly needs a hard crash to reproduce. Both restart with
+`docker compose start`, so the victim keeps its named volume and recovers from
+its own WAL rather than starting empty. Compose *service* names are used rather
+than container names because container names are project- and
+compose-version-dependent (`docker-node2-1`, `docker_node2_1`, …).
+
+Before any load is issued, the nemesis is **preflighted**: the docker daemon must
+answer and every named victim must be a service the compose file actually
+defines. A misspelled service or a missing compose plugin exits 3 rather than
+silently degrading the run into a no-fault run that passes for the wrong reason.
+
+*Fault windows.* Every outage is recorded as a `(victim, down-at, up-at)` window
+and printed with offsets relative to the start of measurement, so a failure can
+be correlated with the fault that produced it. Verbatim from the `stop-restart`
+run tabulated below:
+
+```
+────────────────────────────────────────────────────────────
+  distrikv chaos  PASS  9s @ 4 workers, 5-key space
+────────────────────────────────────────────────────────────
+  ops:                     89649
+  errors:                  85775
+  indeterminate writes:    0
+  events:                  179298
+  nemesis:                 stop-restart on [node1] interval=2s downtime=1s
+  faults injected:         3 of 3 attempted
+  check_duration:          238ms
+  linearizable:            PASS
+────────────────────────────────────────────────────────────
+  fault windows (offsets from measurement start):
+    #1   node1        down +0s      up +1.1s    (1.1s)
+    #2   node1        down +3.1s    up +4.1s    (1.1s)
+    #3   node1        down +6.1s    up +7.2s    (1.1s)
+────────────────────────────────────────────────────────────
+```
+
+A window measures the *observed* outage — down-at is stamped before the disrupt
+command and up-at after the heal returns — so its span is `--nemesis-downtime`
+plus the two commands, which is why 1s of configured downtime reads as 1.1s here
+and why strikes are 3.1s apart rather than 3s. The 86k errors against 90k ops are
+the expected shape, not breakage: the runner talks only to `--target`, and this
+run's only victim *is* the target, so every request during 3.3s of a 9s run is a
+refused connection.
+
+A strike counts as *injected* only if its `Disrupt` returned success, and a
+strike is never started once the run has ended — the disrupt and heal commands
+each run on a context detached from the run deadline, so a command is never
+killed halfway and `injected` never has to mean "unknown". `--output=json` emits
+the same windows as a `fault_windows` array with millisecond offsets, RFC3339
+timestamps, and `up_at`/`up_at_offset_ms`/`down_ms` all `null` together for a
+window whose victim never came back. An interrupted run reports `interrupted` and
+the truncated duration its verdict actually covers.
+
+*How failed operations are modelled.* Ops that fail inside a fault window are
+recorded with `Output.Err = true`, which the KV model treats as a no-op — so
+failing requests cannot on their own make a history illegal. That is verified by
+`TestKVModelTreatsFailedOpsAsNoOps` in `cmd/chaos`, which pins the transition
+directly rather than trusting the prose.
+
+That treatment is exactly right for a *read*, and for a write that provably never
+reached a server — a refused connection, which is what a client sees for the
+whole time a node is down. It is **not** sound for a write whose outcome is
+unknown: a write that was appended and fsynced microseconds before its node was
+SIGKILLed really did take effect, and after WAL recovery a later read will see
+it, while the model insists the write never happened. Those writes are therefore
+counted separately as `indeterminate_writes`, and a FAIL alongside a non-zero
+count prints a note telling you to check the anomaly against the fault windows
+before believing it.
+
+That failure mode is not hypothetical — it reproduces, and the fault *strength*
+is what decides how often it appears. Measured 2026-08-16 on a single local node
+(Linux x86-64, Intel Xeon 6975P-C, 4 cores), 3 runs per nemesis with identical
+flags — `--duration 9s --warmup 1s --workers 4 --keyspace 5 --put 50 --delete 5
+--nemesis-services node1 --nemesis-interval 2s --nemesis-downtime 1s` — each run
+landing 3 of 3 strikes on a real node, with a test stub standing in for
+`docker compose` because the container has no compose plugin:
+
+| Nemesis | Indeterminate writes (3 runs) | Verdicts |
+| --- | --- | --- |
+| `kill-restart` (SIGKILL) | 9, 9, 12 | PASS, **FAIL**, **FAIL** |
+| `stop-restart` (SIGTERM) | 0, 0, 1 | PASS, PASS, PASS |
+
+The graceful stop drains in-flight requests, so almost no write is left in an
+unknown state. The hard kill cuts requests mid-flight, and ~10 writes per run that
+were durable-but-unacknowledged are enough to make the model reject an otherwise
+correct history — 2 runs in 3 here, so the artefact is probabilistic, not
+deterministic. Those SIGKILL FAILs are a **known artefact of the model, not a
+consistency bug**, and the `kill-restart` / `stop-restart` pair is how you tell
+the two apart: an anomaly that survives the graceful nemesis is real. Making
+SIGKILL runs verdict-clean requires teaching the model a third outcome for an
+indeterminate write (Jepsen's `:info`), which is a change to
+`internal/linearizability`, not to this runner.
+
+*Why keys carry a per-run nonce.* `KVModel.Init` is an empty map, so a recorded
+history has to start against an empty keyspace. Keys are therefore prefixed with
+a per-run nonce, and warmup writes to a disjoint set from measurement — otherwise
+the first measured read of a key that warmup already wrote (or that an earlier run
+left in a persistent volume) is a value the model believes cannot exist, and the
+run reports FAIL on a completely healthy cluster. It did: the pre-nemesis runner
+failed 4 out of 4 default-flag runs against a healthy single node with zero
+errors, and passes 5 out of 5 with the nonce, on the same populated store. Two
+costs, both accepted deliberately: each run leaves 2 × `--keyspace` keys behind,
+and the measured keys start cold in the block cache and Bloom filters because
+warmup no longer touches them.
+
+*What this test can and cannot detect today.* A kill-restart nemesis is the test
+that can actually catch replica divergence — two copies of a key disagreeing
+after a crash and recovery. That requires more than one copy to exist. Writes are
+currently routed to a single owner per key, so killing the owner of a key makes
+that key **unavailable**, not inconsistent: requests fail with refused
+connections, which the model records as no-ops. What this run does exercise today
+is real and worth having — crash recovery under concurrent load, WAL replay
+correctness (every run above logged 4 `wal_replayed` opens: one at startup plus
+one per restart), and the absence of stale reads across a restart — but the
+divergence-detection value of the nemesis is unlocked by write replication, not by
+this runner.
+
+Exit codes:
 
 | Code | Meaning |
 | --- | --- |
 | 0 | PASS — history is linearisable |
 | 1 | FAIL — non-linearisable anomaly detected |
 | 2 | UNKNOWN — check timed out (`--check-timeout`) |
-| 3 | Bad flags / startup error |
+| 3 | Bad flags / startup error (including nemesis preflight failure) |
 
 The chaos runner uses an explicit `http.Transport` with
 `MaxIdleConnsPerHost = workers + 64` — the same TCP-pool fix applied in

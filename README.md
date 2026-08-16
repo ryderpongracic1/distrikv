@@ -119,6 +119,12 @@ Every `Put` and `Delete` is appended to a binary WAL file **before** the MemTabl
 - **Log replication.** `AppendEntries` entry handling, `applyEntryLocked`, and the `nextIndex`/`matchIndex` bookkeeping are all implemented, but nothing in the system ever proposes an entry to the Raft log. Client writes go to the storage engine directly (see deviation 1). Consequence: `r.log` stays empty for the lifetime of the process.
 - **Snapshot delivery.** `InstallSnapshot` and the snapshot codec work, and `internal/raft/snapshot_test.go` covers them. But snapshots are triggered by log growth past `snapshotThreshold: 1000`, and since the log never grows, that trigger never fires. No `InstallSnapshot` RPC is ever sent outside tests.
 
+    Traced end to end, because it decides whether the state-machine restore path can ever run in production: `takeSnapshot` is called from exactly one place, `applyEntryLocked`, which only runs when an `AppendEntries` request carries entries. Heartbeats never carry any and nothing proposes, so `takeSnapshot` never runs, `SnapshotStore.Save` is never called, and **`raft_snapshot.bin` never exists**. That makes *both* callers of `store.RestoreFromSnapshot` unreachable in a running cluster: the startup restore in `raft.New` (guarded on a snapshot file being present) and `HandleInstallSnapshot` (a leader must send one first, and `sendInstallSnapshot` returns immediately when there is no snapshot to send). The restore path is still kept correct and fast — see the bulk-load note below — but it is dead code today, so it was **not** the cause of the recovery-availability collapse the write-stall section describes.
+
+    Also found while tracing, and **not fixed here** because `internal/raft` is owned elsewhere: `broadcastHeartbeat` chooses between `AppendEntries` and `InstallSnapshot` on `peerNext > 0 && peerNext-1 <= snapLastIndex`. With an empty log, leader initialisation sets `nextIndex = lastLogIndex+1 = 1` and `snapLastIndex` is 0, so the condition is **always true** and every heartbeat is routed to `sendInstallSnapshot`, which then returns without sending anything because no snapshot exists. Followers therefore receive no heartbeats at all, which is a more complete explanation of the observed election storm (terms climbing ~1.7/s on an idle cluster) than a tight heartbeat RPC deadline.
+
+- **State-machine restore is a bulk load, not a replay.** `LSMTree.Restore` writes the snapshot payload straight into one L0 SSTable and commits it with a single manifest add. It used to replay the payload through the normal write path, which fsyncs the WAL once per key — at snapshot scale (200k keys) that is 200k fsyncs of total write unavailability, to make durable data that is already durable in the snapshot file it was read from. Crash atomicity is unchanged: the `restore-in-progress` sentinel means an open that finds a half-done restore wipes the directory rather than exposing it, and within the bulk load the manifest add is the commit point, so an SSTable written but not recorded is invisible to every reader.
+
 Both paths are kept rather than deleted because they are the natural landing spot if writes are ever moved onto the Raft log. They are listed here so that "distrikv implements InstallSnapshot" is not mistaken for "distrikv ships snapshots between nodes at runtime" — it doesn't.
 
 **Correction — the leader-election storm (fixed).** Until recently the two claims above were not true of a *running* cluster, and the gap was a chronic election storm: a live 3-node Docker cluster burned roughly 1.7 terms per second indefinitely, passing term 900 within nine minutes of startup, alternating leadership every ~500 ms. Two defects combined:
@@ -165,6 +171,22 @@ before the response was lost. The distinction is not cosmetic — the
 linearizability model needs it, and cannot derive it downstream. Phase 4's
 *How failed operations are modelled* below carries the decision table and the
 proof behind each row.
+
+**The replication deadline is its own knob.** Each fan-out RPC is bounded by
+`defaultReplicateTimeout` = **2 s** (`cmd/node/node.go`). It used to be
+2×`HeartbeatInterval`, which tied the write path's failure threshold to a Raft
+election-timing knob: the docker-compose `HEARTBEAT_INTERVAL` of 150 ms made it
+300 ms, so tuning election sensitivity silently changed when writes start
+failing — and 300 ms is below the legitimate worst case, since a replica draining
+a compaction backlog holds a write for up to the engine's 1 s stall budget before
+answering `ErrWriteStalled`. A replica that was merely busy was therefore
+reported as failed and the client got a 503 for a write the primary had already
+applied. 2 s is the stall budget plus margin for the RPC itself (a healthy
+in-cluster replicate is sub-millisecond), sits well below the HTTP server's 10 s
+`WriteTimeout`, and matches the forward deadline so the client's worst case is
+the same 2 s whichever hop fails. A stalled replica answering `ErrWriteStalled`
+inside that window surfaces as `replica X rejected write` rather than a deadline,
+which is what separates "overloaded" from "unreachable" in the primary's logs.
 
 Reads are served from the ring-primary's local store and are never replicated,
 so a node on the minority side of a partition still answers reads while
@@ -521,15 +543,96 @@ lock is taken, avoiding any lock-ordering issue:
 | L0 file count | Behaviour | Default threshold |
 | --- | --- | --- |
 | < `l0SlowThreshold` | No stall | — |
-| `l0SlowThreshold` ≤ n < `l0StopThreshold` | **Soft stall** — proportional sleep 5–50 ms, repeated until L0 drains | 8 files (2× compaction trigger) |
-| ≥ `l0StopThreshold` | **Hard stop** — blocks on `l0Drained` cond var until `runCompact` broadcasts | 12 files (3× compaction trigger) |
+| `l0SlowThreshold` ≤ n < `l0StopThreshold` | **Soft stall** — proportional sleep 5–50 ms, repeated until L0 drains or the caller's context is done | 8 files (2× compaction trigger) |
+| ≥ `l0StopThreshold` | **Hard stop** — waits for compaction to signal that L0 drained, giving up with `ErrWriteStalled` after `maxStallWait` | 12 files (3× compaction trigger), 1 s budget |
+
+The two tiers bound differently on purpose. Soft stall is a throttle — the write
+is going to be accepted, just later — so it waits exactly as long as its caller
+is willing to. Hard stop means the engine is *refusing* writes, so it says so:
+after `maxStallWait` (1 s) the write returns `lsm.ErrWriteStalled`, re-exported as
+`store.ErrWriteStalled`. An unbounded wait there is worse than an error, because
+it makes an overloaded node indistinguishable from a dead one — which is exactly
+how a replica ends up consuming its primary's entire replication deadline and
+being reported as unreachable. `ErrWriteStalled` says "alive, overloaded, retry".
 
 Every stall event increments `metrics.WriteStallCount` and adds elapsed
 microseconds to `metrics.WriteStallMicros` — both visible via `/metrics`.
 The `l0_file_count` gauge tracks the current L0 depth in real time.
 
 Both thresholds are tunable via `WithL0StallConfig(slowThreshold, stopThreshold)`
-for tests or custom deployments.
+for tests or custom deployments; `WithCompactThreshold(n)` moves the compaction
+trigger itself.
+
+#### Reopening on an accumulated store (write-availability)
+
+Backpressure keys off the **live L0 file count**, which is restored from the
+manifest at open — so a store that was closed with a compaction backlog reopens
+already stalled. Compaction is otherwise only ever armed by a memtable flush, or
+by a compaction that left work behind. Neither happens at open, which produced a
+deadlock rather than a delay:
+
+```
+writes stall (L0 ≥ 12 from the manifest)
+   → no write reaches the memtable
+   → no memtable fills
+   → nothing flushes
+   → nothing signals compaction
+   → L0 never drains → writes stall …
+```
+
+`NewLSMTree` now arms compaction at open whenever the restored L0 set is already
+over the compaction threshold, and logs `lsm: armed compaction at open`.
+
+This is what made a three-node cluster inherited from a busy data volume serve KV
+traffic terribly while every container reported healthy: a chaos baseline with no
+faults injected managed **287 ops / 30 s with 164 errors**, and stayed that way
+for 80+ minutes, where a clean-slate cluster on the identical binary served
+**115,170 ops / 30 s with 0 errors**. The failure surfaced as replication and
+forward errors (503s and 502s) because the writes never returned — the stalled
+node was a black hole, not a slow node.
+
+Measured on Linux with `internal/store/lsm/recovery_availability_test.go`, a store
+closed with 13 live L0 SSTables and reopened with production defaults:
+
+| | Before | After |
+| --- | --- | --- |
+| Time until the first write is accepted | never (no write accepted in 30 s, `compactions=0`) | **63 ms** |
+| L0 depth after that first write | 13 (unchanged) | 0 (backlog merged) |
+| A hard-stopped write whose context expires | never returns — the wait ignored `ctx` entirely | returns `context.DeadlineExceeded` at the deadline |
+| A hard-stopped write with no deadline of its own | never returns | `ErrWriteStalled` after the stall budget |
+
+The bench-scale end of the same file (`TestRecovery_BenchScaleReopen`, gated on
+`DISTRIKV_RECOVERY_REPRO=1`) builds the ~200k × 256 B state the field cluster
+held and reports time-to-first-accepted-write plus write p50/p99 through the
+recovery window. At **production settings on a local ext4 disk it does not
+reproduce**, and that is the informative part: 200k keys took 9 m 20 s to write
+(357 writes/s, WAL-fsynced), compaction kept up (3 compactions, **1 live L0 file**
+at close), and the reopen was healthy — `NewLSMTree` returned in **1.7 ms**, the
+first write was accepted in **2.1 ms**, and the following 2000 writes ran
+p50 = 2.7 ms / p99 = 3.2 ms with zero stalls. Key *count* is not what breaks
+recovery; the L0 *backlog* is, and whether one accumulates depends on how
+expensive compaction is on the volume — on Colima/virtiofs each compaction pays
+six manifest fsyncs and falls behind the flush rate, where ext4 keeps up.
+`DISTRIKV_RECOVERY_COMPACT_THRESHOLD` raises the compaction trigger to emulate
+that, and the harness always prints the L0 depth it actually achieved so a run
+is never read as more than it is.
+
+With the trigger raised (`DISTRIKV_RECOVERY_COMPACT_THRESHOLD=1000`), the same
+200k × 256 B build closes with **13 live L0 SSTables** — the field condition at
+field scale — and the reopen behaves as the deterministic test predicts: open in
+1.7 ms, one stall of 268 ms while a single compaction merges the whole ~50 MB
+backlog, **first write accepted at 270 ms**, L0 drained to 0, and the following
+2000 writes at p50 = 2.7 ms / p99 = 3.1 ms — indistinguishable from a store that
+never had a backlog. The recovery window is therefore bounded by one compaction
+pass over the accumulated data, not open-ended. On the unfixed engine the same
+directory accepts no write at all.
+
+That 1.7 ms reopen also settles startup ordering as a factor: a node opens its
+store in `NewNode` and only starts its gRPC/HTTP listeners in `Run`, so a slow
+recovery would be indistinguishable from a down node — but recovery itself is
+cheap (WAL replay loads a single memtable with no per-entry fsync), so the
+black-hole window came from the stall above, not from recovery time, and the
+ordering was left alone.
 
 #### Read path after Phase 3
 
@@ -550,6 +653,13 @@ threshold (≤ 4 files in steady state), so read amplification stays predictable
 | --- | --- |
 | `TestLCS_ReadCorrectness` | All keys readable after L0→L1 compaction; last writer wins across rounds |
 | `TestLCS_TombstoneDroppedAfterCompaction` | Deleted keys return `ErrNotFound`; no tombstone entries in L1 SSTables |
+| `TestRecovery_ReopenWithL0Backlog_AcceptsWrites` | A store closed with L0 at the hard-stop threshold accepts a write after reopening, and the backlog drains (fails by hanging on the unfixed engine) |
+| `TestRecovery_HardStopRespectsContext` | A hard-stopped write returns when its caller's context expires |
+| `TestRecovery_HardStopReturnsStallError` | A hard-stopped write with no deadline of its own returns `ErrWriteStalled` within the stall budget |
+| `TestRecovery_BenchScaleReopen` | Env-gated harness: ~200k × 256 B state, reopen, time-to-first-accepted-write and write p50/p99 through recovery |
+| `TestRestore_BulkLoadPerformsNoWALAppends` | Snapshot restore performs zero WAL appends and lands as one L0 SSTable |
+| `TestRestore_SurvivesReopen` | Restored state, live-key count included, survives close/open; sentinel removed |
+| `TestRestore_EmptySnapshotEmptiesStore` | An empty payload empties the store and leaves it writable |
 | `TestLCS_WriteStallMetrics` | `WriteStallCount` and `WriteStallMicros` increment correctly during soft-stall loops |
 | `TestLCS_L0CountTracking` | `l0Count` atomic, `L0FileCount` metric, and `len(l.l0)` stay consistent before and after compaction |
 
@@ -1141,6 +1251,14 @@ The 86.3% figure for 8 MB is analytically consistent: 8 MB holds ~2,048 blocks, 
   `kern.ipc.somaxconn` and widen `net.inet.ip.portrange.first`.
 - Pass `--output json` for a machine-readable report (suitable for
   piping into diff tools across runs).
+- A node started on a volume with accumulated data logs
+  `lsm: armed compaction at open` when it inherits an L0 backlog; the recovery
+  window is then bounded by one compaction pass rather than being open-ended.
+  If writes come back `503` with `write stalled: L0 compaction backlog` in the
+  message, the node is alive and merging — check `l0_file_count` and
+  `write_stall_count` on `/metrics` and expect them to fall. A node that is
+  *unreachable* fails differently (`502`, or a replication deadline), which is
+  the distinction `ErrWriteStalled` exists to preserve.
 
 ---
 
@@ -1158,6 +1276,8 @@ Tests cover:
 - **PersistentState round-trip** — atomic write/read of `currentTerm` + `votedFor`
 - **Concurrent store writes** — 100 goroutines, verified under `-race`
 - **LSM-Tree correctness** — MemTable flush, SSTable read, compaction, Bloom filter false-positive rate, leveled-compaction read correctness, tombstone removal, write-stall metrics, L0-count tracking
+- **Recovery availability** — a store reopened on an L0 backlog accepts writes and drains it; hard-stopped writes honour their caller's context and report `ErrWriteStalled` within the stall budget; snapshot restore bulk-loads with no WAL appends and survives a reopen
+- **Replication deadline** — the fan-out deadline is independent of `HeartbeatInterval` (a 120 ms replica succeeds under a 5 ms heartbeat) while a silent replica is still bounded
 - **Crash recovery** — WAL replay, torn-write truncation, flushed-data survival, concurrent-write durability, restore-sentinel self-removal, mixed flushed+unflushed data
 - **Linearizability** — Porcupine-verified concurrent put/get/delete histories; both in-memory and with L0→L1 compaction in progress
 - **Block cache** — hit/miss accounting, nil-safe disabled mode, eviction correctness after compaction, Zipfian α=1.1 hit-rate sweep (0→8→32→64 MB)

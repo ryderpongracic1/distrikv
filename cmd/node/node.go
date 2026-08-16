@@ -36,10 +36,26 @@ type Node struct {
 	logger      *slog.Logger
 }
 
-// defaultReplicateTimeout bounds the replication fan-out when HeartbeatInterval
-// is not configured, so a zero value cannot turn every write into an instant
-// deadline-exceeded failure.
-const defaultReplicateTimeout = 500 * time.Millisecond
+// defaultReplicateTimeout bounds a single replication fan-out to the replica
+// set, so a replica that is slow or gone costs the client one bounded 503
+// instead of a hung request.
+//
+// This deadline used to be 2×HeartbeatInterval, which coupled the write path's
+// failure threshold to a Raft election-timing knob it has nothing to do with:
+// the docker-compose HEARTBEAT_INTERVAL of 150ms made it 300ms, so tuning
+// election sensitivity silently changed when writes start failing. 300ms is also
+// below the legitimate worst case — a replica draining a compaction backlog
+// under write-stall backpressure holds a write for up to the storage engine's
+// stall budget (lsm.ErrWriteStalled is returned after 1s) — so a replica that
+// was merely busy got reported as failed and the primary refused writes it had
+// already applied locally.
+//
+// 2s is that 1s stall budget plus margin for the RPC itself; a healthy
+// in-cluster replicate is sub-millisecond (one WAL fsync and one gRPC hop). It
+// stays well below the HTTP server's 10s WriteTimeout, and matches the forward
+// deadline (server.defaultForwardTimeout) so the client's worst case is the same
+// 2s whichever hop fails.
+const defaultReplicateTimeout = 2 * time.Second
 
 // NewNode constructs the Node by initialising all subsystems in dependency
 // order and wiring them together. It returns an error if any subsystem fails
@@ -215,9 +231,15 @@ func (n *Node) ApplyReplica(ctx context.Context, op, key string, value []byte) e
 
 // ReplicateWrite implements server.ReplicationManager. It fans out a mutation
 // that has already been applied to this node's local store to the ring's other
-// replica nodes for the key (the next R-1 distinct nodes clockwise). It uses a
-// deadline of 2× heartbeatInterval to prevent slow replicas from stalling the
-// primary.
+// replica nodes for the key (the next R-1 distinct nodes clockwise). Each
+// fan-out is bounded by defaultReplicateTimeout so a slow replica cannot stall
+// the primary.
+//
+// A replica whose storage engine is refusing writes under compaction
+// backpressure answers with store.ErrWriteStalled well inside that deadline; the
+// gRPC layer surfaces it as a rejected write ("replica X rejected write") rather
+// than as a deadline, which is what distinguishes an overloaded replica from an
+// unreachable one.
 //
 // Returns an error unless every replica ACKs — with R=2 that means any single
 // replica failure fails the client's write. The local write is NOT rolled back
@@ -234,11 +256,7 @@ func (n *Node) ReplicateWrite(ctx context.Context, op, key string, value []byte)
 		return fmt.Errorf("node: ring lookup for replication: %w", err)
 	}
 
-	deadline := 2 * n.cfg.HeartbeatInterval
-	if deadline <= 0 {
-		deadline = defaultReplicateTimeout
-	}
-	repCtx, cancel := context.WithTimeout(ctx, deadline)
+	repCtx, cancel := context.WithTimeout(ctx, defaultReplicateTimeout)
 	defer cancel()
 
 	term := n.raft.CurrentTerm()

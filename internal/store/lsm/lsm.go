@@ -40,9 +40,21 @@
 // drain them, incoming writes are throttled before they take the write lock:
 //
 //   - len(l0) ≥ l0SlowThreshold (default 8): soft stall — proportional sleep,
-//     capped at 50 ms, retried until L0 falls below the threshold.
-//   - len(l0) ≥ l0StopThreshold (default 12): hard stop — blocks on l0Drained
-//     condition variable until runCompact signals that L0 has drained.
+//     capped at 50 ms, retried until L0 falls below the threshold or the
+//     caller's context is done. Soft stall is a throttle, so it is bounded only
+//     by the caller.
+//   - len(l0) ≥ l0StopThreshold (default 12): hard stop — waits for compaction
+//     to signal that L0 has drained, and gives up with ErrWriteStalled after
+//     maxStallWait (default 1 s). Hard stop means writes are being refused, so
+//     it reports that rather than waiting indefinitely: an unbounded wait makes
+//     an overloaded node look identical to a dead one.
+//
+// The thresholds key off the live L0 file count, which is restored from the
+// manifest at open — so a store closed with an L0 backlog reopens stalled.
+// NewLSMTree therefore arms compaction at open when the restored L0 set is
+// already over the compaction threshold. Without that, the stall could never
+// clear: writes stall, so no memtable fills, so nothing flushes, and a flush is
+// otherwise the only thing that signals compaction.
 //
 // Stall events and cumulative delay are recorded in metrics.WriteStallCount
 // and metrics.WriteStallMicros, visible via the /metrics HTTP endpoint.
@@ -89,12 +101,41 @@ import (
 // ErrNotFound is returned by Get when the key does not exist.
 var ErrNotFound = errors.New("key not found")
 
+// ErrWriteStalled is returned by Put and Delete when write-stall backpressure
+// held the write for longer than the engine's stall budget
+// (defaultMaxStallWait) without L0 draining.
+//
+// It is a distinct sentinel because "alive but shedding load" is a different
+// fault from the two errors it would otherwise be confused with: an unbounded
+// wait (which makes the node indistinguishable from one that is down) and
+// context.DeadlineExceeded (which a caller cannot tell from an unreachable
+// peer). A replica that answers its primary with this error is reporting a
+// compaction backlog, which converges on its own; the operator response is
+// different from that for a dead node.
+var ErrWriteStalled = errors.New("write stalled: L0 compaction backlog")
+
 const (
 	defaultMaxMemBytes     = 4 << 20  // 4 MB memtable flush threshold
 	defaultCompactN        = 4        // compact when len(l0) ≥ this
 	defaultL0SlowThreshold = 8        // 2× defaultCompactN: begin soft stall
 	defaultL0StopThreshold = 12       // 3× defaultCompactN: hard stop writes
 	defaultBlockCacheBytes = 64 << 20 // 64 MB in-process LRU block cache
+
+	// defaultMaxStallWait bounds how long one write may sit in write-stall
+	// backpressure before it gives up with ErrWriteStalled.
+	//
+	// The value is chosen against the replication deadline that a stalled
+	// replica is answering into (cmd/node.defaultReplicateTimeout, 2s): a
+	// replica must report its own overload *before* the primary's deadline
+	// fires, because a deadline-exceeded reply is indistinguishable from an
+	// unreachable node while ErrWriteStalled is not. 1s leaves the primary a
+	// full second of margin and is an order of magnitude above a healthy stall
+	// (one compaction pass — tens to low hundreds of milliseconds), so a write
+	// only fails here when the backlog genuinely is not clearing.
+	//
+	// A caller whose own context expires sooner still wins: the stall loop
+	// selects on both.
+	defaultMaxStallWait = 1 * time.Second
 )
 
 // LSMTree is a Log-Structured Merge-Tree key-value engine.
@@ -118,9 +159,13 @@ type LSMTree struct {
 	// l1[0] = newest. Solely replaced by runCompact.
 	l1 []*SSTableReader
 
-	// l0Drained is broadcast by runCompact when l0Count drops below
-	// l0StopThreshold, unblocking writers in hard-stop stall.
-	l0Drained *sync.Cond
+	// l0DrainedCh is closed (and replaced with a fresh channel) whenever
+	// l0Count falls back below l0StopThreshold, waking every writer parked in
+	// hard stop. It is a channel rather than a sync.Cond because a stalled
+	// writer must be able to give up as well as be woken: select can wait on
+	// this and on the caller's context at the same time, which Cond.Wait
+	// cannot. Read and replaced only under mu.
+	l0DrainedCh chan struct{}
 
 	// immFlushed is broadcast when imm transitions to nil.
 	immFlushed *sync.Cond
@@ -153,6 +198,7 @@ type LSMTree struct {
 	nCompact        int              // L0 file count threshold for compaction
 	l0SlowThreshold int              // soft-stall threshold
 	l0StopThreshold int              // hard-stop threshold
+	maxStallWait    time.Duration    // per-write stall budget before ErrWriteStalled
 	metrics         *metrics.Metrics // may be nil
 	cache           *BlockCache      // may be nil (disabled when maxBytes=0)
 
@@ -192,6 +238,20 @@ func WithMaxMemBytes(n int64) Option {
 // The default when this option is absent is 64 MB.
 func WithBlockCacheBytes(n int64) Option {
 	return func(l *LSMTree) { l.cache = NewBlockCache(n) }
+}
+
+// WithCompactThreshold overrides the L0 file count at which background
+// compaction is triggered (default 4). Lower values keep read amplification
+// down at the cost of more merging; higher values do the opposite.
+//
+// Tests use it to build a deliberate L0 backlog: setting it above the number of
+// files they create keeps compaction from racing the build.
+func WithCompactThreshold(n int) Option {
+	return func(l *LSMTree) {
+		if n > 0 {
+			l.nCompact = n
+		}
+	}
 }
 
 // WithL0StallConfig sets the L0 file-count thresholds for write-stall
@@ -244,6 +304,7 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 		nCompact:        defaultCompactN,
 		l0SlowThreshold: defaultL0SlowThreshold,
 		l0StopThreshold: defaultL0StopThreshold,
+		maxStallWait:    defaultMaxStallWait,
 		cache:           NewBlockCache(defaultBlockCacheBytes),
 		flushCh:         make(chan struct{}, 1),
 		compactCh:       make(chan struct{}, 1),
@@ -257,7 +318,7 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 	})
 	l.compact.metrics = l.metrics
 	l.immFlushed = sync.NewCond(&l.mu)
-	l.l0Drained = sync.NewCond(&l.mu)
+	l.l0DrainedCh = make(chan struct{})
 
 	// Open live SSTables from manifest, split into l0 and l1 slices.
 	liveFiles := manifest.LiveFiles()
@@ -339,6 +400,25 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 	l.wg.Add(2)
 	go l.runFlush(context.Background())
 	go l.runCompact(context.Background())
+
+	// Arm compaction if the L0 set restored from the manifest already needs
+	// merging. Nothing else will do it: compaction is otherwise only ever
+	// signalled by a memtable flush or by a compaction that left work behind,
+	// and write-stall backpressure keys off this same restored L0 count. A
+	// store closed with L0 at or above l0StopThreshold would therefore reopen
+	// with every write parked in hard stop, waiting for a compaction that
+	// cannot be triggered until a write gets through — writes stall, so no
+	// memtable fills, so nothing flushes, so nothing signals compaction. That
+	// deadlock is what made a node inherited from a busy data volume serve
+	// almost no writes indefinitely while reporting healthy.
+	if l.compact.ShouldCompact(len(l.l0)) {
+		select {
+		case l.compactCh <- struct{}{}:
+		default:
+		}
+		logger.Info("lsm: armed compaction at open", "l0_sstables", len(l.l0),
+			"compact_threshold", l.nCompact)
+	}
 
 	logger.Info("lsm: opened",
 		"l0_sstables", len(l.l0),
@@ -534,12 +614,32 @@ func (l *LSMTree) WALAppends() uint64 { return l.walAppends.Load() }
 //
 //   - No stall:                  l0Count < l0SlowThreshold
 //   - Soft stall (sleep+retry):  l0SlowThreshold ≤ l0Count < l0StopThreshold
-//   - Hard stop (wait on cond):  l0Count ≥ l0StopThreshold
+//   - Hard stop (wait to drain): l0Count ≥ l0StopThreshold
 //
-// Each stall event increments metrics.WriteStallCount and adds elapsed
+// The two branches bound differently, on purpose. Soft stall is a throttle: the
+// write is going to be accepted, just later, so it waits as long as its caller
+// is willing to (ctx) and no longer. Hard stop means the engine is refusing
+// writes, so it also gives up after maxStallWait with ErrWriteStalled rather
+// than blocking indefinitely — an unbounded wait makes an overloaded node
+// indistinguishable from one that is down, which is exactly how a replica ends
+// up eating its primary's whole replication deadline and being reported as
+// unreachable.
+//
+// Each stall cycle increments metrics.WriteStallCount and adds elapsed
 // microseconds to metrics.WriteStallMicros.
 func (l *LSMTree) maybeStallWrite(ctx context.Context) error {
+	var stalledFor time.Duration
+
 	for {
+		// Take the drain channel BEFORE reading the count. Both are touched
+		// under l.mu by the compaction that drains L0, so this ordering cannot
+		// miss a wake-up: either we read the channel the drainer is about to
+		// close, or we read its replacement — in which case the count we then
+		// load is already the post-drain value.
+		l.mu.RLock()
+		drained := l.l0DrainedCh
+		l.mu.RUnlock()
+
 		n := l.l0Count.Load()
 		if n < int32(l.l0SlowThreshold) {
 			return nil
@@ -553,12 +653,21 @@ func (l *LSMTree) maybeStallWrite(ctx context.Context) error {
 		start := time.Now()
 
 		if n >= int32(l.l0StopThreshold) {
-			// Hard stop: block until runCompact signals l0 has drained.
-			l.mu.Lock()
-			for l.l0Count.Load() >= int32(l.l0StopThreshold) {
-				l.l0Drained.Wait() // releases l.mu; reacquires on wake
+			remaining := l.maxStallWait - stalledFor
+			if remaining <= 0 {
+				return fmt.Errorf("%w: %d L0 SSTables (hard stop at %d) did not drain within %v",
+					ErrWriteStalled, n, l.l0StopThreshold, l.maxStallWait)
 			}
-			l.mu.Unlock()
+			timer := time.NewTimer(remaining)
+			select {
+			case <-drained:
+			case <-ctx.Done():
+				timer.Stop()
+				l.recordStall(start)
+				return ctx.Err()
+			case <-timer.C:
+			}
+			timer.Stop()
 		} else {
 			// Soft stall: proportional sleep, max 50 ms.
 			overage := int(n) - l.l0SlowThreshold + 1
@@ -568,17 +677,40 @@ func (l *LSMTree) maybeStallWrite(ctx context.Context) error {
 			}
 			select {
 			case <-ctx.Done():
+				l.recordStall(start)
 				return ctx.Err()
 			case <-time.After(delay):
 			}
 		}
 
-		if l.metrics != nil {
-			l.metrics.WriteStallCount.Add(1)
-			l.metrics.WriteStallMicros.Add(uint64(time.Since(start).Microseconds()))
-		}
+		waited := time.Since(start)
+		stalledFor += waited
+		l.recordStall(start)
 		// Re-check after waking — L0 may still be above the slow threshold.
 	}
+}
+
+// recordStall folds one stall cycle that began at start into the stall metrics.
+func (l *LSMTree) recordStall(start time.Time) {
+	if l.metrics == nil {
+		return
+	}
+	l.metrics.WriteStallCount.Add(1)
+	l.metrics.WriteStallMicros.Add(uint64(time.Since(start).Microseconds()))
+}
+
+// signalL0DrainedLocked wakes every writer parked in hard stop, once L0 has
+// fallen back below the hard-stop threshold. Closing the current channel is the
+// broadcast; a fresh one takes its place for the next round.
+//
+// Caller must hold l.mu (write lock) and must have already published the new
+// l0Count.
+func (l *LSMTree) signalL0DrainedLocked() {
+	if int(l.l0Count.Load()) >= l.l0StopThreshold {
+		return // still stopped; nothing to wake for
+	}
+	close(l.l0DrainedCh)
+	l.l0DrainedCh = make(chan struct{})
 }
 
 // rotateMemtable promotes l.mem to l.imm and starts a fresh active memtable.
@@ -817,7 +949,7 @@ func (l *LSMTree) installCompactionResult(l0Inputs, l1Inputs []*SSTableReader, n
 	if l.metrics != nil {
 		l.metrics.L0FileCount.Store(int64(len(l.l0)))
 	}
-	l.l0Drained.Broadcast() // wake any hard-stopped writers
+	l.signalL0DrainedLocked() // wake any hard-stopped writers
 	needMore := l.compact.ShouldCompact(len(l.l0))
 	l.mu.Unlock()
 
@@ -940,7 +1072,23 @@ func (l *LSMTree) Snapshot(_ context.Context) (map[string][]byte, error) {
 	return out, nil
 }
 
-// Restore replaces the entire store with the contents of data (from a Raft snapshot).
+// Restore replaces the entire store with the contents of data (from a Raft
+// snapshot).
+//
+// The payload is written as a single L0 SSTable rather than replayed through the
+// write path. The write path fsyncs the WAL once per key, which at snapshot
+// scale (200k keys) is 200k fsyncs and minutes of total write unavailability on
+// a container volume — for data that is already durable in the snapshot file the
+// caller restored it from, so the WAL adds nothing. The bulk path pays one
+// SSTable write plus one manifest rewrite regardless of key count.
+//
+// Crash atomicity is unchanged and comes from two mechanisms the engine already
+// uses. The restore-in-progress sentinel is written before anything is touched
+// and removed only on success, so an open that finds it wipes the directory
+// rather than exposing a half-restored store (see NewLSMTree). Within the bulk
+// load, the manifest add is the commit point: an SSTable that was written but
+// never recorded is invisible to every reader, exactly as for a memtable flush
+// that dies before its manifest add.
 func (l *LSMTree) Restore(ctx context.Context, data map[string][]byte) error {
 	sentinelPath := filepath.Join(l.dataDir, "restore-in-progress")
 	if err := os.WriteFile(sentinelPath, []byte("1"), 0o644); err != nil {
@@ -960,6 +1108,12 @@ func (l *LSMTree) Restore(ctx context.Context, data map[string][]byte) error {
 	l.l0 = nil
 	l.l1 = nil
 	l.l0Count.Store(0)
+	// Fresh drain channel with the rest of the level state. No writer can be
+	// parked on the old one (the goroutines are stopped and a restore is not
+	// concurrent with serving), so this is defensive rather than load-bearing —
+	// but leaving a stale channel behind is the kind of thing that stops being
+	// harmless the moment restore gains a concurrent caller.
+	l.l0DrainedCh = make(chan struct{})
 	if l.metrics != nil {
 		l.metrics.L0FileCount.Store(0)
 	}
@@ -986,12 +1140,13 @@ func (l *LSMTree) Restore(ctx context.Context, data map[string][]byte) error {
 	l.seqNum.Store(0)
 	l.nextSST.Store(0)
 	l.walSeq.Store(0)
-	// The store is now empty; the putInternal loop below re-counts every key
-	// in the snapshot as it is written.
+	// The store is now empty; bulkLoadL0 sets the count from the payload it
+	// writes, every entry of which is live (Snapshot omits tombstones).
 	l.liveKeys.Store(0)
 	// walAppends is deliberately NOT reset: it counts fsync'd WAL appends made
-	// by this process, and the restore writes below are real appends. It is a
-	// process-lifetime IO counter, not a property of the logical store.
+	// by this process, and is a process-lifetime IO counter rather than a
+	// property of the logical store. The bulk load performs no WAL appends, so
+	// a restore leaves it where it was.
 
 	activeWalSeq := l.walSeq.Add(1)
 	activeWalPath := filepath.Join(l.dataDir, fmt.Sprintf("wal-%04d.log", activeWalSeq))
@@ -1004,7 +1159,13 @@ func (l *LSMTree) Restore(ctx context.Context, data map[string][]byte) error {
 	l.mem = NewMemtable(activeWAL, activeWalPath, &l.seqNum, l.maxMem)
 	l.mu.Unlock()
 
-	// Restart background goroutines before writing data so flushes are serviced.
+	// Write the payload straight to L0. Nothing is served from the memtable or
+	// the WAL after a restore, so no background goroutine is needed for this.
+	if err := l.bulkLoadL0(data); err != nil {
+		return err
+	}
+
+	// Restart background goroutines now that the restored state is published.
 	l.stopCh = make(chan struct{})
 	l.flushCh = make(chan struct{}, 1)
 	l.compactCh = make(chan struct{}, 1)
@@ -1012,18 +1173,79 @@ func (l *LSMTree) Restore(ctx context.Context, data map[string][]byte) error {
 	go l.runFlush(ctx)
 	go l.runCompact(ctx)
 
-	// Write snapshot data via putInternal (no stall — this is a recovery path).
-	for k, v := range data {
-		if err := l.putInternal(ctx, k, v); err != nil {
-			return fmt.Errorf("lsm: restore write %q: %w", k, err)
-		}
-	}
-
 	if err := os.Remove(sentinelPath); err != nil && !os.IsNotExist(err) {
 		l.logger.Warn("lsm: remove restore sentinel", "err", err)
 	}
 
 	l.logger.Info("lsm: snapshot restored", "keys", len(data))
+	return nil
+}
+
+// bulkLoadL0 writes data as one L0 SSTable and publishes it, without touching
+// the WAL or the memtable. Used by Restore; see its doc comment for why the
+// write path is bypassed and where the commit point is.
+//
+// A single output file (rather than one per memtable-sized chunk) keeps the
+// restored store below every compaction and write-stall threshold, so a node
+// that has just restored is immediately writable.
+func (l *LSMTree) bulkLoadL0(data map[string][]byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // SSTableWriter requires strictly ascending keys
+
+	sstSeq := l.nextSST.Add(1)
+	outName := fmt.Sprintf("sst-%08d.sst", sstSeq)
+	outPath := filepath.Join(l.dataDir, outName)
+
+	writer, err := NewSSTableWriter(outPath, len(keys))
+	if err != nil {
+		return fmt.Errorf("lsm: restore create writer: %w", err)
+	}
+	for _, k := range keys {
+		e := Entry{Key: k, Value: data[k], SeqNum: l.seqNum.Add(1)}
+		if err := writer.Write(e); err != nil {
+			writer.Close()
+			os.Remove(outPath)
+			return fmt.Errorf("lsm: restore write %q: %w", k, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		os.Remove(outPath)
+		return fmt.Errorf("lsm: restore close writer: %w", err)
+	}
+
+	// Commit point: before this the file is invisible, after it the restored
+	// state is the store. The live-key count goes in the same record so a
+	// restart straight after a restore recovers it without a scan.
+	if err := l.manifest.AddWithLiveKeys(outName, sstSeq, 0 /*level=L0*/, int64(len(keys))); err != nil {
+		os.Remove(outPath)
+		return fmt.Errorf("lsm: restore manifest add: %w", err)
+	}
+
+	reader, err := OpenSSTableReader(outPath, sstSeq)
+	if err != nil {
+		return fmt.Errorf("lsm: restore open reader: %w", err)
+	}
+	reader.Level = 0
+	reader.metrics = l.metrics
+	reader.cache = l.cache
+
+	l.mu.Lock()
+	l.l0 = []*SSTableReader{reader}
+	l.l0Count.Store(1)
+	if l.metrics != nil {
+		l.metrics.L0FileCount.Store(1)
+	}
+	l.liveKeys.Store(int64(len(keys)))
+	l.mu.Unlock()
+
+	l.logger.Info("lsm: restore bulk-loaded to L0", "sst", outName, "keys", len(keys))
 	return nil
 }
 

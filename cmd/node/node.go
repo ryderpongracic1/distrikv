@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -23,16 +24,22 @@ import (
 // subsystems. There is no global mutable state — everything flows through
 // this struct.
 type Node struct {
-	cfg        *config.Config
-	store      *store.Store
-	raft       *raft.RaftNode
-	ring       *cluster.Ring
-	grpcServer *server.GRPCServer
-	httpServer *server.HTTPServer
-	metrics    *metrics.Metrics
-	peerConns  []*grpc.ClientConn // held for Clean shutdown
-	logger     *slog.Logger
+	cfg         *config.Config
+	store       *store.Store
+	raft        *raft.RaftNode
+	ring        *cluster.Ring
+	grpcServer  *server.GRPCServer
+	httpServer  *server.HTTPServer
+	metrics     *metrics.Metrics
+	peerClients map[string]kvpb.KVServiceClient // nodeID → gRPC client
+	peerConns   []*grpc.ClientConn              // held for Clean shutdown
+	logger      *slog.Logger
 }
+
+// defaultReplicateTimeout bounds the replication fan-out when HeartbeatInterval
+// is not configured, so a zero value cannot turn every write into an instant
+// deadline-exceeded failure.
+const defaultReplicateTimeout = 500 * time.Millisecond
 
 // NewNode constructs the Node by initialising all subsystems in dependency
 // order and wiring them together. It returns an error if any subsystem fails
@@ -83,6 +90,7 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 			Client: client,
 		})
 	}
+	n.peerClients = peerClients
 
 	// 5. Raft node (election + heartbeat + snapshots).
 	raftCfg := raft.Config{
@@ -110,13 +118,15 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 		logger,
 	)
 
-	// 7. HTTP server (client-facing REST API).
+	// 7. HTTP server (client-facing REST API). Node is passed as the
+	//    ReplicationManager so client writes this node owns are replicated.
 	n.httpServer = server.NewHTTPServer(
 		cfg.HTTPAddr,
 		s,
 		raftNode,
 		ring,
 		peerClients,
+		n, // Node implements server.ReplicationManager
 		n.metrics,
 		logger,
 	)
@@ -182,26 +192,42 @@ func (n *Node) Run(ctx context.Context) error {
 }
 
 // ApplyReplica implements server.ReplicationManager. It writes a replicated
-// mutation directly to the local store, bypassing the replication fan-out
-// (because this node IS the replica receiving the write).
+// mutation directly to the local store, deliberately bypassing the replication
+// fan-out (because this node IS the replica receiving the write). Fanning out
+// from here would make every write replicate forever.
 func (n *Node) ApplyReplica(ctx context.Context, op, key string, value []byte) error {
 	switch op {
-	case "put":
+	case server.OpPut:
 		return n.store.Put(ctx, key, value)
-	case "delete":
-		return n.store.Delete(ctx, key)
+	case server.OpDelete:
+		// A replicated delete is idempotent: if this replica never received
+		// the original write (an earlier fan-out to it failed), the key is
+		// already absent and the tombstone is satisfied. Reporting ErrNotFound
+		// here would fail the client's delete on the primary forever.
+		if err := n.store.Delete(ctx, key); err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		return nil
 	default:
 		return fmt.Errorf("node: ApplyReplica: unknown op %q", op)
 	}
 }
 
-// ReplicateWrite fans out a committed mutation to the ring's replica nodes
-// (the next R-1 nodes clockwise from the primary). It uses a deadline of
-// 2× heartbeatInterval to prevent slow replicas from stalling the primary.
+// ReplicateWrite implements server.ReplicationManager. It fans out a mutation
+// that has already been applied to this node's local store to the ring's other
+// replica nodes for the key (the next R-1 distinct nodes clockwise). It uses a
+// deadline of 2× heartbeatInterval to prevent slow replicas from stalling the
+// primary.
 //
-// Returns an error if fewer than all replicas ACK — with R=2 this means any
-// single replica failure blocks the write. See the README for the CAP
-// discussion.
+// Returns an error unless every replica ACKs — with R=2 that means any single
+// replica failure fails the client's write. The local write is NOT rolled back
+// (no rollback mechanism exists), so a failed fan-out leaves this node ahead of
+// its replicas until the next successful write for the key. See the README's
+// "CAP Position" section.
+//
+// A deployment with no other node in the replica set (single node, or R=1)
+// degrades to a local-only write and returns nil: the only member of the
+// replica set is this node, which the caller has already written.
 func (n *Node) ReplicateWrite(ctx context.Context, op, key string, value []byte) error {
 	replicas, err := n.ring.GetN(key, n.cfg.ReplicaCount)
 	if err != nil {
@@ -209,8 +235,13 @@ func (n *Node) ReplicateWrite(ctx context.Context, op, key string, value []byte)
 	}
 
 	deadline := 2 * n.cfg.HeartbeatInterval
+	if deadline <= 0 {
+		deadline = defaultReplicateTimeout
+	}
 	repCtx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
+
+	term := n.raft.CurrentTerm()
 
 	var errs []error
 	for _, vn := range replicas {
@@ -218,8 +249,9 @@ func (n *Node) ReplicateWrite(ctx context.Context, op, key string, value []byte)
 			continue // skip self — already written by the caller
 		}
 
-		client, ok := n.httpServer.PeerClient(vn.NodeID)
+		client, ok := n.peerClients[vn.NodeID]
 		if !ok {
+			n.metrics.ReplicationErrors.Add(1)
 			errs = append(errs, fmt.Errorf("no client for replica %s", vn.NodeID))
 			continue
 		}
@@ -228,7 +260,7 @@ func (n *Node) ReplicateWrite(ctx context.Context, op, key string, value []byte)
 			Op:    op,
 			Key:   key,
 			Value: value,
-			Term:  n.raft.CurrentTerm(),
+			Term:  term,
 		})
 		if err != nil {
 			n.metrics.ReplicationErrors.Add(1)
@@ -242,7 +274,7 @@ func (n *Node) ReplicateWrite(ctx context.Context, op, key string, value []byte)
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("node: replication errors: %v", errs)
+		return fmt.Errorf("node: replication errors: %w", errors.Join(errs...))
 	}
 	return nil
 }

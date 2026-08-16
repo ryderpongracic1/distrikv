@@ -9,11 +9,32 @@ import (
 	"net/http"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/ryderpongracic1/distrikv/internal/cluster"
 	"github.com/ryderpongracic1/distrikv/internal/metrics"
 	"github.com/ryderpongracic1/distrikv/internal/store"
 	kvpb "github.com/ryderpongracic1/distrikv/proto/kvpb"
 )
+
+// defaultForwardTimeout bounds a single forward RPC to the ring-primary, so a
+// primary that has vanished costs the client one bounded 502 instead of no
+// response at all.
+//
+// The client's request context cannot supply that bound on its own: it carries
+// no deadline, and a host that is simply gone (a stopped container) never sends
+// a TCP RST, so the gRPC channel parks in CONNECTING. A fail-fast RPC — the
+// default, and what this client uses — only returns immediately once the
+// channel reaches TRANSIENT_FAILURE; while it is CONNECTING the RPC blocks.
+// The channel therefore does not give up until gRPC's own ~20s connect timeout,
+// which is longer than this server's 10s WriteTimeout: the connection gets
+// closed with nothing written and curl reports exit code 000.
+//
+// 2s is far above a healthy forward (sub-millisecond in-cluster, plus the
+// primary's replication fan-out, itself bounded by 2×HeartbeatInterval) and far
+// below WriteTimeout, so the deadline only ever fires on a real fault.
+const defaultForwardTimeout = 2 * time.Second
 
 // HTTPServer wraps net/http.Server and provides the client-facing REST API.
 // It routes requests to the local store when this node owns the key, and
@@ -247,6 +268,10 @@ func (h *HTTPServer) isLocalOwner(key string) bool {
 
 // forwardRequest sends the operation to the ring-primary via gRPC and writes
 // the response back to the HTTP client.
+//
+// The RPC is bounded by defaultForwardTimeout rather than run on the request
+// context alone, so an unreachable primary produces a prompt 502 instead of
+// hanging until the HTTP WriteTimeout closes the connection unanswered.
 func (h *HTTPServer) forwardRequest(w http.ResponseWriter, r *http.Request, key, method string, value []byte) {
 	primary, err := h.ring.Get(key)
 	if err != nil {
@@ -262,13 +287,27 @@ func (h *HTTPServer) forwardRequest(w http.ResponseWriter, r *http.Request, key,
 
 	h.logger.Debug("forwarding request", "method", method, "key", key, "to", primary.NodeID)
 
-	resp, err := client.ForwardKey(r.Context(), &kvpb.ForwardKeyRequest{
+	ctx, cancel := context.WithTimeout(r.Context(), defaultForwardTimeout)
+	defer cancel()
+
+	resp, err := client.ForwardKey(ctx, &kvpb.ForwardKeyRequest{
 		Method: method,
 		Key:    key,
 		Value:  value,
 	})
 	if err != nil {
-		writeError(w, http.StatusBadGateway, fmt.Sprintf("forward RPC: %s", err))
+		code := status.Code(err)
+		msg := fmt.Sprintf("forward RPC to primary %s: %s", primary.NodeID, err)
+		if code == codes.DeadlineExceeded || code == codes.Unavailable {
+			// The primary is unreachable, not misbehaving: say so plainly
+			// rather than surfacing a raw gRPC status to the client.
+			msg = fmt.Sprintf("primary %s unreachable: forward RPC did not complete within %s",
+				primary.NodeID, defaultForwardTimeout)
+		}
+		h.logger.Warn("forward failed",
+			"method", method, "key", key, "to", primary.NodeID,
+			"grpc_code", code.String(), "error", err)
+		writeError(w, http.StatusBadGateway, msg)
 		return
 	}
 

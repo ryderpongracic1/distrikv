@@ -144,10 +144,7 @@ func newHarness(t *testing.T) *harness {
 // do issues an HTTP request against the server's registered routes.
 func (h *harness) do(t *testing.T, method, target, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(method, target, strings.NewReader(body))
-	rec := httptest.NewRecorder()
-	h.http.srv.Handler.ServeHTTP(rec, req)
-	return rec
+	return serveHTTP(t, h.http, method, target, body)
 }
 
 // assertWrites checks the exact set of fan-out calls the primary made.

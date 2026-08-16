@@ -28,15 +28,27 @@ type fakePeer struct {
 
 	mu     sync.Mutex
 	reqs   []*kvpb.ReplicateRequest
-	err    error // transport-level failure
-	refuse bool  // ACK with Success=false
+	err    error         // transport-level failure
+	refuse bool          // ACK with Success=false
+	delay  time.Duration // how long the replica takes to answer
 	nodeID string
 }
 
-func (f *fakePeer) Replicate(_ context.Context, in *kvpb.ReplicateRequest, _ ...grpc.CallOption) (*kvpb.ReplicateResponse, error) {
+func (f *fakePeer) Replicate(ctx context.Context, in *kvpb.ReplicateRequest, _ ...grpc.CallOption) (*kvpb.ReplicateResponse, error) {
 	f.mu.Lock()
 	f.reqs = append(f.reqs, in)
+	delay := f.delay
 	f.mu.Unlock()
+
+	// Honour the caller's deadline the way a real gRPC call does, so a test can
+	// distinguish "replica was slow" from "deadline was too tight".
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 
 	if f.err != nil {
 		return nil, f.err
@@ -288,6 +300,73 @@ func TestReplicateWriteMissingPeerClient(t *testing.T) {
 	if got := n.metrics.ReplicationErrors.Load(); got != 1 {
 		t.Errorf("replication_errors = %d, want 1", got)
 	}
+}
+
+// TestReplicateWriteDeadlineIsIndependentOfHeartbeatInterval pins the decoupling
+// of the replication deadline from Raft's heartbeat tuning.
+//
+// The deadline used to be 2×HeartbeatInterval, so lowering the heartbeat to make
+// elections more responsive also shortened the window a replica had to answer a
+// write. With the docker-compose value of 150ms that window was 300ms, which a
+// replica draining a compaction backlog exceeds routinely — the primary then
+// reported the write refused even though it had applied it locally.
+//
+// A 5ms heartbeat here would give the old code a 10ms deadline; the replica
+// takes 120ms, which is well inside the fixed 2s budget and must succeed.
+func TestReplicateWriteDeadlineIsIndependentOfHeartbeatInterval(t *testing.T) {
+	n, peers := testNode(t, 2, "node2", "node3")
+	n.cfg.HeartbeatInterval = 5 * time.Millisecond
+
+	const key = "slow-replica"
+	for _, id := range replicaIDsFor(t, n, key) {
+		peers[id].mu.Lock()
+		peers[id].delay = 120 * time.Millisecond
+		peers[id].mu.Unlock()
+	}
+
+	start := time.Now()
+	if err := n.ReplicateWrite(context.Background(), server.OpPut, key, []byte("v")); err != nil {
+		t.Fatalf("ReplicateWrite with a 120ms replica and a 5ms heartbeat: %v "+
+			"(the deadline is still coupled to HeartbeatInterval)", err)
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Fatalf("ReplicateWrite returned in %v; the replica was supposed to take 120ms, "+
+			"so the delay was not exercised", elapsed)
+	}
+	if got := n.metrics.ReplicationErrors.Load(); got != 0 {
+		t.Errorf("ReplicationErrors = %d; want 0 — a slow but healthy replica is not an error", got)
+	}
+}
+
+// TestReplicateWriteBoundsASilentReplica asserts the other half of the contract:
+// the deadline still exists. A replica that never answers must not hang the
+// primary past defaultReplicateTimeout.
+func TestReplicateWriteBoundsASilentReplica(t *testing.T) {
+	n, peers := testNode(t, 2, "node2", "node3")
+
+	const key = "silent-replica"
+	for _, id := range replicaIDsFor(t, n, key) {
+		peers[id].mu.Lock()
+		peers[id].delay = time.Hour // never answers within any sane test
+		peers[id].mu.Unlock()
+	}
+
+	start := time.Now()
+	err := n.ReplicateWrite(context.Background(), server.OpPut, key, []byte("v"))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("ReplicateWrite succeeded against a replica that never answered")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("ReplicateWrite error = %v; want it to wrap context.DeadlineExceeded", err)
+	}
+	// Generous upper bound: the assertion is that *a* bound exists, not its
+	// precise value, so a loaded CI box cannot make this flaky.
+	if elapsed > 3*defaultReplicateTimeout {
+		t.Errorf("ReplicateWrite took %v; deadline is %v", elapsed, defaultReplicateTimeout)
+	}
+	t.Logf("silent replica bounded at %v (deadline %v)", elapsed, defaultReplicateTimeout)
 }
 
 // TestApplyReplicaWritesLocallyWithoutFanOut is the loop guard at the Node

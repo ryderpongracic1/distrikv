@@ -15,6 +15,14 @@ import (
 // ErrNotFound is returned by Get when the key does not exist or has been deleted.
 var ErrNotFound = lsm.ErrNotFound
 
+// ErrWriteStalled is returned by Put and Delete when the storage engine is
+// refusing writes because its L0 compaction backlog has not drained within the
+// engine's stall budget. It means "alive, overloaded, retry" — a different fault
+// from a deadline (indistinguishable from an unreachable node) and from an
+// unbounded wait (indistinguishable from a dead one), which is why callers that
+// classify write failures should test for it. See lsm.ErrWriteStalled.
+var ErrWriteStalled = lsm.ErrWriteStalled
+
 // Store is a thread-safe key-value store. Create one with New.
 type Store struct {
 	engine *lsm.LSMTree

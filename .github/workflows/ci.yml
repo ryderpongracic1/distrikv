@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref — the race suite is ~45s, but queueing
+# duplicates on rapid pushes wastes runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: build, vet, gofmt, race tests
+    runs-on: ubuntu-latest
+    # The LSM package alone takes ~35s under -race and the whole suite ~45s;
+    # 10 minutes leaves ample headroom for a cold module cache without letting
+    # a hung test burn a full hour.
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Single source of truth for the toolchain version: go.mod (1.25).
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-formatted. Run 'gofmt -w .' and commit the result:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Test (race detector)
+        run: go test ./... -race -count=1

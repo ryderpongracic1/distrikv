@@ -272,6 +272,12 @@ func (h *HTTPServer) isLocalOwner(key string) bool {
 // The RPC is bounded by defaultForwardTimeout rather than run on the request
 // context alone, so an unreachable primary produces a prompt 502 instead of
 // hanging until the HTTP WriteTimeout closes the connection unanswered.
+//
+// Every 502 this function writes carries a "forward_outcome" field saying whether
+// the request provably never reached the primary. That judgement is made here
+// because this is the last place the gRPC error still has its code, and the
+// status message has not yet been flattened into prose — see
+// classifyForwardError.
 func (h *HTTPServer) forwardRequest(w http.ResponseWriter, r *http.Request, key, method string, value []byte) {
 	primary, err := h.ring.Get(key)
 	if err != nil {
@@ -281,7 +287,9 @@ func (h *HTTPServer) forwardRequest(w http.ResponseWriter, r *http.Request, key,
 
 	client, ok := h.peers[primary.NodeID]
 	if !ok {
-		writeError(w, http.StatusBadGateway, fmt.Sprintf("no gRPC client for node %s", primary.NodeID))
+		// No RPC is attempted at all, so nothing could have been delivered.
+		writeForwardError(w, fmt.Sprintf("no gRPC client for node %s", primary.NodeID),
+			forwardNeverSent)
 		return
 	}
 
@@ -297,8 +305,18 @@ func (h *HTTPServer) forwardRequest(w http.ResponseWriter, r *http.Request, key,
 	})
 	if err != nil {
 		code := status.Code(err)
+		// Classify before flattening to text: this is the last point at which the
+		// error still carries its gRPC code, and the message is at its freshest.
+		// See classifyForwardError for what is and is not provable.
+		outcome := classifyForwardError(err)
+
 		msg := fmt.Sprintf("forward RPC to primary %s: %s", primary.NodeID, err)
-		if code == codes.DeadlineExceeded || code == codes.Unavailable {
+		switch {
+		case outcome == forwardNeverSent:
+			// Do not claim a timeout that did not happen: a refused connection
+			// fails in milliseconds, nowhere near defaultForwardTimeout.
+			msg = fmt.Sprintf("primary %s unreachable: forward RPC was not delivered", primary.NodeID)
+		case code == codes.DeadlineExceeded || code == codes.Unavailable:
 			// The primary is unreachable, not misbehaving: say so plainly
 			// rather than surfacing a raw gRPC status to the client.
 			msg = fmt.Sprintf("primary %s unreachable: forward RPC did not complete within %s",
@@ -306,8 +324,8 @@ func (h *HTTPServer) forwardRequest(w http.ResponseWriter, r *http.Request, key,
 		}
 		h.logger.Warn("forward failed",
 			"method", method, "key", key, "to", primary.NodeID,
-			"grpc_code", code.String(), "error", err)
-		writeError(w, http.StatusBadGateway, msg)
+			"grpc_code", code.String(), "forward_outcome", string(outcome), "error", err)
+		writeForwardError(w, msg, outcome)
 		return
 	}
 
@@ -333,4 +351,20 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// writeForwardError writes the 502 a failed forward produces: the same error
+// shape every other failure uses, plus the typed outcome.
+//
+// The outcome travels in the body rather than a header because internal/client
+// already captures the body verbatim on a *StatusError, so a consumer gets it
+// for free through the existing chain. A field is additive: a reader that does
+// not know it still sees the same "error" string it always did.
+func writeForwardError(w http.ResponseWriter, msg string, outcome forwardOutcome) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadGateway)
+	_ = json.NewEncoder(w).Encode(struct {
+		Error          string         `json:"error"`
+		ForwardOutcome forwardOutcome `json:"forward_outcome"`
+	}{Error: msg, ForwardOutcome: outcome})
 }

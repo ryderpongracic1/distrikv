@@ -681,11 +681,11 @@ func (e writeEffect) String() string {
 //	     Both client entry points report this identically: a forwarded write
 //	     returns the primary's status verbatim through ForwardKey.
 //	502  the write failed on its way to the primary, in forwardRequest. Two
-//	     causes hide behind one code: a peer with no gRPC client (never sent),
-//	     and a ForwardKey RPC that failed (which may have been applied before
-//	     the response was lost, or before a deadline expired). The code alone
-//	     cannot separate them, so this is unknown unless the body names a
-//	     transport failure that delivers nothing — see neverSentText.
+//	     causes hide behind one code: a request that provably never reached the
+//	     primary (never applied), and a ForwardKey RPC that failed in a way that
+//	     may have been applied before the response was lost. The server separates
+//	     them and says which in the body's forward_outcome field — see
+//	     classifyForwardOutcome.
 //	5xx  anything else: 500 covers both a ring-lookup failure (never applied)
 //	     and a local store error (possibly durable already). Unknown.
 //
@@ -709,10 +709,7 @@ func classifyWriteEffect(err error) writeEffect {
 		case http.StatusServiceUnavailable:
 			return effectApplied
 		case http.StatusBadGateway:
-			if neverSentText(se.Body) {
-				return effectNotApplied
-			}
-			return effectUnknown
+			return classifyForwardOutcome(se.Body)
 		default:
 			return effectUnknown
 		}
@@ -725,6 +722,66 @@ func classifyWriteEffect(err error) writeEffect {
 	// a cancelled context, an error shape this runner has never seen. Guessing
 	// "no-op" here is what produced false anomalies; leaving the operation
 	// pending asserts nothing.
+	return effectUnknown
+}
+
+// forwardOutcome values the server emits in a 502 body. They mirror the
+// constants in internal/server; this is the wire contract between the two.
+const (
+	forwardOutcomeNeverSent = "never-sent"
+	forwardOutcomeUnknown   = "unknown"
+)
+
+// forwardErrorBody is the 502 body shape written by internal/server's
+// writeForwardError. ForwardOutcome is a pointer so an *absent* field — an older
+// server that does not emit it — is distinguishable from one present with a value
+// this runner does not recognise. The two are treated differently: see
+// classifyForwardOutcome.
+type forwardErrorBody struct {
+	Error          string  `json:"error"`
+	ForwardOutcome *string `json:"forward_outcome"`
+}
+
+// classifyForwardOutcome decides what a 502 says about the store, reading the
+// server's typed verdict in preference to its prose.
+//
+// The server is the only party that can answer this. A gRPC RPC error is a
+// *status.Error carrying a code and a string and nothing else — it does not wrap
+// the transport failure underneath, so there is no chain to inspect even on the
+// server's side, let alone after the message has crossed two process boundaries
+// as text. What the server does have is the code that framed the message, which
+// is what separates a connection that was never established from a stream that
+// broke after the request went out. It makes that call and sends the answer;
+// this function just reads it. See classifyForwardError in internal/server.
+//
+// Three inputs, three answers, and the difference between the last two matters:
+//
+//   - field present and recognised → its verdict, trusted. The server made it
+//     with strictly more evidence than exists here.
+//   - field present but unrecognised → unknown, and the text is *not* consulted.
+//     A server that speaks this field is authoritative; falling back to a weaker
+//     signal that might contradict it would be worse than declining to answer.
+//   - field absent → the text scan, for a server predating the field. See
+//     neverSentText.
+//
+// Every path that is not a recognised never-sent ends in effectUnknown, so the
+// bounded-safe property holds: an unparseable, truncated, or unexpected body
+// leaves the operation pending rather than asserting a no-op.
+func classifyForwardOutcome(body string) writeEffect {
+	var parsed forwardErrorBody
+	if err := json.Unmarshal([]byte(body), &parsed); err == nil && parsed.ForwardOutcome != nil {
+		switch *parsed.ForwardOutcome {
+		case forwardOutcomeNeverSent:
+			return effectNotApplied
+		default:
+			// Includes forwardOutcomeUnknown and anything unrecognised.
+			return effectUnknown
+		}
+	}
+
+	if neverSentText(body) {
+		return effectNotApplied
+	}
 	return effectUnknown
 }
 
@@ -743,17 +800,20 @@ var neverSentMarkers = []string{
 // neverSentText reports whether an error message describes a transport failure
 // that delivered nothing.
 //
-// This is the text path, and it is load-bearing in exactly one place: the body
-// of a 502 from forwardRequest, where the failure of the *second* hop reached us
-// as a string. gRPC rendered its status into an error, the server formatted that
-// error into a JSON body, and the body crossed HTTP — there is no chain left to
-// inspect on this side of that boundary, and the alternative is not a typed
-// check, it is treating tens of thousands of never-sent forwards as unknown and
-// timing the checker out.
+// This is the text path. It is now a **compatibility fallback**, reached only for
+// a 502 body with no forward_outcome field — a server older than that field.
+// Against a current server the typed field always decides.
 //
-// It is bounded to be safe: an unrecognised body stays unknown, which is the
-// conservative direction, so the worst case of gRPC changing its wording is a
-// slower check rather than a wrong verdict.
+// It was load-bearing until the server learned to classify, and its limits are
+// worth recording, because they are what motivated moving the decision upstream.
+// Two of the four markers above could never fire on this path: gRPC reports an
+// unresolvable target as `name resolver error: produced zero addresses`, not "no
+// such host", and an unroutable address as a plain DeadlineExceeded rather than
+// anything naming a route. Reading a failure this far downstream means matching
+// wording chosen by a library two hops away for an audience of humans.
+//
+// It stays bounded in the safe direction either way: an unrecognised body is
+// unknown, so a rewording costs checker time, never a wrong verdict.
 func neverSentText(msg string) bool {
 	for _, s := range neverSentMarkers {
 		if strings.Contains(msg, s) {

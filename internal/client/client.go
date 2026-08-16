@@ -138,6 +138,18 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// drainAndClose consumes any unread response bytes before closing the body.
+// An HTTP/1.1 connection whose body is closed with bytes still unread is
+// discarded by Go's transport instead of returned to the idle pool, so every
+// call would otherwise pay a fresh TCP dial — under load this exhausts
+// ephemeral ports (the "cannot assign requested address" failure mode).
+// The limit bounds the drain so a pathologically large error body cannot
+// stall the caller; past it, dropping the connection is the right outcome.
+func drainAndClose(body io.ReadCloser) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 4<<10))
+	_ = body.Close()
+}
+
 func (c *Client) Get(ctx context.Context, key string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/keys/"+key), nil)
 	if err != nil {
@@ -147,7 +159,7 @@ func (c *Client) Get(ctx context.Context, key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode == http.StatusNotFound {
 		return "", ErrNotFound
@@ -178,7 +190,7 @@ func (c *Client) Put(ctx context.Context, key string, value string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode >= 500 {
 		b, _ := io.ReadAll(resp.Body)
@@ -196,7 +208,7 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode == http.StatusNotFound {
 		return ErrNotFound
@@ -217,7 +229,7 @@ func (c *Client) Status(ctx context.Context) (*StatusResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode >= 500 {
 		b, _ := io.ReadAll(resp.Body)
@@ -239,7 +251,7 @@ func (c *Client) Metrics(ctx context.Context) (MetricsResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode >= 500 {
 		b, _ := io.ReadAll(resp.Body)

@@ -3,10 +3,12 @@ package client_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -227,4 +229,51 @@ func TestMetrics_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint64(5), m["put_total"])
 	assert.Equal(t, uint64(10), m["get_total"])
+}
+
+// TestConnectionReuseAcrossCalls pins the drain-before-close contract: if any
+// verb leaves response bytes unread, Go's transport discards the connection
+// and the server sees a new one per request. One connection serving many
+// sequential calls is the observable proof the pool works — the regression
+// this guards caused ephemeral-port exhaustion at benchmark rates.
+func TestConnectionReuseAcrossCalls(t *testing.T) {
+	var mu sync.Mutex
+	remotes := make(map[string]struct{})
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		remotes[r.RemoteAddr] = struct{}{}
+		mu.Unlock()
+		switch r.Method {
+		case http.MethodGet:
+			fmt.Fprintln(w, `{"value":"v"}`)
+		default:
+			fmt.Fprintln(w, `{"status":"ok"}`)
+		}
+	}))
+	srv.Start()
+	defer srv.Close()
+
+	c := client.New(client.Config{
+		Host:    strings.TrimPrefix(srv.URL, "http://"),
+		Timeout: 5 * time.Second,
+	})
+	ctx := context.Background()
+	for i := 0; i < 20; i++ {
+		if err := c.Put(ctx, "k", "v"); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+		if _, err := c.Get(ctx, "k"); err != nil {
+			t.Fatalf("Get %d: %v", i, err)
+		}
+		if err := c.Delete(ctx, "k"); err != nil {
+			t.Fatalf("Delete %d: %v", i, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(remotes) != 1 {
+		t.Fatalf("60 sequential calls used %d connections, want 1 (bodies not drained → transport discards conns)", len(remotes))
+	}
 }

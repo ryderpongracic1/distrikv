@@ -3,6 +3,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
     environment:
       NODE_ID: node1
       HTTP_ADDR: ":8001"
@@ -23,6 +25,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
     environment:
       NODE_ID: node2
       HTTP_ADDR: ":8002"
@@ -43,6 +47,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
     environment:
       NODE_ID: node3
       HTTP_ADDR: ":8003"

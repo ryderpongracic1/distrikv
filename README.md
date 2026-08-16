@@ -52,6 +52,15 @@ optimisation, chaos testing, and operational hardening.
 | 6 | LSM-Tree storage engine + complete Raft (snapshots, pre-vote) | ✅ Done |
 | 7 | `distrikv-cli` — first-class CLI tool | ✅ Done |
 
+> **Phase 3 note — honest disclosure.** The replication fan-out
+> (`Node.ReplicateWrite`) was written during Phase 3, but nothing ever called
+> it: no caller existed in any commit from the initial one onward. Until it was
+> wired into the ring-primary's write path, every key lived on exactly one node
+> and the receive side (`Replicate` → `ApplyReplica`) was never exercised in
+> production. Any benchmark table or `replication_errors=0` reading produced
+> before that wiring therefore describes a single-copy sharded store; those are
+> labelled where they appear.
+
 ### Production-grade upgrade phases
 
 | Phase | Description | Status |
@@ -112,7 +121,43 @@ Full implementation covering:
 
 ### CAP Position
 
-With R=2 and both-replicas-must-ACK writes, the system is **CP**: it refuses writes when any replica is unreachable. Under network partition, nodes on the minority side will accept reads from their local store but reject writes. This is the correct trade-off for a store where stale reads are more tolerable than split-brain writes.
+With R=2 and both-replicas-must-ACK writes, distrikv is **CP**. The ring-primary
+applies a mutation to its own store and then synchronously replicates it over
+gRPC to the other R−1 replicas that `ring.GetN(key, R)` selects, and it returns
+success to the client only if **every** replica acknowledges. If any replica is
+unreachable or rejects the write, the client receives `503 Service Unavailable`
+and must treat the write as refused. Both client entry points behave identically
+— a request that lands on the ring-primary directly and one forwarded to it by a
+peer via gRPC `ForwardKey` share a single primary-write path, so they cannot
+drift apart on durability or on failure semantics.
+
+Reads are served from the ring-primary's local store and are never replicated,
+so a node on the minority side of a partition still answers reads while
+refusing writes. That is the right trade-off for a store where a stale read is
+more tolerable than a split-brain write.
+
+**A refused write is not an undone write.** There is no rollback. By the time
+replication is attempted the mutation is already durable on the primary
+(WAL-fsynced, then applied to the memtable), so a failed fan-out leaves the
+primary **ahead of** the replicas that did not ACK: the client sees a 5xx for a
+write that is in fact present on the primary and that subsequent reads will
+return. The divergence persists until the next successful write for that key
+converges the replica set — there is no anti-entropy, hinted handoff, or read
+repair. Closing that hole properly means either two-phase commit across the
+replica set or routing data writes through the Raft log; both are out of scope
+for the current design (see "Intentional deviations from the paper" above).
+
+Three smaller guarantees, stated because they are load-bearing:
+
+- **Replicas do not re-replicate.** A replicated mutation is applied straight to
+  the receiving node's local store and is never fanned out again. A second
+  fan-out from a replica would replicate forever.
+- **Replicated deletes are idempotent.** A `delete` for a key a replica never
+  received is treated as already applied, so a replica that missed an earlier
+  write cannot block the primary's deletes indefinitely.
+- **A single-node deployment still works.** With no other node in the replica
+  set (one node, or R=1) the fan-out has no targets and the write completes
+  local-only.
 
 ---
 
@@ -297,6 +342,7 @@ saturation:    false   max_queue_depth=30
 | `bloom_fp_rate` | `false_positives / bloom_hits`. A correctly sized Bloom filter stays well under 1%. |
 | `WAF` (Write Amplification Factor) | `(flush_bytes + compaction_bytes_written) / flush_bytes`. 1.0× means no compaction overhead; 2-3× is normal for size-tiered compaction; Phase 3 (leveled) will trade higher WAF for better read amp. |
 | `forwarded_requests` | Ring routed the key to a peer instead of handling it locally. |
+| `replication_errors` | Replica fan-out failures — a replica that did not ACK a primary's PUT/DELETE (unreachable, or an explicit rejection). Each one also fails the client's write with `503`, so a non-zero value means writes were **refused**, not merely under-replicated. Reports produced before replication was wired read `0` by construction; see the Phase 3 note under Status. |
 | `saturation` | `TRUE` if the arrival queue reached its cap → the cluster couldn't keep up; tail latencies include queue wait. |
 
 ### Phase 1 baseline (2026-05-21, 3-node docker-compose on M-series laptop)
@@ -321,10 +367,20 @@ cluster; Zipfian α=1.1, 100k-key space, 256 B values.  "Not saturated" means
 | 100% reads (GET) | 6,000 | **5,977 /s** | 0.5 ms | 11 ms | No |
 | 20% write / 80% read | 3,000 | **2,996 /s** | 1 ms | 70 ms | No |
 
-Write throughput is bounded by WAL fsync + gRPC replication to ring-replica
-nodes (each PUT incurs one fsync on the ring-primary and one gRPC round-trip to
-each replica before returning). Read throughput is limited only by ring lookup,
-LSM block reads, and HTTP round-trip overhead; no replication is required.
+Write throughput is bounded by WAL fsync plus gRPC replication to the
+ring-replica nodes: each PUT costs one fsync on the ring-primary and one gRPC
+round-trip to each of the R−1 replicas, all before the client gets a response.
+Read throughput is limited only by ring lookup, LSM block reads, and HTTP
+round-trip overhead; reads are never replicated.
+
+> ⚠️ **The write rows above predate replication wiring and need re-measurement.**
+> That cost model describes the write path as it behaves *now*. When this table
+> was measured the fan-out was never invoked (see the Phase 3 note under
+> Status), so each PUT cost one fsync on the ring-primary and no replica
+> round-trip at all. The measured write numbers are therefore an upper bound on
+> what a replicated write path can achieve, and can only get slower once each
+> PUT waits on R−1 gRPC ACKs. No re-measured figures are published here yet —
+> the table will be re-run rather than adjusted on paper.
 
 ### Phase 2 WAL allocation profile (2026-05-21, Apple M1 Max)
 

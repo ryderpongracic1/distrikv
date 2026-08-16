@@ -5,9 +5,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 
 	"time"
 
@@ -36,14 +38,23 @@ type RaftInterface interface {
 	ID() string
 }
 
-// ReplicationManager replicates a single mutation to the ring's replica nodes.
-// It is implemented by the Node struct and injected into GRPCServer so the
-// Replicate handler can write the incoming mutation to the local store AND
-// forward it onward if this node is the primary.
+// ReplicationManager owns both directions of replication for a single
+// mutation. It is implemented by the Node struct (which holds the ring, the
+// peer gRPC clients, and the replica count) and injected into both servers.
+//
+// The two methods are deliberately asymmetric, and that asymmetry is what
+// prevents an infinite replication loop: a primary fans out via
+// ReplicateWrite, while a replica applies via ApplyReplica and stops there.
 type ReplicationManager interface {
-	// ApplyReplica writes a replicated mutation directly to the local store
-	// (bypassing the replication fan-out — this IS the replica receiving the write).
+	// ApplyReplica writes a replicated mutation directly to the local store,
+	// bypassing the replication fan-out — this node IS the replica receiving
+	// the write, so re-fanning-out would replicate forever.
 	ApplyReplica(ctx context.Context, op, key string, value []byte) error
+
+	// ReplicateWrite fans a mutation this node has already applied locally out
+	// to the other replicas for the key, and reports an error unless every one
+	// of them acknowledges it. op is OpPut or OpDelete.
+	ReplicateWrite(ctx context.Context, op, key string, value []byte) error
 }
 
 // GRPCServer wraps a gRPC server and implements kvpb.KVServiceServer. It
@@ -51,13 +62,14 @@ type ReplicationManager interface {
 type GRPCServer struct {
 	kvpb.UnimplementedKVServiceServer
 
-	addr    string
-	srv     *grpc.Server
-	store   *store.Store
-	raft    RaftInterface
-	ring    *cluster.Ring
-	repMgr  ReplicationManager
-	logger  *slog.Logger
+	addr   string
+	srv    *grpc.Server
+	store  *store.Store
+	raft   RaftInterface
+	ring   *cluster.Ring
+	repMgr ReplicationManager
+	writer *primaryWriter
+	logger *slog.Logger
 }
 
 // NewGRPCServer constructs a GRPCServer. Call Start to begin listening.
@@ -70,6 +82,7 @@ func NewGRPCServer(
 	logger *slog.Logger,
 ) *GRPCServer {
 	srv := grpc.NewServer()
+	log := logger.With("component", "grpc")
 	g := &GRPCServer{
 		addr:   addr,
 		srv:    srv,
@@ -77,7 +90,8 @@ func NewGRPCServer(
 		raft:   r,
 		ring:   ring,
 		repMgr: repMgr,
-		logger: logger.With("component", "grpc"),
+		writer: newPrimaryWriter(s, repMgr, log),
+		logger: log,
 	}
 	kvpb.RegisterKVServiceServer(srv, g)
 	return g
@@ -112,49 +126,55 @@ func (g *GRPCServer) Start(ctx context.Context) error {
 // ---------------------------------------------------------------------------
 
 // ForwardKey handles a key-operation that was forwarded from another node
-// because that node is not the ring-primary for the key.
+// because that node is not the ring-primary for the key. This node IS the
+// primary, so mutations go through the shared primary-write path and are
+// replicated exactly as if the client had contacted this node directly.
 func (g *GRPCServer) ForwardKey(ctx context.Context, req *kvpb.ForwardKeyRequest) (*kvpb.ForwardKeyResponse, error) {
 	g.logger.Debug("ForwardKey RPC received", "method", req.Method, "key", req.Key)
 
 	switch req.Method {
 	case "PUT":
-		if err := g.store.Put(ctx, req.Key, req.Value); err != nil {
-			body, _ := json.Marshal(map[string]string{"error": err.Error()})
-			return &kvpb.ForwardKeyResponse{StatusCode: 500, Body: body}, nil
+		if err := g.writer.Put(ctx, req.Key, req.Value); err != nil {
+			return forwardError(statusForWriteError(err), err.Error()), nil
 		}
 		return &kvpb.ForwardKeyResponse{StatusCode: 200}, nil
 
 	case "GET":
 		val, err := g.store.Get(ctx, req.Key)
-		if err == store.ErrNotFound {
-			body, _ := json.Marshal(map[string]string{"error": "not found"})
-			return &kvpb.ForwardKeyResponse{StatusCode: 404, Body: body}, nil
+		if errors.Is(err, store.ErrNotFound) {
+			return forwardError(http.StatusNotFound, "not found"), nil
 		}
 		if err != nil {
-			body, _ := json.Marshal(map[string]string{"error": err.Error()})
-			return &kvpb.ForwardKeyResponse{StatusCode: 500, Body: body}, nil
+			return forwardError(http.StatusInternalServerError, err.Error()), nil
 		}
 		body, _ := json.Marshal(map[string]string{"value": string(val)})
 		return &kvpb.ForwardKeyResponse{StatusCode: 200, Body: body}, nil
 
 	case "DELETE":
-		if err := g.store.Delete(ctx, req.Key); err == store.ErrNotFound {
-			body, _ := json.Marshal(map[string]string{"error": "not found"})
-			return &kvpb.ForwardKeyResponse{StatusCode: 404, Body: body}, nil
-		} else if err != nil {
-			body, _ := json.Marshal(map[string]string{"error": err.Error()})
-			return &kvpb.ForwardKeyResponse{StatusCode: 500, Body: body}, nil
+		if err := g.writer.Delete(ctx, req.Key); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return forwardError(http.StatusNotFound, "not found"), nil
+			}
+			return forwardError(statusForWriteError(err), err.Error()), nil
 		}
 		return &kvpb.ForwardKeyResponse{StatusCode: 200}, nil
 
 	default:
-		body, _ := json.Marshal(map[string]string{"error": "unsupported method"})
-		return &kvpb.ForwardKeyResponse{StatusCode: 400, Body: body}, nil
+		return forwardError(http.StatusBadRequest, "unsupported method"), nil
 	}
 }
 
+// forwardError builds a ForwardKeyResponse carrying the same JSON error shape
+// the HTTP API uses, so the forwarding node can relay it verbatim.
+func forwardError(code int, msg string) *kvpb.ForwardKeyResponse {
+	body, _ := json.Marshal(map[string]string{"error": msg})
+	return &kvpb.ForwardKeyResponse{StatusCode: int32(code), Body: body}
+}
+
 // Replicate handles an incoming replication request from a ring-primary node.
-// It writes the mutation directly to the local store.
+// It writes the mutation directly to the local store via ApplyReplica and
+// deliberately does NOT fan out again — this node is the replica, and a
+// second fan-out from here would replicate in a loop forever.
 func (g *GRPCServer) Replicate(ctx context.Context, req *kvpb.ReplicateRequest) (*kvpb.ReplicateResponse, error) {
 	g.logger.Debug("Replicate RPC received", "op", req.Op, "key", req.Key)
 

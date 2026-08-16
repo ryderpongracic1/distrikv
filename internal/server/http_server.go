@@ -19,35 +19,42 @@ import (
 // It routes requests to the local store when this node owns the key, and
 // forwards them via gRPC when another node is the ring-primary.
 type HTTPServer struct {
-	addr        string
-	srv         *http.Server
-	store       *store.Store
-	raft        RaftInterface
-	ring        *cluster.Ring
-	peers       map[string]kvpb.KVServiceClient // nodeID → gRPC client
-	metrics     *metrics.Metrics
-	logger      *slog.Logger
+	addr    string
+	srv     *http.Server
+	store   *store.Store
+	raft    RaftInterface
+	ring    *cluster.Ring
+	peers   map[string]kvpb.KVServiceClient // nodeID → gRPC client
+	writer  *primaryWriter
+	metrics *metrics.Metrics
+	logger  *slog.Logger
 }
 
 // NewHTTPServer constructs an HTTPServer and registers all routes. Call Start
 // to begin listening.
+//
+// repMgr supplies the replication fan-out used when this node is the
+// ring-primary for a mutated key; it must be non-nil for writes to succeed.
 func NewHTTPServer(
 	addr string,
 	s *store.Store,
 	r RaftInterface,
 	ring *cluster.Ring,
 	peers map[string]kvpb.KVServiceClient,
+	repMgr ReplicationManager,
 	m *metrics.Metrics,
 	logger *slog.Logger,
 ) *HTTPServer {
+	log := logger.With("component", "http")
 	h := &HTTPServer{
 		addr:    addr,
 		store:   s,
 		raft:    r,
 		ring:    ring,
 		peers:   peers,
+		writer:  newPrimaryWriter(s, repMgr, log),
 		metrics: m,
-		logger:  logger.With("component", "http"),
+		logger:  log,
 	}
 
 	mux := http.NewServeMux()
@@ -120,9 +127,10 @@ func (h *HTTPServer) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.Put(r.Context(), key, []byte(body.Value)); err != nil {
-		h.logger.Error("Put failed", "key", key, "error", err)
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if err := h.writer.Put(r.Context(), key, []byte(body.Value)); err != nil {
+		code := statusForWriteError(err)
+		h.logger.Error("Put failed", "key", key, "status", code, "error", err)
+		writeError(w, code, err.Error())
 		return
 	}
 
@@ -176,11 +184,14 @@ func (h *HTTPServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.Delete(r.Context(), key); errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "not found")
-		return
-	} else if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if err := h.writer.Delete(r.Context(), key); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		code := statusForWriteError(err)
+		h.logger.Error("Delete failed", "key", key, "status", code, "error", err)
+		writeError(w, code, err.Error())
 		return
 	}
 
@@ -262,13 +273,6 @@ func (h *HTTPServer) forwardRequest(w http.ResponseWriter, r *http.Request, key,
 	if len(resp.Body) > 0 {
 		w.Write(resp.Body)
 	}
-}
-
-// PeerClient returns the gRPC client for the given peer node ID, plus a bool
-// indicating whether the peer is known.
-func (h *HTTPServer) PeerClient(nodeID string) (kvpb.KVServiceClient, bool) {
-	c, ok := h.peers[nodeID]
-	return c, ok
 }
 
 // ---------------------------------------------------------------------------

@@ -45,6 +45,18 @@
 // checks each key's sub-history independently.  For a 20-key, 30s,
 // 8-worker run this typically completes in under 5 seconds.
 //
+// # How a failed write enters the history
+//
+// A write that returns an error is classified, not assumed — see
+// classifyWriteEffect. distrikv answers 503 for a mutation the ring-primary
+// applied to its own store and then failed to replicate, and it does not roll
+// that back, so such a write is recorded as *applied*; a write the transport
+// provably never delivered is recorded as a no-op; anything ambiguous is
+// recorded as a pending operation the checker may place anywhere or nowhere.
+// Recording every failure as a no-op — the runner's original behaviour — made
+// every correct read of a refused value look like an anomaly, which is what the
+// first real fault-injection runs reported.
+//
 // # Exit codes
 //
 //	0  linearizable (PASS)
@@ -225,6 +237,7 @@ func main() {
 	ops := measured.ops.Load()
 	errs := measured.errors.Load()
 	indeterminate := measured.indeterminateWrites.Load()
+	refused := measured.refusedWrites.Load()
 	injected := countInjected(windows)
 	log.Printf("ops=%d errors=%d events=%d faults=%d/%d; running linearizability check …",
 		ops, errs, rec.Len(), injected, len(windows))
@@ -254,6 +267,7 @@ func main() {
 			TotalOps            int64               `json:"total_ops"`
 			Errors              int64               `json:"errors"`
 			IndeterminateWrites int64               `json:"indeterminate_writes"`
+			RefusedWrites       int64               `json:"refused_writes"`
 			Events              int                 `json:"events"`
 			Linearizable        bool                `json:"linearizable"`
 			CheckTimedOut       bool                `json:"check_timed_out"`
@@ -276,6 +290,7 @@ func main() {
 			TotalOps:            ops,
 			Errors:              errs,
 			IndeterminateWrites: indeterminate,
+			RefusedWrites:       refused,
 			Events:              rec.Len(),
 			Linearizable:        ok && !timedOut,
 			CheckTimedOut:       timedOut,
@@ -298,6 +313,7 @@ func main() {
 		}
 		fmt.Printf("  %-24s %d\n", "ops:", ops)
 		fmt.Printf("  %-24s %d\n", "errors:", errs)
+		fmt.Printf("  %-24s %d\n", "refused-but-applied:", refused)
 		fmt.Printf("  %-24s %d\n", "indeterminate writes:", indeterminate)
 		fmt.Printf("  %-24s %d\n", "events:", rec.Len())
 		fmt.Printf("  %-24s %s\n", "nemesis:", ncfg.Describe())
@@ -311,18 +327,63 @@ func main() {
 				fmt.Printf("    %s\n", line)
 			}
 		}
-		if exitCode == 1 && indeterminate > 0 {
-			fmt.Printf("%s\n", sep)
-			fmt.Printf("  NOTE: %d write(s) failed with an unknown outcome. The KV model records a\n", indeterminate)
-			fmt.Printf("        failed write as a no-op, so a write that reached disk before its\n")
-			fmt.Printf("        connection died can make a later correct read look non-linearizable.\n")
-			fmt.Printf("        Check whether the reported anomaly falls inside a fault window above\n")
-			fmt.Printf("        before treating it as a real consistency bug.\n")
+		for _, line := range verdictNotes(exitCode, refused, indeterminate) {
+			if line == "" {
+				fmt.Printf("%s\n", sep)
+				continue
+			}
+			fmt.Printf("  %s\n", line)
 		}
 		fmt.Printf("%s\n\n", sep)
 	}
 
 	os.Exit(exitCode)
+}
+
+// verdictNotes returns the operator guidance printed under a non-PASS verdict.
+// An empty string is a separator line.
+//
+// The old note told the reader to distrust a FAIL that coincided with a fault
+// window, because every failed write was modelled as a no-op and a
+// durable-but-unacknowledged one could therefore invent an anomaly. Failed
+// writes are now classified instead of assumed — a refused write is modelled as
+// applied, an unknown one as a pending operation the checker may place anywhere
+// — so a FAIL no longer has that escape hatch, and the note says so.
+func verdictNotes(exitCode int, refused, indeterminate int64) []string {
+	switch exitCode {
+	case 1:
+		notes := []string{
+			"",
+			"NOTE: this FAIL is not explained by failed operations. Writes refused with",
+			"      503 are modelled as applied (the primary keeps them; see \"CAP Position\"),",
+			"      and writes with an unknown outcome are modelled as pending operations the",
+			"      checker may linearize anywhere or not at all. Neither can invent an",
+			"      anomaly, so treat this as a real consistency anomaly and correlate it",
+			"      with the fault windows above to see which fault exposed it.",
+		}
+		if refused > 0 {
+			notes = append(notes,
+				fmt.Sprintf("      %d refused write(s) were modelled as applied: that encoding is exact only", refused),
+				"      while reads are served by the ring-primary that kept them.")
+		}
+		return notes
+	case 2:
+		notes := []string{
+			"",
+			"NOTE: the check timed out, which is neither a PASS nor a FAIL. Raise",
+			"      --check-timeout, or shorten the run.",
+		}
+		if indeterminate > 0 {
+			notes = append(notes,
+				fmt.Sprintf("      %d write(s) had an unknown outcome and are pending operations, each of", indeterminate),
+				"      which overlaps every later operation on its key — the most likely reason",
+				"      the search did not finish. A shorter run, or fewer ambiguous failures,",
+				"      brings it back inside the budget.")
+		}
+		return notes
+	default:
+		return nil
+	}
 }
 
 // countInjected returns the number of windows whose Disrupt actually landed.
@@ -424,10 +485,15 @@ func makeKeys(prefix string, n int) []string {
 type counters struct {
 	ops    atomic.Int64
 	errors atomic.Int64
-	// indeterminateWrites counts failed writes whose outcome is unknown — the
-	// request may have been applied before the connection died. See
-	// writeIsIndeterminate.
+	// indeterminateWrites counts failed writes whose effect on the store is
+	// unknown. They are recorded as pending operations, which the checker may
+	// place anywhere, so they cannot cause a false anomaly — but they widen the
+	// search space, so the count is worth reporting.
 	indeterminateWrites atomic.Int64
+	// refusedWrites counts failed writes that are known to have taken effect
+	// anyway: distrikv answers 503 for a mutation the ring-primary applied and
+	// could not replicate, and does not roll it back. See classifyWriteEffect.
+	refusedWrites atomic.Int64
 }
 
 // runWorkers starts `n` goroutines that each issue operations until ctx is
@@ -512,10 +578,13 @@ func runWorkers(
 
 // finishWrite records the outcome of a put or delete.
 //
-// Any error is recorded as Output.Err, which the KV model treats as a no-op —
-// including an error caused by the run's own shutdown, because recording a
-// failed write as a success would assert it was applied. Only failures that are
-// not shutdown artefacts are counted in the reported statistics.
+// How the operation enters the history is decided by classifyWriteEffect: a
+// write known to have landed is recorded as applied, one that provably never
+// left as a no-op, and one whose effect is unknown as a pending operation. Only
+// failures that are not shutdown artefacts are counted in the reported
+// statistics — but a shutdown-cancelled write is still an unknown outcome and is
+// recorded as one, because the runner cancelling its own context says nothing
+// about what the server did with the request.
 func finishWrite(
 	ctx context.Context,
 	rec *linearizability.Recorder,
@@ -523,14 +592,32 @@ func finishWrite(
 	err error,
 	c *counters,
 ) {
+	effect := classifyWriteEffect(err)
+
 	if err != nil && ctx.Err() == nil {
 		c.errors.Add(1)
-		if writeIsIndeterminate(err) {
+		switch effect {
+		case effectApplied:
+			c.refusedWrites.Add(1)
+		case effectUnknown:
 			c.indeterminateWrites.Add(1)
 		}
 	}
-	if rec != nil {
-		rec.End(cid, linearizability.Output{Err: err != nil})
+
+	if rec == nil {
+		return
+	}
+	switch {
+	case err == nil:
+		rec.End(cid, linearizability.Output{})
+	case effect == effectApplied:
+		// The error is positive evidence the mutation landed; recording it as a
+		// no-op would make a later correct read of it an anomaly.
+		rec.End(cid, linearizability.Output{Err: true, Applied: true})
+	case effect == effectNotApplied:
+		rec.End(cid, linearizability.Output{Err: true})
+	default:
+		rec.EndUnknown(cid)
 	}
 }
 
@@ -553,28 +640,136 @@ func classifyDeleteErr(err error) error {
 	return err
 }
 
-// writeIsIndeterminate reports whether a failed write may still have taken
-// effect on the server.
-//
-// The KV model records a failed operation as a no-op (state unchanged). That is
-// sound when the request provably never reached a server — a refused
-// connection, an unresolvable host — which is what a client sees while a node
-// is down. It is *not* sound when the outcome is unknown: a write that was
-// appended and fsynced just before its node was SIGKILLed really did take
-// effect, and after WAL recovery a later read will see it. Modelling that write
-// as a no-op can make a correct read look like a linearizability violation.
-//
-// These writes are therefore counted separately, so a FAIL that coincides with
-// a fault window can be judged rather than trusted blindly.
-func writeIsIndeterminate(err error) bool {
-	if err == nil || isNotFound(err) {
-		return false
+// writeEffect is what the runner concluded a failed write did to the store. It
+// decides how the operation enters the recorded history — see finishWrite.
+type writeEffect int
+
+const (
+	// effectApplied: the mutation took effect. Either the call succeeded, or it
+	// failed with positive evidence that the write landed anyway.
+	effectApplied writeEffect = iota
+	// effectNotApplied: the mutation provably did not take effect, so modelling
+	// it as a no-op is exact rather than merely convenient.
+	effectNotApplied
+	// effectUnknown: the mutation may or may not have taken effect. Neither
+	// no-op nor applied can be asserted; the operation is left pending.
+	effectUnknown
+)
+
+func (e writeEffect) String() string {
+	switch e {
+	case effectApplied:
+		return "applied"
+	case effectNotApplied:
+		return "not applied"
+	case effectUnknown:
+		return "unknown"
 	}
-	return !provablyNeverSent(err)
+	return fmt.Sprintf("writeEffect(%d)", int(e))
+}
+
+// classifyWriteEffect decides which of the three outcomes a write error carries.
+//
+// The status code decides first, and it decides from the chain: internal/client
+// returns *StatusError for a 5xx, so the code is matched with errors.As rather
+// than read out of the message.
+//
+//	503  the ring-primary applied the mutation to its own store and then failed
+//	     to replicate it. distrikv does not roll that back (see ErrReplication
+//	     in internal/server and the README's "CAP Position"), and reads are
+//	     served by the primary, so the write is present and readable. Applied.
+//	     Both client entry points report this identically: a forwarded write
+//	     returns the primary's status verbatim through ForwardKey.
+//	502  the write failed on its way to the primary, in forwardRequest. Two
+//	     causes hide behind one code: a peer with no gRPC client (never sent),
+//	     and a ForwardKey RPC that failed (which may have been applied before
+//	     the response was lost, or before a deadline expired). The code alone
+//	     cannot separate them, so this is unknown unless the body names a
+//	     transport failure that delivers nothing — see neverSentText.
+//	5xx  anything else: 500 covers both a ring-lookup failure (never applied)
+//	     and a local store error (possibly durable already). Unknown.
+//
+// Only when there is no status code at all — the request never got a response —
+// does the transport classification run.
+//
+// Ordering matters, and not only for tidiness. A 503's body carries the
+// replication error underneath it, which during an outage reads "…connect:
+// connection refused" from the fan-out to the dead replica. Classifying on the
+// message text first therefore declared refused-but-applied writes "provably
+// never sent" — the reason a stop-restart run reported 0 indeterminate writes
+// while failing.
+func classifyWriteEffect(err error) writeEffect {
+	if err == nil || isNotFound(err) {
+		return effectApplied
+	}
+
+	var se *clientpkg.StatusError
+	if errors.As(err, &se) {
+		switch se.StatusCode {
+		case http.StatusServiceUnavailable:
+			return effectApplied
+		case http.StatusBadGateway:
+			if neverSentText(se.Body) {
+				return effectNotApplied
+			}
+			return effectUnknown
+		default:
+			return effectUnknown
+		}
+	}
+
+	if provablyNeverSent(err) {
+		return effectNotApplied
+	}
+	// Everything left is unknown, deliberately: a timeout, a reset mid-request,
+	// a cancelled context, an error shape this runner has never seen. Guessing
+	// "no-op" here is what produced false anomalies; leaving the operation
+	// pending asserts nothing.
+	return effectUnknown
+}
+
+// neverSentMarkers are transport failures that mean nothing was delivered: a
+// refused connection got no SYN-ACK, an unresolvable or unroutable host got no
+// packets at all. A connection that died *after* the request went out reads
+// differently ("EOF", "connection reset by peer", "transport is closing") and is
+// deliberately absent from this list.
+var neverSentMarkers = []string{
+	"connection refused",
+	"no such host",
+	"no route to host",
+	"network is unreachable",
+}
+
+// neverSentText reports whether an error message describes a transport failure
+// that delivered nothing.
+//
+// This is the text path, and it is load-bearing in exactly one place: the body
+// of a 502 from forwardRequest, where the failure of the *second* hop reached us
+// as a string. gRPC rendered its status into an error, the server formatted that
+// error into a JSON body, and the body crossed HTTP — there is no chain left to
+// inspect on this side of that boundary, and the alternative is not a typed
+// check, it is treating tens of thousands of never-sent forwards as unknown and
+// timing the checker out.
+//
+// It is bounded to be safe: an unrecognised body stays unknown, which is the
+// conservative direction, so the worst case of gRPC changing its wording is a
+// slower check rather than a wrong verdict.
+func neverSentText(msg string) bool {
+	for _, s := range neverSentMarkers {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // provablyNeverSent reports whether err means the request never reached a
 // server, so treating it as a no-op is exact rather than merely conservative.
+//
+// It is only consulted for an error with no HTTP status in it — a request that
+// never got a response at all. classifyWriteEffect handles status-carrying
+// errors before this runs, which is what keeps a 503 (applied) from being read
+// as "never sent" because its body quotes a refused replica connection.
 //
 // The typed checks are the contract, and they cover the errors this runner
 // actually produces: internal/client wraps a dial failure as
@@ -586,9 +781,9 @@ func writeIsIndeterminate(err error) bool {
 // The substring checks behind them are a last resort for an error that arrives
 // as text with no identity left to match — one that crossed a process boundary,
 // or came from a source outside this repo. They are deliberately kept because
-// misclassifying a never-sent write as indeterminate only inflates a diagnostic
-// counter, whereas the reverse would let a genuinely unknown outcome be
-// modelled as a no-op. They are no longer load-bearing for client errors.
+// misclassifying a never-sent write as unknown only costs checker time, whereas
+// the reverse would model a genuinely unknown outcome as a no-op. They are no
+// longer load-bearing for client errors.
 func provablyNeverSent(err error) bool {
 	// Typed: exact, and works for any error that preserves its chain.
 	for _, errno := range []syscall.Errno{
@@ -606,18 +801,7 @@ func provablyNeverSent(err error) bool {
 	}
 
 	// Fallback: the message text, for errors that reach us with no chain.
-	msg := err.Error()
-	for _, s := range []string{
-		"connection refused",
-		"no such host",
-		"no route to host",
-		"network is unreachable",
-	} {
-		if strings.Contains(msg, s) {
-			return true
-		}
-	}
-	return false
+	return neverSentText(err.Error())
 }
 
 // isNotFound reports whether err represents a 404 / key-not-found response.

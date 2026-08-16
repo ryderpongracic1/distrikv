@@ -778,8 +778,9 @@ func TestProvablyNeverSentUsesTypedErrors(t *testing.T) {
 		if !provablyNeverSent(refused) {
 			t.Error("a real ECONNREFUSED OpError must classify as never sent")
 		}
-		if writeIsIndeterminate(refused) {
-			t.Error("a refused write is provably a no-op, not indeterminate")
+		if got := classifyWriteEffect(refused); got != effectNotApplied {
+			t.Errorf("classifyWriteEffect(refused) = %v, want effectNotApplied — "+
+				"a refused write provably did not happen", got)
 		}
 
 		dnsMiss := &net.DNSError{Err: "server misbehaving", Name: "nodeX", IsNotFound: true}
@@ -878,8 +879,8 @@ func TestProvablyNeverSentClassifiesRealClientErrors(t *testing.T) {
 			if !provablyNeverSent(err) {
 				t.Errorf("a refused client write must classify as never sent, got indeterminate for %v", err)
 			}
-			if writeIsIndeterminate(err) {
-				t.Errorf("a refused client write is provably a no-op, not indeterminate: %v", err)
+			if got := classifyWriteEffect(err); got != effectNotApplied {
+				t.Errorf("classifyWriteEffect = %v, want effectNotApplied for %v", got, err)
 			}
 
 			// The classification must come from the chain, not the message: hide
@@ -895,99 +896,318 @@ func TestProvablyNeverSentClassifiesRealClientErrors(t *testing.T) {
 	}
 }
 
-func TestWriteIsIndeterminate(t *testing.T) {
-	// Message-only errors, so these rows exercise the substring fallback and the
-	// 404/nil short-circuits. The typed path against a real client error is
-	// covered by TestProvablyNeverSentClassifiesRealClientErrors.
+// TestClassifyWriteEffect covers one error class per case. The three effects are
+// not interchangeable: getting one wrong either invents an anomaly (a correct
+// read of a refused value reported as a violation) or hides one (a lost write
+// modelled as never issued).
+func TestClassifyWriteEffect(t *testing.T) {
+	statusErr := func(code int, body string) error {
+		return &clientpkg.StatusError{StatusCode: code, Body: body}
+	}
+	// The bodies below are the shapes the server actually produces: writeError
+	// wraps the message in JSON, and the 503's message carries the replication
+	// failure — including, during an outage, the refused connection to the dead
+	// replica.
+	const (
+		replicationRefused = `{"error":"replication to replicas failed: rpc error: code = Unavailable ` +
+			`desc = connection error: desc = \"transport: Error while dialing dial tcp 172.18.0.3:9002: ` +
+			`connect: connection refused\""}`
+		forwardRefused  = `{"error":"forward RPC: rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing dial tcp 172.18.0.3:9002: connect: connection refused\""}`
+		forwardDeadline = `{"error":"forward RPC: rpc error: code = DeadlineExceeded desc = context deadline exceeded"}`
+		forwardClosing  = `{"error":"forward RPC: rpc error: code = Unavailable desc = transport is closing"}`
+		noPeerClient    = `{"error":"no gRPC client for node node2"}`
+		storeFailure    = `{"error":"primary put \"k\": wal: write: no space left on device"}`
+	)
+
 	tests := []struct {
+		name string
 		err  error
-		want bool
+		want writeEffect
 		why  string
 	}{
-		{nil, false, "no error"},
-		{clientpkg.ErrNotFound, false, "404 on delete: the key was already absent, which is an outcome, not an unknown"},
-		{fmt.Errorf("delete: %w", clientpkg.ErrNotFound), false, "wrapped 404 must classify the same"},
-		{fmt.Errorf("node unreachable: dial tcp 127.0.0.1:8002: connect: connection refused"), false, "refused → never reached a server"},
-		{fmt.Errorf("node unreachable: dial tcp: lookup nodeX: no such host"), false, "unresolvable → never sent"},
-		{fmt.Errorf("node unreachable: dial tcp 10.0.0.1:8002: connect: no route to host"), false, "unroutable → never sent"},
-		{fmt.Errorf("node unreachable: EOF"), true, "connection died after the request was sent"},
-		{fmt.Errorf("context deadline exceeded (Client.Timeout exceeded while awaiting headers)"), true, "timeout → outcome unknown"},
-		{fmt.Errorf("node unreachable: read tcp 127.0.0.1:8002: connection reset by peer"), true, "reset mid-request → outcome unknown"},
-		{fmt.Errorf("server error: 500"), true, "5xx → the server may have applied the write"},
-	}
-	for _, tc := range tests {
-		if got := writeIsIndeterminate(tc.err); got != tc.want {
-			t.Errorf("writeIsIndeterminate(%v) = %v, want %v (%s)", tc.err, got, tc.want, tc.why)
-		}
-	}
-}
-
-func TestFinishWriteRecordsFailuresAsErrEvenWhenCancelled(t *testing.T) {
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	tests := []struct {
-		name              string
-		ctx               context.Context
-		err               error
-		wantErrOut        bool
-		wantErrors        int64
-		wantIndeterminate int64
-	}{
-		{"success", context.Background(), nil, false, 0, 0},
 		{
-			name: "refused write", ctx: context.Background(),
-			err:        fmt.Errorf("node unreachable: connect: connection refused"),
-			wantErrOut: true, wantErrors: 1, wantIndeterminate: 0,
+			name: "success", err: nil, want: effectApplied,
+			why: "no error at all",
 		},
 		{
-			name: "indeterminate write", ctx: context.Background(),
-			err:        fmt.Errorf("node unreachable: EOF"),
-			wantErrOut: true, wantErrors: 1, wantIndeterminate: 1,
+			name: "404 on delete", err: clientpkg.ErrNotFound, want: effectApplied,
+			why: "the key was already absent, which is the state a delete produces",
 		},
 		{
-			// A write cut short by the run's own shutdown must still be recorded
-			// as Err — recording it as a success would assert it was applied —
-			// but it is a shutdown artefact, not a cluster failure, so it is not
-			// counted in the reported statistics.
-			name: "cancelled write", ctx: cancelled,
-			err:        context.Canceled,
-			wantErrOut: true, wantErrors: 0, wantIndeterminate: 0,
+			name: "wrapped 404", err: fmt.Errorf("delete: %w", clientpkg.ErrNotFound), want: effectApplied,
+			why: "a wrapped 404 must classify the same",
+		},
+		{
+			name: "503 replication refused", err: statusErr(503, replicationRefused), want: effectApplied,
+			why: "the primary wrote locally before replicating and does not roll back",
+		},
+		{
+			name: "502 forward to a dead node", err: statusErr(502, forwardRefused), want: effectNotApplied,
+			why: "the forward hop was refused, so the primary never saw the request",
+		},
+		{
+			name: "502 forward deadline", err: statusErr(502, forwardDeadline), want: effectUnknown,
+			why: "the RPC may have been applied before the deadline expired",
+		},
+		{
+			name: "502 transport closing mid-call", err: statusErr(502, forwardClosing), want: effectUnknown,
+			why: "the connection died after the request went out",
+		},
+		{
+			name: "502 with no peer client", err: statusErr(502, noPeerClient), want: effectUnknown,
+			why: "nothing was sent, but the body names no transport failure — unknown is the safe read",
+		},
+		{
+			name: "500 local store failure", err: statusErr(500, storeFailure), want: effectUnknown,
+			why: "a failed local write may already be durable in the WAL",
+		},
+		{
+			name: "dial refused", err: fmt.Errorf("%w: %w", clientpkg.ErrUnreachable, &net.OpError{
+				Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED},
+			}), want: effectNotApplied,
+			why: "nothing was delivered",
+		},
+		{
+			name: "unresolvable host", err: fmt.Errorf("%w: %w", clientpkg.ErrUnreachable,
+				&net.DNSError{Err: "no such host", Name: "nodeX", IsNotFound: true}), want: effectNotApplied,
+			why: "no packets were ever sent",
+		},
+		{
+			name: "reset mid-request", err: fmt.Errorf("%w: %w", clientpkg.ErrUnreachable,
+				&net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}), want: effectUnknown,
+			why: "the request was already out when the connection died",
+		},
+		{
+			name: "client timeout", err: fmt.Errorf("%w: %w", clientpkg.ErrUnreachable,
+				context.DeadlineExceeded), want: effectUnknown,
+			why: "a timeout says nothing about what the server did",
+		},
+		{
+			name: "run shutdown", err: context.Canceled, want: effectUnknown,
+			why: "the runner cancelling its own context says nothing about the server",
+		},
+		{
+			name: "unrecognised error shape", err: errors.New("something new"), want: effectUnknown,
+			why: "the default must assert nothing",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := &linearizability.Recorder{}
-			c := &counters{}
-			cid := rec.Begin(linearizability.Input{Op: "put", Key: "k", Value: "v"})
-			finishWrite(tc.ctx, rec, cid, tc.err, c)
+			if got := classifyWriteEffect(tc.err); got != tc.want {
+				t.Errorf("classifyWriteEffect() = %v, want %v (%s)", got, tc.want, tc.why)
+			}
+		})
+	}
+}
 
-			if rec.Len() != 2 {
-				t.Fatalf("expected a call and a return event, got %d", rec.Len())
+// TestClassifyWriteEffectDecidesFromTheChain proves the classifier reads the
+// status code out of the error chain rather than out of the message. Each error
+// is wrapped in a shell whose text names nothing, so a correct answer can only
+// come from errors.As.
+//
+// The 503 row is the one that matters most, and it is also the bug that hid the
+// whole problem: a 503's body quotes the refused connection to the dead replica,
+// so a classifier that reads the message first sees "connection refused" and
+// declares a refused-but-applied write "provably never sent". That is why a
+// stop-restart run reported 0 indeterminate writes while failing.
+func TestClassifyWriteEffectDecidesFromTheChain(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want writeEffect
+	}{
+		{
+			name: "503 whose body quotes a refused replica",
+			err: &clientpkg.StatusError{StatusCode: 503, Body: `{"error":"replication to replicas failed: ` +
+				`connect: connection refused"}`},
+			want: effectApplied,
+		},
+		{
+			name: "500",
+			err:  &clientpkg.StatusError{StatusCode: 500, Body: `{"error":"ring lookup: empty ring"}`},
+			want: effectUnknown,
+		},
+		{
+			name: "refused dial",
+			err: &net.OpError{Op: "dial", Net: "tcp",
+				Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}},
+			want: effectNotApplied,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			hidden := opaqueError{err: tc.err}
+			if strings.Contains(hidden.Error(), "refused") || strings.Contains(hidden.Error(), "replication") {
+				t.Fatal("test setup error: the opaque message still names the cause")
 			}
-			// A write recorded without Err asserts it was applied; the model
-			// only tolerates an unknown write when Err is set.
-			ok, timedOut := rec.CheckTimeout(5 * time.Second)
-			if !ok || timedOut {
-				t.Fatalf("recorded history should be checkable: ok=%v timedOut=%v", ok, timedOut)
+			if got := classifyWriteEffect(hidden); got != tc.want {
+				t.Errorf("classifyWriteEffect(opaque) = %v, want %v — the typed path is not doing the work",
+					got, tc.want)
 			}
+		})
+	}
+}
+
+// TestNeverSentTextIsBoundedToDeliveryFailures pins the one place a message is
+// still load-bearing: the body of a 502, where the second hop's failure crossed
+// a process boundary as text. It must recognise failures that delivered nothing
+// and refuse everything else, because an unrecognised body falls through to
+// unknown — the conservative direction.
+func TestNeverSentTextIsBoundedToDeliveryFailures(t *testing.T) {
+	neverSent := []string{
+		"connect: connection refused",
+		"lookup nodeX: no such host",
+		"connect: no route to host",
+		"connect: network is unreachable",
+	}
+	for _, msg := range neverSent {
+		if !neverSentText(msg) {
+			t.Errorf("neverSentText(%q) = false, want true", msg)
+		}
+	}
+
+	ambiguous := []string{
+		"transport is closing",
+		"EOF",
+		"connection reset by peer",
+		"context deadline exceeded",
+		"rpc error: code = DeadlineExceeded",
+		"no gRPC client for node node2",
+		"",
+	}
+	for _, msg := range ambiguous {
+		if neverSentText(msg) {
+			t.Errorf("neverSentText(%q) = true, want false — this failure may have been delivered", msg)
+		}
+	}
+}
+
+// TestFinishWriteEncodesEachOutcome checks the runner-to-model wiring end to end:
+// for each class of write failure, is a later read that sees the value legal, and
+// is a later read that does not see it legal? Those two answers are the whole
+// point of the encoding, and they are asserted through the checker rather than by
+// inspecting which flags were set.
+func TestFinishWriteEncodesEachOutcome(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	refusedDial := fmt.Errorf("%w: %w", clientpkg.ErrUnreachable, &net.OpError{
+		Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED},
+	})
+	replicationRefused := &clientpkg.StatusError{
+		StatusCode: 503,
+		Body:       `{"error":"replication to replicas failed: connect: connection refused"}`,
+	}
+	tornConnection := fmt.Errorf("%w: %w", clientpkg.ErrUnreachable,
+		&net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET})
+
+	tests := []struct {
+		name              string
+		ctx               context.Context
+		err               error
+		wantErrors        int64
+		wantIndeterminate int64
+		wantRefused       int64
+		wantPending       int
+		readBackLegal     bool // may a later read return the written value?
+		absentReadLegal   bool // may a later read find the key absent?
+	}{
+		{
+			name: "acknowledged write", ctx: context.Background(), err: nil,
+			readBackLegal: true, absentReadLegal: false,
+		},
+		{
+			// Nothing was delivered, so a value appearing out of nowhere is a
+			// genuine anomaly and must stay detectable.
+			name: "refused write", ctx: context.Background(), err: refusedDial,
+			wantErrors: 1,
+			// no counter: a never-sent write is neither refused-but-applied nor unknown
+			readBackLegal: false, absentReadLegal: true,
+		},
+		{
+			// The primary kept it. Reads go to the primary, so seeing it is
+			// correct and not seeing it is a lost write.
+			name: "replication refused (503)", ctx: context.Background(), err: replicationRefused,
+			wantErrors: 1, wantRefused: 1,
+			readBackLegal: true, absentReadLegal: false,
+		},
+		{
+			name: "unknown outcome", ctx: context.Background(), err: tornConnection,
+			wantErrors: 1, wantIndeterminate: 1, wantPending: 1,
+			readBackLegal: true, absentReadLegal: true,
+		},
+		{
+			// A write cut short by the run's own shutdown is a shutdown artefact,
+			// so it stays out of the reported statistics — but the runner
+			// cancelling its own context is no evidence about what the server
+			// did, so the history must leave it unknown.
+			name: "shutdown-cancelled write", ctx: cancelled, err: context.Canceled,
+			wantPending: 1,
+			// no counters: not a cluster failure
+			readBackLegal: true, absentReadLegal: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &counters{}
+			rec := &linearizability.Recorder{}
+			finishWrite(tc.ctx, rec, rec.Begin(linearizability.Input{Op: "put", Key: "k", Value: "v"}), tc.err, c)
+
 			if got := c.errors.Load(); got != tc.wantErrors {
 				t.Errorf("errors = %d, want %d", got, tc.wantErrors)
 			}
 			if got := c.indeterminateWrites.Load(); got != tc.wantIndeterminate {
 				t.Errorf("indeterminateWrites = %d, want %d", got, tc.wantIndeterminate)
 			}
+			if got := c.refusedWrites.Load(); got != tc.wantRefused {
+				t.Errorf("refusedWrites = %d, want %d", got, tc.wantRefused)
+			}
+			if got := rec.Pending(); got != tc.wantPending {
+				t.Errorf("pending operations = %d, want %d", got, tc.wantPending)
+			}
+			if got := rec.Len(); got != 2 {
+				t.Fatalf("history has %d events, want a call and a return", got)
+			}
+
+			// The history so far, plus one read, must agree with the encoding.
+			readBack := legalWithRead(t, tc.ctx, tc.err, "v")
+			if readBack != tc.readBackLegal {
+				t.Errorf("a later read returning the written value: legal=%v, want %v", readBack, tc.readBackLegal)
+			}
+			absentRead := legalWithRead(t, tc.ctx, tc.err, "")
+			if absentRead != tc.absentReadLegal {
+				t.Errorf("a later read finding the key absent: legal=%v, want %v", absentRead, tc.absentReadLegal)
+			}
 		})
 	}
+}
+
+// legalWithRead records one write with the given error followed by one read that
+// returns value, and reports whether the resulting history is linearizable.
+func legalWithRead(t *testing.T, ctx context.Context, writeErr error, value string) bool {
+	t.Helper()
+	rec := &linearizability.Recorder{}
+	finishWrite(ctx, rec, rec.Begin(linearizability.Input{Op: "put", Key: "k", Value: "v"}), writeErr, &counters{})
+	rid := rec.Begin(linearizability.Input{Op: "get", Key: "k"})
+	rec.End(rid, linearizability.Output{Value: value})
+
+	ok, timedOut := rec.CheckTimeout(5 * time.Second)
+	if timedOut {
+		t.Fatal("linearizability check timed out on a two-operation history")
+	}
+	return ok
 }
 
 func TestFinishWriteToleratesANilRecorder(t *testing.T) {
 	c := &counters{}
 	finishWrite(context.Background(), nil, 0, fmt.Errorf("node unreachable: EOF"), c)
-	if c.errors.Load() != 1 || c.indeterminateWrites.Load() != 1 {
-		t.Errorf("warmup-mode counters not updated: errors=%d indeterminate=%d",
-			c.errors.Load(), c.indeterminateWrites.Load())
+	finishWrite(context.Background(), nil, 0, &clientpkg.StatusError{StatusCode: 503, Body: "refused"}, c)
+	if c.errors.Load() != 2 || c.indeterminateWrites.Load() != 1 || c.refusedWrites.Load() != 1 {
+		t.Errorf("warmup-mode counters not updated: errors=%d indeterminate=%d refused=%d",
+			c.errors.Load(), c.indeterminateWrites.Load(), c.refusedWrites.Load())
 	}
 }
 
@@ -1059,6 +1279,22 @@ func TestKVModelTreatsFailedOpsAsNoOps(t *testing.T) {
 		}
 	})
 
+	t.Run("a write known applied does change state", func(t *testing.T) {
+		// The counterpart the runner relies on for a 503: see classifyWriteEffect.
+		// The full set of model behaviours is covered in
+		// internal/linearizability; this pins the transition the runner's own
+		// encoding depends on.
+		ok, next := step(initial,
+			linearizability.Input{Op: "put", Key: "k", Value: "v1"},
+			linearizability.Output{Err: true, Applied: true})
+		if !ok {
+			t.Fatal("a refused-but-applied put must be a legal transition")
+		}
+		if got := stateOf(t, next)["k"]; got != "v1" {
+			t.Errorf("state[k] = %q after a refused-but-applied put, want %q", got, "v1")
+		}
+	})
+
 	t.Run("successful ops still apply", func(t *testing.T) {
 		ok, next := step(initial, linearizability.Input{Op: "put", Key: "k", Value: "v1"}, linearizability.Output{})
 		if !ok {
@@ -1076,14 +1312,61 @@ func TestKVModelTreatsFailedOpsAsNoOps(t *testing.T) {
 	})
 }
 
-// TestKVModelRequiresAReturnForEveryCall documents why finishWrite always calls
-// Recorder.End: porcupine treats a call with no matching return as a dead end
-// rather than as an operation that may still be pending, so dropping the return
-// of an in-flight write would report a false anomaly instead of an unknown one.
+// TestKVModelRequiresAReturnForEveryCall documents why an unknown-outcome write
+// goes through Recorder.EndUnknown rather than simply having its return dropped:
+// porcupine treats a call with no matching return as a dead end, not as an
+// operation that may still be pending. EndUnknown synthesizes a return placed
+// after every other event, which is how a pending operation is expressed on the
+// event API.
 func TestKVModelRequiresAReturnForEveryCall(t *testing.T) {
 	rec := &linearizability.Recorder{}
 	rec.Begin(linearizability.Input{Op: "put", Key: "k", Value: "v"}) // deliberately never ended
 	if ok, timedOut := rec.CheckTimeout(5 * time.Second); ok || timedOut {
 		t.Fatalf("an unmatched call checked as ok=%v timedOut=%v; expected it to be rejected", ok, timedOut)
+	}
+
+	// The same call, ended as unknown, is checkable and unconstrained.
+	pending := &linearizability.Recorder{}
+	pending.EndUnknown(pending.Begin(linearizability.Input{Op: "put", Key: "k", Value: "v"}))
+	if ok, timedOut := pending.CheckTimeout(5 * time.Second); !ok || timedOut {
+		t.Fatalf("a pending operation checked as ok=%v timedOut=%v; expected it to be legal", ok, timedOut)
+	}
+}
+
+// TestVerdictNotesMatchTheEncoding covers the operator guidance printed under a
+// non-PASS verdict. The old note told the reader to distrust a FAIL that
+// coincided with a fault window, which was correct when every failed write was
+// modelled as a no-op and false once they are classified — a note that outlives
+// the behaviour it describes teaches the operator to ignore a real bug.
+func TestVerdictNotesMatchTheEncoding(t *testing.T) {
+	joined := func(lines []string) string { return strings.Join(lines, "\n") }
+
+	if got := verdictNotes(0, 100, 5); got != nil {
+		t.Errorf("a PASS should print no note, got %v", got)
+	}
+
+	fail := joined(verdictNotes(1, 120, 3))
+	for _, want := range []string{"real consistency anomaly", "503", "pending", "120 refused write(s)"} {
+		if !strings.Contains(fail, want) {
+			t.Errorf("the FAIL note should mention %q:\n%s", want, fail)
+		}
+	}
+	for _, unwanted := range []string{"no-op", "before treating it as a real consistency bug"} {
+		if strings.Contains(fail, unwanted) {
+			t.Errorf("the FAIL note still carries the superseded %q explanation:\n%s", unwanted, fail)
+		}
+	}
+	if strings.Contains(joined(verdictNotes(1, 0, 0)), "refused write(s)") {
+		t.Error("the refused-write sentence should be omitted when there were none")
+	}
+
+	timeout := joined(verdictNotes(2, 0, 7))
+	for _, want := range []string{"--check-timeout", "7 write(s)", "pending"} {
+		if !strings.Contains(timeout, want) {
+			t.Errorf("the timeout note should mention %q:\n%s", want, timeout)
+		}
+	}
+	if strings.Contains(joined(verdictNotes(2, 0, 0)), "pending operations") {
+		t.Error("the pending-operations sentence should be omitted when there were none")
 	}
 }

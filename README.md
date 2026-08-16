@@ -371,32 +371,59 @@ These numbers establish the baseline for Phases 2 (WAL GC optimisation), 3
 (leveled compaction), and 4 (chaos). Any regression in p99 or WAF in a
 later phase has to be justified.
 
-### Throughput ceiling (2026-05-22, 3-node docker-compose, Apple M1 Max 32 GB)
+### Throughput baseline with replication (2026-08-16, 3-node docker-compose, Apple M4 Pro, Colima VM 8 CPU / 8 GB)
 
 Measured with `cmd/bench` open-loop Poisson arrivals against a healthy 3-node
-cluster; Zipfian α=1.1, 100k-key space, 256 B values.  "Not saturated" means
-`max_queue_depth ≪ cap` and achieved QPS ≈ target QPS.
+cluster; Zipfian α=1.1, 100k-key space, 256 B values, 128 workers. "Not
+saturated" means `max_queue_depth ≪ cap` and achieved QPS ≈ target QPS.
+**Every PUT here pays the full replicated write path**: WAL fsync on the
+ring-primary plus a synchronous gRPC ACK from each of the R−1 replicas.
 
-| Workload | Target QPS | Achieved | p50 | p99 | Saturated? |
-| --- | ---: | ---: | ---: | ---: | --- |
-| 100% writes (PUT) | 1,200 | **1,191 /s** | 3 ms | 70 ms | No |
-| 100% reads (GET) | 6,000 | **5,977 /s** | 0.5 ms | 11 ms | No |
-| 20% write / 80% read | 3,000 | **2,996 /s** | 1 ms | 70 ms | No |
+**Methodology note:** the bench binary runs *inside* the cluster's Docker
+network (`docker run --network docker_default … bench-linux --target
+node1:8001`), not through the host's port forward. Measuring through a
+localhost forwarder (Docker Desktop or Colima/Lima) adds a proxy hop to every
+request and, on macOS, caps concurrent connections at the host's ephemeral
+port range — both of which measure the plumbing rather than the store.
 
-Write throughput is bounded by WAL fsync plus gRPC replication to the
-ring-replica nodes: each PUT costs one fsync on the ring-primary and one gRPC
-round-trip to each of the R−1 replicas, all before the client gets a response.
-Read throughput is limited only by ring lookup, LSM block reads, and HTTP
-round-trip overhead; reads are never replicated.
+| Workload | Target QPS | Achieved | p50 | p90 | p99 | p999 | Errors | Saturated? |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 100% writes (PUT) | 1,200 | **1,199 /s** | 1.7 ms | 2.7 ms | 4.6 ms | 13.6 ms | 0 | No |
+| 100% reads (GET) | 6,000 | **6,017 /s** | 0.54 ms | 1.3 ms | 1.7 ms | 2.0 ms | 0 | No |
+| 20% write / 80% read | 3,000 | **3,000 /s** | 0.70 ms | 1.5 ms | 2.5 ms | 3.7 ms | 0 | No |
 
-> ⚠️ **The write rows above predate replication wiring and need re-measurement.**
-> That cost model describes the write path as it behaves *now*. When this table
-> was measured the fan-out was never invoked (see the Phase 3 note under
-> Status), so each PUT cost one fsync on the ring-primary and no replica
-> round-trip at all. The measured write numbers are therefore an upper bound on
-> what a replicated write path can achieve, and can only get slower once each
-> PUT waits on R−1 gRPC ACKs. No re-measured figures are published here yet —
-> the table will be re-run rather than adjusted on paper.
+Engine-side counters for these runs show `flush_bytes=0`, `bloom_*=0` and
+`block_cache_*=0` — that is expected, not broken: a Zipfian workload at 256 B
+accumulates *unique*-key bytes slowly (overwrites replace in place in the
+memtable), so each node stays under the 4 MB flush threshold and every read is
+served from the memtable. The Bloom filter and block cache are only consulted
+on the SSTable path; exercising them requires a larger value size or keyspace
+(see the Zipfian hit-rate baseline below, which builds its SSTables explicitly).
+
+#### Why these numbers replaced the earlier table
+
+The previous baseline (2026-05-22, Apple M1 Max) reported 1,191 /s writes at
+p99 = 70 ms and 5,977 /s reads at p99 = 11 ms, measured **without replication**
+(the fan-out was never invoked — see the Phase 3 note under Status) and through
+a client bug that has since been fixed: `internal/client` never drained HTTP
+response bodies, so Go's transport discarded every connection instead of
+returning it to the idle pool, and **every request paid a fresh TCP dial**.
+Under load this exhausted ephemeral ports (`cannot assign requested address`)
+and inflated tail latencies with handshake and TIME_WAIT stalls — it is also
+the real cause behind the TIME_WAIT warning that used to live in the operator
+notes. The fix is a drain-before-close helper pinned by a test asserting 60
+sequential calls arrive over one connection.
+
+The two tables are therefore not comparable (different hardware, fixed client,
+replication on), but the direction is telling: **writes now do strictly more
+work per request — a synchronous replica ACK — and still post a 15× better
+p99**, because the connection churn cost far more than replication does.
+
+Reads are never replicated; read throughput is bounded by ring lookup,
+memtable/LSM reads, and HTTP round-trip overhead. Roughly half of all requests
+are forwarded to the ring-primary via gRPC (`forwarded_requests` ≈ ops × 2/3
+per node on a 3-node ring), so forwarding overhead is already included in
+every percentile above.
 
 ### Phase 2 WAL allocation profile (2026-05-21, Apple M1 Max)
 
@@ -888,11 +915,15 @@ The 86.3% figure for 8 MB is analytically consistent: 8 MB holds ~2,048 blocks, 
 
 - `--workers` sizes the worker pool *and* the HTTP connection pool
   (`MaxIdleConnsPerHost = workers + 64`). Go's defaults cap idle conns/host
-  at 2, which causes TCP `TIME_WAIT` exhaustion under high concurrency;
-  the bench overrides this.
-- For runs above ~10k QPS on macOS, you may need to raise
-  `kern.ipc.somaxconn` and the ephemeral port range
-  (`net.inet.ip.portrange.first`).
+  at 2; the bench overrides this so the pool can actually hold a connection
+  per worker. Connection reuse also depends on the client draining response
+  bodies — see the throughput baseline notes for the bug where it didn't.
+- Prefer running the bench inside the cluster's Docker network
+  (`docker run --network docker_default …`) rather than through a localhost
+  port forward: forwarders (Docker Desktop, Colima/Lima) add a proxy hop to
+  every request, and macOS additionally caps concurrency at its ephemeral
+  port range. If you must bench through the host, raise
+  `kern.ipc.somaxconn` and widen `net.inet.ip.portrange.first`.
 - Pass `--output json` for a machine-readable report (suitable for
   piping into diff tools across runs).
 

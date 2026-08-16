@@ -576,13 +576,19 @@ func writeIsIndeterminate(err error) bool {
 // provablyNeverSent reports whether err means the request never reached a
 // server, so treating it as a no-op is exact rather than merely conservative.
 //
-// The typed checks are the real contract. The substring checks behind them are a
-// necessary fallback, not belt-and-braces: internal/client formats a dial
-// failure as fmt.Errorf("%w: %v", ErrUnreachable, urlErr.Err), which stringifies
-// the cause and breaks the error chain, so errors.Is cannot see the underlying
-// syscall error through it today. Repairing that wrapping lives in
-// internal/client; until it happens the substrings carry these cases, and they
-// are what the tests exercise for client-produced errors.
+// The typed checks are the contract, and they cover the errors this runner
+// actually produces: internal/client wraps a dial failure as
+// fmt.Errorf("%w: %w", ErrUnreachable, urlErr.Err), so the *net.OpError and the
+// refusing syscall.Errno underneath stay reachable through errors.Is and
+// errors.As. That is asserted end to end against a real refused dial in
+// TestProvablyNeverSentClassifiesRealClientErrors.
+//
+// The substring checks behind them are a last resort for an error that arrives
+// as text with no identity left to match — one that crossed a process boundary,
+// or came from a source outside this repo. They are deliberately kept because
+// misclassifying a never-sent write as indeterminate only inflates a diagnostic
+// counter, whereas the reverse would let a genuinely unknown outcome be
+// modelled as a no-op. They are no longer load-bearing for client errors.
 func provablyNeverSent(err error) bool {
 	// Typed: exact, and works for any error that preserves its chain.
 	for _, errno := range []syscall.Errno{
@@ -599,7 +605,7 @@ func provablyNeverSent(err error) bool {
 		return true
 	}
 
-	// Fallback: the message text, for errors whose chain was flattened.
+	// Fallback: the message text, for errors that reach us with no chain.
 	msg := err.Error()
 	for _, s := range []string{
 		"connection refused",

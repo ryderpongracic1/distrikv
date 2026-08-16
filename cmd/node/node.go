@@ -284,9 +284,3 @@ type metricsAdapter struct{ m *metrics.Metrics }
 
 func (a *metricsAdapter) IncRaftTerms()       { a.m.RaftTerms.Add(1) }
 func (a *metricsAdapter) IncLeaderElections() { a.m.LeaderElections.Add(1) }
-
-// dialTimeout is the maximum time to wait for a single peer dial attempt
-// before retrying.
-const dialTimeout = 500 * time.Millisecond
-
-var _ = dialTimeout // used by DialPeerWithRetry internally

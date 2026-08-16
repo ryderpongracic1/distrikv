@@ -59,15 +59,13 @@ func (p *primaryWriter) Put(ctx context.Context, key string, value []byte) error
 	return p.replicate(ctx, OpPut, key, value)
 }
 
-// Delete removes key locally and then replicates the tombstone.
+// Delete writes a tombstone locally and then replicates it.
 //
-// A delete of an absent key returns store.ErrNotFound and is NOT replicated:
-// nothing changed locally, so there is nothing for a replica to apply.
+// Deletes are blind tombstone writes: deleting an absent key succeeds and is
+// still replicated, because the tombstone itself is a durable local write that
+// replicas must also apply (it must shadow any earlier value a replica holds).
 func (p *primaryWriter) Delete(ctx context.Context, key string) error {
 	if err := p.store.Delete(ctx, key); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return err
-		}
 		return fmt.Errorf("primary delete %q: %w", key, err)
 	}
 	return p.replicate(ctx, OpDelete, key, nil)

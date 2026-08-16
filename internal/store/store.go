@@ -56,26 +56,38 @@ func (s *Store) Put(ctx context.Context, key string, value []byte) error {
 	return s.engine.Put(ctx, key, value)
 }
 
-// Delete removes key. Returns ErrNotFound if the key does not exist.
+// Delete removes key by writing a tombstone.
+//
+// Deletes are unconditional (blind) and therefore idempotent: deleting a key
+// that does not exist succeeds. The previous implementation did a Get before the
+// Delete to synthesise ErrNotFound, which was both racy (another writer could
+// insert or remove the key between the two calls, so the answer was never
+// authoritative) and expensive — a full read-path traversal through the
+// memtable, every L0 SSTable and L1 on every delete. Pushing the check into the
+// engine instead would mean holding the engine write lock across those disk
+// reads, which is worse. Blind deletes match RocksDB, Cassandra and DynamoDB
+// DeleteItem. Callers that must distinguish absence should Get first and accept
+// that the result is advisory.
 func (s *Store) Delete(ctx context.Context, key string) error {
 	s.delCount.Add(1)
-	_, err := s.engine.Get(ctx, key)
-	if err == ErrNotFound {
-		return ErrNotFound
-	}
-	if err != nil {
-		return err
-	}
 	return s.engine.Delete(ctx, key)
 }
 
-// KeyCount returns an approximate count of live keys (may be slightly over
-// actual due to overwritten keys not being subtracted immediately).
-func (s *Store) KeyCount() int { return 0 }
+// KeyCount returns the approximate number of live keys.
+//
+// It is exact for workloads of distinct keys and drifts up on overwrites, or
+// down on deletes, of keys that are no longer resident in the active memtable —
+// classifying those correctly would cost a read on the write hot path. The value
+// is served as `key_count` on /status alongside `key_count_approximate: true`.
+// See lsm.LSMTree.LiveKeys for the full contract and how the count is persisted
+// across restarts.
+func (s *Store) KeyCount() int { return int(s.engine.LiveKeys()) }
 
-// Counts returns cumulative operation counters since startup.
+// Counts returns cumulative operation counters since startup. walWrites is the
+// number of fsync'd WAL appends performed by the storage engine — one per
+// successful Put/Delete; WAL replay during recovery is not counted.
 func (s *Store) Counts() (puts, gets, dels, walWrites uint64) {
-	return s.putCount.Load(), s.getCount.Load(), s.delCount.Load(), 0
+	return s.putCount.Load(), s.getCount.Load(), s.delCount.Load(), s.engine.WALAppends()
 }
 
 // Snapshot returns a point-in-time copy of all live key-value pairs.

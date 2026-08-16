@@ -151,10 +151,8 @@ func (g *GRPCServer) ForwardKey(ctx context.Context, req *kvpb.ForwardKeyRequest
 		return &kvpb.ForwardKeyResponse{StatusCode: 200, Body: body}, nil
 
 	case "DELETE":
+		// Blind tombstone: deleting an absent key succeeds and replicates.
 		if err := g.writer.Delete(ctx, req.Key); err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				return forwardError(http.StatusNotFound, "not found"), nil
-			}
 			return forwardError(statusForWriteError(err), err.Error()), nil
 		}
 		return &kvpb.ForwardKeyResponse{StatusCode: 200}, nil

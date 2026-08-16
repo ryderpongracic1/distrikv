@@ -42,8 +42,12 @@ func TestMemtable_PutGetDelete(t *testing.T) {
 	mem := NewMemtable(w, walPath, &seq, 4<<20)
 
 	for _, kv := range []struct{ k, v string }{{"b", "B"}, {"a", "A"}, {"c", "C"}} {
-		if err := mem.Put(kv.k, []byte(kv.v)); err != nil {
+		delta, err := mem.Put(kv.k, []byte(kv.v))
+		if err != nil {
 			t.Fatalf("Put %s: %v", kv.k, err)
+		}
+		if delta != 1 {
+			t.Fatalf("Put %s: live delta = %d, want 1 (new key)", kv.k, delta)
 		}
 	}
 
@@ -52,8 +56,10 @@ func TestMemtable_PutGetDelete(t *testing.T) {
 		t.Fatalf("Get a: got %v ok=%v", e, ok)
 	}
 
-	if err := mem.Delete("b"); err != nil {
+	if delta, err := mem.Delete("b"); err != nil {
 		t.Fatalf("Delete b: %v", err)
+	} else if delta != -1 {
+		t.Fatalf("Delete b: live delta = %d, want -1 (live key removed)", delta)
 	}
 	e, ok = mem.Get("b")
 	if !ok || !e.Tombstone {
@@ -80,7 +86,7 @@ func TestMemtable_IsFull(t *testing.T) {
 		t.Fatal("should not be full initially")
 	}
 	for i := 0; i < 20; i++ {
-		_ = mem.Put(fmt.Sprintf("key-%02d", i), []byte("value"))
+		_, _ = mem.Put(fmt.Sprintf("key-%02d", i), []byte("value"))
 	}
 	if !mem.IsFull() {
 		t.Fatal("should be full after exceeding maxSize")

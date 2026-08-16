@@ -65,7 +65,7 @@ func TestForwardKeyDeleteReplicates(t *testing.T) {
 	assertWrites(t, h.repl.writeCalls(), replCall{Op: OpDelete, Key: "alpha"})
 }
 
-func TestForwardKeyDeleteMissingKeyDoesNotReplicate(t *testing.T) {
+func TestForwardKeyDeleteMissingKeyIsIdempotentAndReplicates(t *testing.T) {
 	h := newHarness(t)
 
 	resp, err := h.grpc.ForwardKey(context.Background(), &kvpb.ForwardKeyRequest{
@@ -74,11 +74,11 @@ func TestForwardKeyDeleteMissingKeyDoesNotReplicate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ForwardKey DELETE: %v", err)
 	}
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("ForwardKey DELETE of absent key status = %d, want 404", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ForwardKey DELETE of absent key status = %d, want 200 (blind tombstone)", resp.StatusCode)
 	}
 
-	assertWrites(t, h.repl.writeCalls())
+	assertWrites(t, h.repl.writeCalls(), replCall{Op: OpDelete, Key: "ghost"})
 }
 
 func TestForwardKeyGetDoesNotReplicate(t *testing.T) {

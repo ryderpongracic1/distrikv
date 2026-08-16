@@ -212,16 +212,16 @@ func TestHandleDeleteReplicatesTombstone(t *testing.T) {
 	}
 }
 
-func TestHandleDeleteMissingKeyDoesNotReplicate(t *testing.T) {
+func TestHandleDeleteMissingKeyIsIdempotentAndReplicates(t *testing.T) {
 	h := newHarness(t)
 
 	rec := h.do(t, http.MethodDelete, "/keys/ghost", "")
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("DELETE of absent key status = %d, want 404", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE of absent key status = %d, want 200 (blind tombstone)", rec.Code)
 	}
 
-	// Nothing changed locally, so there is nothing to replicate.
-	assertWrites(t, h.repl.writeCalls())
+	// The tombstone is a durable local write, so it replicates like any other.
+	assertWrites(t, h.repl.writeCalls(), replCall{Op: OpDelete, Key: "ghost"})
 }
 
 func TestHandleGetDoesNotReplicate(t *testing.T) {

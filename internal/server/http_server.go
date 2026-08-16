@@ -184,11 +184,11 @@ func (h *HTTPServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Deletes are blind tombstone writes in the storage engine, so DELETE is
+	// idempotent: removing a key that does not exist succeeds and is replicated
+	// like any other write. There is no 404 path here — see store.Store.Delete
+	// for why the previous Get-then-Delete existence check was racy and expensive.
 	if err := h.writer.Delete(r.Context(), key); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "not found")
-			return
-		}
 		code := statusForWriteError(err)
 		h.logger.Error("Delete failed", "key", key, "status", code, "error", err)
 		writeError(w, code, err.Error())
@@ -201,11 +201,15 @@ func (h *HTTPServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 // handleStatus implements GET /status
 func (h *HTTPServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
-		"node_id":   h.raft.ID(),
-		"leader":    h.raft.Leader(),
-		"term":      h.raft.CurrentTerm(),
-		"role":      h.raft.RoleString(),
-		"key_count": h.store.KeyCount(),
+		"node_id": h.raft.ID(),
+		"leader":  h.raft.Leader(),
+		"term":    h.raft.CurrentTerm(),
+		"role":    h.raft.RoleString(),
+		// key_count is an approximation maintained by the LSM engine; the
+		// companion flag makes that explicit to programmatic consumers rather
+		// than leaving them to assume an exact count.
+		"key_count":             h.store.KeyCount(),
+		"key_count_approximate": true,
 	})
 }
 

@@ -111,7 +111,7 @@ Every `Put` and `Delete` is appended to a binary WAL file **before** the MemTabl
 
 - Randomised election timeouts (150–300 ms) with **pre-vote phase** — a candidate first checks it can win a real election before incrementing its term, preventing a rejoining partitioned node from disrupting a stable leader.
 - `RequestVote` with log-up-to-date check, majority-vote election, term-based split-brain prevention.
-- `AppendEntries` **heartbeats only** (75 ms). Heartbeats carry no entries, so they serve purely as a liveness signal and a leader-authority assertion.
+- `AppendEntries` **heartbeats only** (75 ms send period). Heartbeats carry no entries, so they serve purely as a liveness signal and a leader-authority assertion. Each heartbeat RPC carries its own deadline, deliberately decoupled from the send period and bounded by the minimum election timeout: a heartbeat is useful to a follower right up until that follower's election timer expires, and pointless after it.
 - Atomic persistence of `currentTerm`/`votedFor` via write-temp-then-`os.Rename`.
 
 **Implemented but dormant — exercised by unit tests, never by a running cluster:**
@@ -120,6 +120,13 @@ Every `Put` and `Delete` is appended to a binary WAL file **before** the MemTabl
 - **Snapshot delivery.** `InstallSnapshot` and the snapshot codec work, and `internal/raft/snapshot_test.go` covers them. But snapshots are triggered by log growth past `snapshotThreshold: 1000`, and since the log never grows, that trigger never fires. No `InstallSnapshot` RPC is ever sent outside tests.
 
 Both paths are kept rather than deleted because they are the natural landing spot if writes are ever moved onto the Raft log. They are listed here so that "distrikv implements InstallSnapshot" is not mistaken for "distrikv ships snapshots between nodes at runtime" — it doesn't.
+
+**Correction — the leader-election storm (fixed).** Until recently the two claims above were not true of a *running* cluster, and the gap was a chronic election storm: a live 3-node Docker cluster burned roughly 1.7 terms per second indefinitely, passing term 900 within nine minutes of startup, alternating leadership every ~500 ms. Two defects combined:
+
+1. `broadcastHeartbeat` classified a peer as needing a snapshot when `nextIndex-1 <= snapLastIndex` — but a fully caught-up peer sits at exactly `nextIndex == snapLastIndex+1` and satisfies that test. Since the Raft log never grows, *every* peer matched on *every* tick, and the snapshot was sent **instead of** the heartbeat. With no snapshot on disk that send returned early, so no heartbeat ever left the leader at all, and every follower elected the moment its timer expired. A heartbeat now goes to every peer unconditionally; snapshot delivery (still dormant, for the reason above) rides alongside it rather than replacing it.
+2. Each heartbeat RPC was given a deadline of exactly one send interval, so any RPC delayed past 150 ms by gRPC connection setup or container scheduling was cancelled by its own deadline and never reached the follower.
+
+Because the data path is ring-based and never consults Raft leadership, the storm cost nothing but log volume and wasted CPU — which is why it went unnoticed until the container logs were read directly. `internal/raft/cluster_test.go` now stands an in-process 3-node cluster up and fails if the term advances more than once over three seconds, both on an idle cluster and with per-RPC latency injected above the send interval.
 
 **Intentional deviations from the paper (important for reviewers):**
 
@@ -1147,6 +1154,7 @@ Tests cover:
 - **Hash ring distribution** — 10k keys across 3 nodes, no node owns >40% or <20%
 - **WAL replay correctness** — put/delete/truncated-entry scenarios
 - **Raft vote-granting logic** — stale term, duplicate vote, outdated log, idempotent re-vote
+- **Raft leadership stability** — in-process 3-node cluster asserting the term stays flat on an idle cluster, under injected per-RPC latency above the heartbeat send interval, and with one peer partitioned off; plus the snapshot-vs-heartbeat dispatch boundary and the heartbeat deadline contract
 - **PersistentState round-trip** — atomic write/read of `currentTerm` + `votedFor`
 - **Concurrent store writes** — 100 goroutines, verified under `-race`
 - **LSM-Tree correctness** — MemTable flush, SSTable read, compaction, Bloom filter false-positive rate, leveled-compaction read correctness, tombstone removal, write-stall metrics, L0-count tracking

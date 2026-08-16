@@ -393,6 +393,13 @@ func (r *RaftNode) becomeLeaderLocked(ctx context.Context) {
 func (r *RaftNode) runLeader(ctx context.Context, leaderStop <-chan struct{}) {
 	ticker := time.NewTicker(r.heartbeatInterval)
 	defer ticker.Stop()
+
+	// Assert authority immediately rather than waiting out the first tick. The
+	// followers that just voted reset their election timers at vote time, so
+	// idling for a full heartbeatInterval spends part of their election window
+	// before the new leader has said anything.
+	r.broadcastHeartbeat(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -405,48 +412,99 @@ func (r *RaftNode) runLeader(ctx context.Context, leaderStop <-chan struct{}) {
 	}
 }
 
-// broadcastHeartbeat sends AppendEntries (or InstallSnapshot) to every peer.
-// For peers that have fallen behind the snapshot boundary, InstallSnapshot is
-// sent instead of AppendEntries.
+// broadcastHeartbeat sends an AppendEntries heartbeat to every peer, plus an
+// InstallSnapshot to any peer whose next log entry has already been compacted.
+//
+// Every peer gets a heartbeat on every tick, unconditionally. The heartbeat is
+// the only liveness signal a follower's election timer has, so it is never
+// traded away for another RPC — doing so silently starves that follower into
+// calling an election against a healthy leader.
+//
+// Each peer is served by its own goroutine, so a slow or unreachable peer can
+// neither delay nor suppress the heartbeat owed to any other peer.
 func (r *RaftNode) broadcastHeartbeat(ctx context.Context) {
 	r.mu.Lock()
 	term := r.currentTerm
 	lastIdx := r.lastLogIndex()
 	lastTerm := r.lastLogTerm()
-	snapLastIndex := r.snapLastIndex
 	peers := r.peers
-	nextIndex := r.nextIndex
+	// Decide snapshot delivery under the lock: nextIndex is mutated by
+	// sendInstallSnapshot from other goroutines, so it must not be read once
+	// the lock is dropped.
+	//
+	// A peer needs a snapshot only when the entry it asks for next has already
+	// been compacted away. nextIndex == snapLastIndex+1 is the fully-caught-up
+	// case: PrevLogIndex is then snapLastIndex, whose term the leader still
+	// holds in snapLastTerm, so a plain AppendEntries carries everything the
+	// peer needs.
+	needSnapshot := make(map[string]bool, len(peers))
+	for _, p := range peers {
+		needSnapshot[p.NodeID] = r.nextIndex[p.NodeID] <= r.snapLastIndex
+	}
 	r.mu.Unlock()
 
 	for _, peer := range peers {
 		peer := peer
-		peerNext := nextIndex[peer.NodeID]
-
-		if peerNext > 0 && peerNext-1 <= snapLastIndex {
-			// Peer needs log entries that were compacted — send snapshot instead.
+		go r.sendHeartbeat(ctx, peer, term, lastIdx, lastTerm)
+		if needSnapshot[peer.NodeID] {
 			go r.sendInstallSnapshot(ctx, peer, term)
-		} else {
-			go func() {
-				hbCtx, cancel := context.WithTimeout(ctx, r.heartbeatInterval)
-				defer cancel()
-				resp, err := peer.Client.AppendEntries(hbCtx, &kvpb.AppendEntriesRequest{
-					Term:         term,
-					LeaderId:     r.nodeID,
-					PrevLogIndex: lastIdx,
-					PrevLogTerm:  lastTerm,
-				})
-				if err != nil {
-					r.logger.Warn("heartbeat failed", "peer", peer.NodeID, "error", err)
-					return
-				}
-				r.mu.Lock()
-				if resp.Term > r.currentTerm {
-					r.stepDownLocked(resp.Term)
-				}
-				r.mu.Unlock()
-			}()
 		}
 	}
+}
+
+// sendHeartbeat sends one AppendEntries heartbeat to one peer and applies any
+// higher term the peer reports.
+func (r *RaftNode) sendHeartbeat(ctx context.Context, peer PeerClient, term, prevLogIndex, prevLogTerm uint64) {
+	hbCtx, cancel := context.WithTimeout(ctx, r.heartbeatRPCTimeout())
+	defer cancel()
+
+	resp, err := peer.Client.AppendEntries(hbCtx, &kvpb.AppendEntriesRequest{
+		Term:         term,
+		LeaderId:     r.nodeID,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+	})
+	if err != nil {
+		r.logger.Warn("heartbeat failed", "peer", peer.NodeID, "error", err)
+		return
+	}
+	r.mu.Lock()
+	if resp.Term > r.currentTerm {
+		r.stepDownLocked(resp.Term)
+	}
+	r.mu.Unlock()
+}
+
+// heartbeatRPCTimeout is the per-RPC deadline for a heartbeat. It is
+// deliberately decoupled from the send interval.
+//
+// Giving each heartbeat exactly one heartbeatInterval to complete — as this
+// code used to — means any RPC delayed past a single interval by gRPC
+// connection setup, a host scheduler pause, or ordinary network jitter is
+// cancelled by its own deadline. The follower never sees it, its election timer
+// never resets, and it calls an election against a perfectly healthy leader.
+// That margin is far too tight to survive a containerised cluster.
+//
+// A heartbeat stays useful to a follower right up until that follower's
+// election timer could expire, so the deadline is the minimum election timeout:
+// long enough to ride out jitter of several send intervals, short enough that
+// the RPC is abandoned once its arrival could no longer have prevented an
+// election. The floor of two send intervals keeps the deadline wider than one
+// interval even if the election timeouts are configured tighter than the
+// heartbeat interval, which the config validator does not forbid.
+//
+// The send loop period stays at heartbeatInterval, so a merely slow peer still
+// gets a fresh heartbeat every interval. Up to ceil(timeout/interval) may be in
+// flight to one peer at once; that is bounded and deliberate. Skipping a tick
+// while an earlier RPC is still outstanding would withhold the very signal the
+// follower is waiting for, betting the cluster's stability on the stalled RPC
+// eventually landing.
+func (r *RaftNode) heartbeatRPCTimeout() time.Duration {
+	timeout := r.electionTimeoutMin
+	if floor := 2 * r.heartbeatInterval; timeout < floor {
+		timeout = floor
+	}
+	return timeout
 }
 
 // sendInstallSnapshot sends a full snapshot to a peer.

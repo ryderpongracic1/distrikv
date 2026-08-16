@@ -29,12 +29,44 @@ import (
 //	errors.As(err, &opErr)                 // *net.OpError, *net.DNSError, ...
 //
 // Callers must classify with errors.Is/errors.As. The message text is not part
-// of the contract — do not match on substrings.
+// of the contract — do not match on substrings. A 5xx response additionally
+// carries its status code as a *StatusError in the chain; see below.
 var (
 	ErrNotFound    = errors.New("key not found")
 	ErrUnreachable = errors.New("node unreachable")
 	ErrServerError = errors.New("server error")
 )
+
+// StatusError is returned for a response the client treats as a failure (any
+// 5xx). It carries the status code so a caller can tell *which* failure it was
+// from the chain rather than from the message text:
+//
+//	var se *client.StatusError
+//	if errors.As(err, &se) && se.StatusCode == http.StatusServiceUnavailable { … }
+//
+// The code is load-bearing for writes, because distrikv's 5xx codes describe
+// different effects on the store. A 503 means the ring-primary applied the
+// mutation to its own store and then failed to replicate it — the write is
+// present and there is no rollback (see internal/server's ErrReplication and
+// the README's "CAP Position"). A 502 means the request failed on its way to
+// the primary, so it may never have been applied at all. Both render as
+// "server error: …", so nothing but the code separates them.
+//
+// It unwraps to ErrServerError, so existing errors.Is(err, ErrServerError)
+// classification is unaffected, and Error() is byte-identical to the
+// fmt.Errorf("%w: %s", ErrServerError, body) wrapping it replaced.
+type StatusError struct {
+	StatusCode int
+	Body       string // the response body, verbatim
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("%s: %s", ErrServerError, e.Body)
+}
+
+// Unwrap reports ErrServerError as the cause so this type slots into the
+// package's sentinel contract.
+func (e *StatusError) Unwrap() error { return ErrServerError }
 
 type Config struct {
 	Host    string
@@ -150,6 +182,13 @@ func drainAndClose(body io.ReadCloser) {
 	_ = body.Close()
 }
 
+// serverError builds the error for a 5xx response. The body is read here so the
+// caller's deferred drainAndClose has nothing left to discard.
+func serverError(resp *http.Response) error {
+	b, _ := io.ReadAll(resp.Body)
+	return &StatusError{StatusCode: resp.StatusCode, Body: string(b)}
+}
+
 func (c *Client) Get(ctx context.Context, key string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/keys/"+key), nil)
 	if err != nil {
@@ -165,8 +204,7 @@ func (c *Client) Get(ctx context.Context, key string) (string, error) {
 		return "", ErrNotFound
 	}
 	if resp.StatusCode >= 500 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("%w: %s", ErrServerError, string(body))
+		return "", serverError(resp)
 	}
 	var gr GetResponse
 	if err := json.NewDecoder(resp.Body).Decode(&gr); err != nil {
@@ -193,8 +231,7 @@ func (c *Client) Put(ctx context.Context, key string, value string) error {
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode >= 500 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("%w: %s", ErrServerError, string(b))
+		return serverError(resp)
 	}
 	return nil
 }
@@ -214,8 +251,7 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 		return ErrNotFound
 	}
 	if resp.StatusCode >= 500 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("%w: %s", ErrServerError, string(b))
+		return serverError(resp)
 	}
 	return nil
 }
@@ -232,8 +268,7 @@ func (c *Client) Status(ctx context.Context) (*StatusResponse, error) {
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode >= 500 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("%w: %s", ErrServerError, string(b))
+		return nil, serverError(resp)
 	}
 	var sr StatusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
@@ -254,8 +289,7 @@ func (c *Client) Metrics(ctx context.Context) (MetricsResponse, error) {
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode >= 500 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("%w: %s", ErrServerError, string(b))
+		return nil, serverError(resp)
 	}
 	var mr MetricsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&mr); err != nil {

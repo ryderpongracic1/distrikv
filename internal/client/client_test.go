@@ -64,6 +64,54 @@ func TestGet_Unreachable(t *testing.T) {
 	assert.ErrorIs(t, err, client.ErrUnreachable)
 }
 
+// TestStatusErrorCarriesTheCode covers the contract cmd/chaos classifies writes
+// with. distrikv's 5xx codes describe different effects on the store — a 503 is
+// a mutation the primary applied and could not replicate, a 502 is a mutation
+// that may never have reached the primary — so a consumer that can only see
+// ErrServerError has to read the message text to tell them apart. The code has
+// to survive in the chain.
+func TestStatusErrorCarriesTheCode(t *testing.T) {
+	for _, code := range []int{
+		http.StatusServiceUnavailable,
+		http.StatusBadGateway,
+		http.StatusInternalServerError,
+	} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			body := `{"error":"replication to replicas failed"}`
+			c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(code)
+				w.Write([]byte(body))
+			}))
+
+			for name, call := range map[string]func() error{
+				"put":    func() error { return c.Put(context.Background(), "k", "v") },
+				"delete": func() error { return c.Delete(context.Background(), "k") },
+				"get": func() error {
+					_, err := c.Get(context.Background(), "k")
+					return err
+				},
+			} {
+				t.Run(name, func(t *testing.T) {
+					err := call()
+					require.Error(t, err)
+
+					// The sentinel classification is unchanged...
+					assert.ErrorIs(t, err, client.ErrServerError)
+					// ...and the message is byte-identical to the fmt.Errorf
+					// wrapping this type replaced, so existing operator output
+					// does not shift.
+					assert.Equal(t, fmt.Sprintf("server error: %s", body), err.Error())
+
+					var se *client.StatusError
+					require.ErrorAs(t, err, &se, "the status code must survive in the chain")
+					assert.Equal(t, code, se.StatusCode)
+					assert.Equal(t, body, se.Body)
+				})
+			}
+		})
+	}
+}
+
 // closedPortHost returns a host:port that is guaranteed to refuse connections:
 // a listener is opened to reserve the port and closed again before returning.
 func closedPortHost(t *testing.T) string {

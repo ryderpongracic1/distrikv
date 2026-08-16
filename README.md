@@ -1,5 +1,7 @@
 # distrikv
 
+[![CI](https://github.com/ryderpongracic1/distrikv/actions/workflows/ci.yml/badge.svg)](https://github.com/ryderpongracic1/distrikv/actions/workflows/ci.yml)
+
 A production-quality distributed key-value store written in Go from scratch.
 
 ```

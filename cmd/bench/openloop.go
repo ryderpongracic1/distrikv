@@ -25,12 +25,12 @@ type arrival struct {
 // runResult holds aggregate counters and a merged histogram for one phase
 // (warmup or measurement).
 type runResult struct {
-	ops          uint64
-	errors       uint64
+	ops           uint64
+	errors        uint64
 	maxQueueDepth uint64
-	startedAt    time.Time
-	endedAt      time.Time
-	hist         *hdrhistogram.Histogram
+	startedAt     time.Time
+	endedAt       time.Time
+	hist          *hdrhistogram.Histogram
 }
 
 // runConfig drives a single phase of an open-loop bench run.

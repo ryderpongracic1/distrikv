@@ -75,11 +75,11 @@ func (c *CLI) Root() *cobra.Command {
 
 func (c *CLI) buildRoot() *cobra.Command {
 	root := &cobra.Command{
-		Use:           "distrikv-cli",
-		Short:         "CLI for the distrikv distributed key-value store",
-		Long:          "A command-line interface for interacting with a distrikv cluster over HTTP.",
-		SilenceUsage:  true,  // don't print usage on RunE errors
-		SilenceErrors: true,  // don't prepend "Error: " — HandleErr does that
+		Use:               "distrikv-cli",
+		Short:             "CLI for the distrikv distributed key-value store",
+		Long:              "A command-line interface for interacting with a distrikv cluster over HTTP.",
+		SilenceUsage:      true, // don't print usage on RunE errors
+		SilenceErrors:     true, // don't prepend "Error: " — HandleErr does that
 		PersistentPreRunE: c.initAppContext,
 	}
 
@@ -134,8 +134,8 @@ func resolveConfig(cmd *cobra.Command) (*ResolvedConfig, error) {
 
 	viper.SetConfigName(".distrikv")
 	viper.SetConfigType("yaml")
-	viper.AddConfigPath(".")    // CWD — higher priority
-	viper.AddConfigPath(home)   // HOME — fallback
+	viper.AddConfigPath(".")  // CWD — higher priority
+	viper.AddConfigPath(home) // HOME — fallback
 
 	viper.SetEnvPrefix("DISTRIKV")
 	viper.AutomaticEnv() // DISTRIKV_HOST → "host", etc.

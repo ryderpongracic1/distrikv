@@ -37,7 +37,7 @@ import (
 type Role uint8
 
 const (
-	Follower  Role = iota
+	Follower Role = iota
 	Candidate
 	Leader
 )
@@ -72,12 +72,12 @@ type StoreInterface interface {
 
 // Config carries RaftNode configuration.
 type Config struct {
-	NodeID              string
-	DataDir             string
-	ElectionTimeoutMin  time.Duration
-	ElectionTimeoutMax  time.Duration
-	HeartbeatInterval   time.Duration
-	SnapshotThreshold   int // take snapshot when log exceeds this many entries
+	NodeID             string
+	DataDir            string
+	ElectionTimeoutMin time.Duration
+	ElectionTimeoutMax time.Duration
+	HeartbeatInterval  time.Duration
+	SnapshotThreshold  int // take snapshot when log exceeds this many entries
 }
 
 // RaftNode implements Raft leader election, heartbeating, snapshot delivery,
@@ -466,11 +466,11 @@ func (r *RaftNode) sendInstallSnapshot(ctx context.Context, peer PeerClient, ter
 	defer cancel()
 
 	resp, err := peer.Client.InstallSnapshot(isCtx, &kvpb.InstallSnapshotRequest{
-		Term:               term,
-		LeaderId:           r.nodeID,
-		LastIncludedIndex:  snap.LastIncludedIndex,
-		LastIncludedTerm:   snap.LastIncludedTerm,
-		Data:               buf.Bytes(),
+		Term:              term,
+		LeaderId:          r.nodeID,
+		LastIncludedIndex: snap.LastIncludedIndex,
+		LastIncludedTerm:  snap.LastIncludedTerm,
+		Data:              buf.Bytes(),
 	})
 	if err != nil {
 		r.logger.Warn("InstallSnapshot RPC failed", "peer", peer.NodeID, "err", err)

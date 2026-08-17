@@ -155,6 +155,21 @@ type replicaState struct {
 
 	lastAttempt time.Time
 
+	// queued marks that a repair cycle for this replica is already waiting to run
+	// or running. Three independent sources schedule a cycle — a health-transition
+	// recovery, the retry ticker for a replica still behind, and the startup seed —
+	// and none of them knew about the others, so a replica could have several
+	// identical cycles queued at once. Every one after the first finds nothing left
+	// to ship and completes instantly, which is how a converged cluster produced
+	// six "replica caught up, entries_sent=0, took=0" lines inside one millisecond:
+	// wasted passes, and a convergence claim logged repeatedly for the same fact.
+	//
+	// Cleared when the cycle finishes rather than when it starts, so the burst
+	// collapses to exactly one cycle: anything that would have been scheduled while
+	// the cycle was running is already covered by it, and if the replica is still
+	// behind afterwards the retry ticker picks it up again.
+	queued bool
+
 	// candidate is a tip observed at candidateAt with failures == candidateFail.
 	// If the failure count is still unchanged once the tip is CursorHoldback old,
 	// every write before it resolved without a single failure, so the cursor can
@@ -256,6 +271,11 @@ func newAntiEntropy(
 			"A full key-scan sync would close this and does not exist in v1",
 			"reason", fullSyncReason, "wal_tip", tip)
 	}
+	// Cursors that cannot possibly describe this node's log are collected here and
+	// dealt with after the replica map is populated, because noteLogGap records the
+	// reason on the replica's own state.
+	var orphaned []string
+
 	for _, id := range peerIDs {
 		st := &replicaState{}
 		// A persisted cursor behind the tip means this node stopped — crashed, or
@@ -269,10 +289,48 @@ func newAntiEntropy(
 		// been recorded, which is also the state of a node that has just been
 		// created. Treating it as "behind" would make every fresh node open by
 		// re-sending its whole retained log to every replica.
-		if cur := cursors.Get(id); !cur.IsZero() && cur.Before(tip) {
+		switch cur := cursors.Get(id); {
+		case cur.IsZero():
+			// No evidence either way.
+		case cur.Before(tip):
 			st.behind = true
+		case tip.Before(cur):
+			// A cursor ahead of the tip cannot arise in a log this node simply kept
+			// appending to: offsets only grow and segment numbers only increase. It
+			// means the log the cursor described is gone and a different one stands in
+			// its place — a snapshot restore that failed to invalidate cursors, a
+			// rebuilt data directory, or (before segment numbers were made monotonic
+			// across a restart) a clean shutdown that released every live segment and
+			// restarted numbering at 1.
+			//
+			// Left in place it is worse than stale. It cannot be moved back, because
+			// cursors are monotonic; the retention floor derived from it names a
+			// segment of a log that no longer exists, so freshly flushed segments are
+			// deleted instead of parked for catch-up; and the first pass reads from a
+			// byte offset past the end of a shorter log, which is a clean stop with no
+			// error — so the pass ships nothing and the engine reports the replica as
+			// caught up. That last one is a silently wrong convergence claim, which is
+			// the specific failure this whole file is built to refuse.
+			//
+			// So drop it (a zero cursor honestly says "no evidence"), mark the replica
+			// behind so it is examined rather than assumed fine, and latch the gap so
+			// no pass over this log may be read as the replica agreeing.
+			st.behind = true
+			orphaned = append(orphaned, id)
 		}
 		ae.replica[id] = st
+	}
+
+	for _, id := range orphaned {
+		cursors.Forget(id)
+		ae.noteLogGap(id, fmt.Sprintf(
+			"replica %s had a cursor ordered after this node's WAL tip %s, so it "+
+				"described a different log; the cursor has been dropped", id, tip))
+		ae.logger.Warn("replica cursor ordered after this node's WAL tip, so it cannot "+
+			"describe this log; dropping it and catching up from the oldest surviving "+
+			"segment. Keys this node holds only in an SSTable are not in the log and "+
+			"stay divergent on that replica until they are rewritten (v1 limitation)",
+			"replica", id, "wal_tip", tip)
 	}
 	return ae
 }
@@ -350,10 +408,19 @@ func (ae *antiEntropy) Run(ctx context.Context) {
 	}()
 
 	enqueue := func(nodeID, reason string) {
+		if !ae.tryEnqueue(nodeID) {
+			// A cycle for this replica is already pending or running, and it will
+			// cover everything this one would have. Queueing it anyway is what
+			// produced bursts of instantly-completing passes after convergence.
+			ae.logger.Debug("catch-up already pending for this replica; not queueing again",
+				"replica", nodeID, "reason", reason)
+			return
+		}
 		select {
 		case cycles <- nodeID:
 			ae.logger.Info("catch-up scheduled", "replica", nodeID, "reason", reason)
 		default:
+			ae.clearQueued(nodeID)
 			ae.logger.Warn("catch-up queue full; will retry", "replica", nodeID)
 		}
 	}
@@ -519,9 +586,39 @@ func (ae *antiEntropy) advanceQuietCursors() {
 	}
 }
 
+// tryEnqueue claims the pending slot for nodeID and reports whether the caller
+// is the one that should queue a cycle. It returns false when a cycle for that
+// replica is already pending or running, which is what keeps three independent
+// schedulers from queueing the same work several times over.
+func (ae *antiEntropy) tryEnqueue(nodeID string) bool {
+	ae.mu.Lock()
+	defer ae.mu.Unlock()
+	st := ae.replica[nodeID]
+	if st == nil || st.queued {
+		return false
+	}
+	st.queued = true
+	return true
+}
+
+// clearQueued releases the pending slot claimed by tryEnqueue.
+func (ae *antiEntropy) clearQueued(nodeID string) {
+	ae.mu.Lock()
+	if st := ae.replica[nodeID]; st != nil {
+		st.queued = false
+	}
+	ae.mu.Unlock()
+}
+
 // repair runs one repair cycle for a replica: passes until a pass ships nothing,
 // which is what proves there is nothing left to converge.
 func (ae *antiEntropy) repair(ctx context.Context, nodeID string) {
+	// Release the pending slot however this cycle ends, so the next scheduler tick
+	// can queue a fresh one. Deferred rather than cleared up front on purpose: a
+	// cycle already in flight covers anything that would have been scheduled while
+	// it ran.
+	defer ae.clearQueued(nodeID)
+
 	ae.mu.Lock()
 	st := ae.replica[nodeID]
 	if st == nil {

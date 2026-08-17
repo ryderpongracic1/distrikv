@@ -193,6 +193,9 @@ type LSMTree struct {
 	// without taking the mutex. It is always updated under mu before Unlock.
 	l0Count atomic.Int32
 
+	// closeOnce makes Close idempotent; see Close.
+	closeOnce sync.Once
+
 	dataDir         string
 	logger          *slog.Logger
 	maxMem          int64
@@ -357,10 +360,37 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 		l.metrics.L0FileCount.Store(int64(len(l.l0)))
 	}
 
-	// Find and seed walSeq from existing WAL files.
-	walFiles, maxWalSeq, err := findWALFiles(dataDir)
+	// Find the live WAL segments recovery must replay.
+	walFiles, err := findWALFiles(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("lsm: scan WAL files: %w", err)
+	}
+
+	// Seed the sequence number from every segment this node has on disk —
+	// including the ones parked under retainedWALDir for replica catch-up, which
+	// findWALFiles deliberately excludes because they must not be replayed.
+	//
+	// Excluding them here too is what made segment numbers repeat. A clean
+	// shutdown flushes the active memtable and releases its segment, so a store
+	// that closes gracefully can be left with no live segment at all; seeding from
+	// the live set alone then restarts numbering at 1 while wal-retained/ already
+	// holds a segment 1. Positions are (segment, offset) pairs, so every replica
+	// cursor recorded before the restart silently addresses the *new* log:
+	// wal.ErrCursorStale is keyed on the segment number and cannot fire, the old
+	// parked segment is shadowed by the new one of the same number (ListSegments
+	// prefers the live directory), and a pass reads from a byte offset that is past
+	// the end of a different log — which is a clean stop with no error, so the pass
+	// ships nothing and the engine concludes the replica is caught up. That is a
+	// silently wrong convergence claim, and it is the same failure the README
+	// documents for snapshot restore, reached by an ordinary restart.
+	//
+	// Monotonic numbering removes the ambiguity outright: a cursor into a released
+	// segment now names a segment number that no longer exists, which is exactly
+	// the condition ErrCursorStale reports and the anti-entropy engine already
+	// handles by withholding the convergence claim.
+	maxWalSeq, err := highestWALSeq(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("lsm: scan WAL segments: %w", err)
 	}
 	l.walSeq.Store(maxWalSeq)
 
@@ -1257,7 +1287,18 @@ func (l *LSMTree) bulkLoadL0(data map[string][]byte) error {
 
 // Close flushes any pending memtable, stops background goroutines, and closes
 // all file handles.
+//
+// It is idempotent. A second call used to panic on `close` of an already-closed
+// channel, which made "close it twice" a crash rather than a no-op — an easy
+// mistake for any caller with more than one shutdown path, and one that turns an
+// orderly stop into a lost flush.
 func (l *LSMTree) Close() error {
+	var err error
+	l.closeOnce.Do(func() { err = l.doClose() })
+	return err
+}
+
+func (l *LSMTree) doClose() error {
 	close(l.stopCh)
 	l.wg.Wait()
 
@@ -1366,17 +1407,20 @@ func (l *LSMTree) flushMemtableDirect(mem *Memtable) error {
 // ---- Helpers ---------------------------------------------------------------
 
 // findWALFiles returns the live WAL segments in dataDir — the ones recovery must
-// replay — sorted by ascending sequence number, together with the highest
-// sequence number seen. Segments parked for replica catch-up live in a
-// subdirectory and are deliberately not returned: they have already been flushed
-// into an SSTable, so replaying them would re-apply committed writes.
+// replay — sorted by ascending sequence number.
+//
+// Segments parked for replica catch-up live in a subdirectory and are
+// deliberately not returned: they have already been flushed into an SSTable, so
+// replaying them would re-apply committed writes. Their sequence numbers are
+// still reserved, though, which is what highestWALSeq is for — this function must
+// not be used to decide the next segment number.
 //
 // The filename format is owned by the wal package (wal.SegmentName /
 // wal.ParseSegmentSeq); this function must not restate it.
-func findWALFiles(dataDir string) (paths []string, maxSeq uint64, err error) {
+func findWALFiles(dataDir string) (paths []string, err error) {
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
-		return nil, 0, fmt.Errorf("lsm: read dir: %w", err)
+		return nil, fmt.Errorf("lsm: read dir: %w", err)
 	}
 
 	type walFile struct {
@@ -1397,16 +1441,13 @@ func findWALFiles(dataDir string) (paths []string, maxSeq uint64, err error) {
 			path: filepath.Join(dataDir, de.Name()),
 			seq:  seq,
 		})
-		if seq > maxSeq {
-			maxSeq = seq
-		}
 	}
 
 	sort.Slice(wals, func(i, j int) bool { return wals[i].seq < wals[j].seq })
 	for _, w := range wals {
 		paths = append(paths, w.path)
 	}
-	return paths, maxSeq, nil
+	return paths, nil
 }
 
 func wipeLSMDir(dataDir string) error {

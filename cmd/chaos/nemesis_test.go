@@ -1473,11 +1473,11 @@ func TestKVModelRequiresAReturnForEveryCall(t *testing.T) {
 func TestVerdictNotesMatchTheEncoding(t *testing.T) {
 	joined := func(lines []string) string { return strings.Join(lines, "\n") }
 
-	if got := verdictNotes(0, 100, 5); got != nil {
+	if got := verdictNotes(0, 100, 5, convergedOK); got != nil {
 		t.Errorf("a PASS should print no note, got %v", got)
 	}
 
-	fail := joined(verdictNotes(1, 120, 3))
+	fail := joined(verdictNotes(1, 120, 3, convergedOK))
 	for _, want := range []string{"real consistency anomaly", "503", "pending", "120 refused write(s)"} {
 		if !strings.Contains(fail, want) {
 			t.Errorf("the FAIL note should mention %q:\n%s", want, fail)
@@ -1488,17 +1488,17 @@ func TestVerdictNotesMatchTheEncoding(t *testing.T) {
 			t.Errorf("the FAIL note still carries the superseded %q explanation:\n%s", unwanted, fail)
 		}
 	}
-	if strings.Contains(joined(verdictNotes(1, 0, 0)), "refused write(s)") {
+	if strings.Contains(joined(verdictNotes(1, 0, 0, convergedOK)), "refused write(s)") {
 		t.Error("the refused-write sentence should be omitted when there were none")
 	}
 
-	timeout := joined(verdictNotes(2, 0, 7))
+	timeout := joined(verdictNotes(2, 0, 7, convergedOK))
 	for _, want := range []string{"--check-timeout", "7 write(s)", "pending"} {
 		if !strings.Contains(timeout, want) {
 			t.Errorf("the timeout note should mention %q:\n%s", want, timeout)
 		}
 	}
-	if strings.Contains(joined(verdictNotes(2, 0, 0)), "pending operations") {
+	if strings.Contains(joined(verdictNotes(2, 0, 0, convergedOK)), "pending operations") {
 		t.Error("the pending-operations sentence should be omitted when there were none")
 	}
 }

@@ -87,9 +87,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -177,6 +175,9 @@ type LSMTree struct {
 	seqNum  atomic.Uint64 // global write sequence; shared with Memtables
 	nextSST atomic.Uint64 // SSTable file sequence number
 	walSeq  atomic.Uint64 // WAL file sequence number
+
+	// WAL cursor/retention state for replica catch-up (see wal_retention.go).
+	walRetentionState
 
 	// liveKeys is the approximate number of live (non-tombstoned) keys in the
 	// engine. See LiveKeys for the accuracy contract and how it is persisted.
@@ -375,12 +376,13 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 	}
 
 	activeWalSeq := l.walSeq.Add(1)
-	activeWalPath := filepath.Join(dataDir, fmt.Sprintf("wal-%04d.log", activeWalSeq))
+	activeWalPath := filepath.Join(dataDir, storewal.SegmentName(activeWalSeq))
 	activeWAL, err := storewal.Open(activeWalPath)
 	if err != nil {
 		return nil, fmt.Errorf("lsm: open active WAL: %w", err)
 	}
 	l.mem = NewMemtable(activeWAL, activeWalPath, &l.seqNum, l.maxMem)
+	l.activeWalSeq.Store(activeWalSeq)
 
 	for _, wf := range walFiles {
 		w, err := storewal.Open(wf)
@@ -722,7 +724,7 @@ func (l *LSMTree) rotateMemtable() error {
 	}
 
 	seq := l.walSeq.Add(1)
-	walPath := filepath.Join(l.dataDir, fmt.Sprintf("wal-%04d.log", seq))
+	walPath := filepath.Join(l.dataDir, storewal.SegmentName(seq))
 	newWAL, err := storewal.Open(walPath)
 	if err != nil {
 		return fmt.Errorf("lsm: open new WAL: %w", err)
@@ -734,6 +736,9 @@ func (l *LSMTree) rotateMemtable() error {
 	// lands in the new WAL and is re-applied by replay at open.
 	l.imm.liveKeysAtSeal = l.liveKeys.Load()
 	l.mem = NewMemtable(newWAL, walPath, &l.seqNum, l.maxMem)
+	// Published with the new memtable, under the same lock, so WALTip never
+	// pairs one segment's number with another's offset.
+	l.activeWalSeq.Store(seq)
 
 	select {
 	case l.flushCh <- struct{}{}:
@@ -825,9 +830,9 @@ func (l *LSMTree) flushMemtable(imm *Memtable) error {
 	l.immFlushed.Broadcast()
 	l.mu.Unlock()
 
-	if err := os.Remove(imm.walPath); err != nil && !os.IsNotExist(err) {
-		l.logger.Warn("lsm: remove flushed WAL", "path", imm.walPath, "err", err)
-	}
+	// The segment is either deleted or parked for a replica that still needs to
+	// be caught up from it — see releaseWALSegment.
+	l.releaseWALSegment(imm.walPath)
 
 	// l0Depth is captured under the lock above: reading len(l.l0) here would
 	// race with runCompact clearing l.l0, and would also be off by one because
@@ -1149,7 +1154,7 @@ func (l *LSMTree) Restore(ctx context.Context, data map[string][]byte) error {
 	// a restore leaves it where it was.
 
 	activeWalSeq := l.walSeq.Add(1)
-	activeWalPath := filepath.Join(l.dataDir, fmt.Sprintf("wal-%04d.log", activeWalSeq))
+	activeWalPath := filepath.Join(l.dataDir, storewal.SegmentName(activeWalSeq))
 	activeWAL, err := storewal.Open(activeWalPath)
 	if err != nil {
 		return fmt.Errorf("lsm: open restore WAL: %w", err)
@@ -1157,6 +1162,7 @@ func (l *LSMTree) Restore(ctx context.Context, data map[string][]byte) error {
 
 	l.mu.Lock()
 	l.mem = NewMemtable(activeWAL, activeWalPath, &l.seqNum, l.maxMem)
+	l.activeWalSeq.Store(activeWalSeq)
 	l.mu.Unlock()
 
 	// Write the payload straight to L0. Nothing is served from the memtable or
@@ -1353,16 +1359,20 @@ func (l *LSMTree) flushMemtableDirect(mem *Memtable) error {
 	}
 	l.mu.Unlock()
 
-	if err := os.Remove(mem.walPath); err != nil && !os.IsNotExist(err) {
-		l.logger.Warn("lsm: remove WAL after direct flush", "path", mem.walPath, "err", err)
-	}
+	l.releaseWALSegment(mem.walPath)
 	return nil
 }
 
 // ---- Helpers ---------------------------------------------------------------
 
-var walFileRE = regexp.MustCompile(`^wal-(\d+)\.log$`)
-
+// findWALFiles returns the live WAL segments in dataDir — the ones recovery must
+// replay — sorted by ascending sequence number, together with the highest
+// sequence number seen. Segments parked for replica catch-up live in a
+// subdirectory and are deliberately not returned: they have already been flushed
+// into an SSTable, so replaying them would re-apply committed writes.
+//
+// The filename format is owned by the wal package (wal.SegmentName /
+// wal.ParseSegmentSeq); this function must not restate it.
 func findWALFiles(dataDir string) (paths []string, maxSeq uint64, err error) {
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
@@ -1376,11 +1386,13 @@ func findWALFiles(dataDir string) (paths []string, maxSeq uint64, err error) {
 	var wals []walFile
 
 	for _, de := range entries {
-		m := walFileRE.FindStringSubmatch(de.Name())
-		if m == nil {
+		if de.IsDir() {
 			continue
 		}
-		seq, _ := strconv.ParseUint(m[1], 10, 64)
+		seq, ok := storewal.ParseSegmentSeq(de.Name())
+		if !ok {
+			continue
+		}
 		wals = append(wals, walFile{
 			path: filepath.Join(dataDir, de.Name()),
 			seq:  seq,
@@ -1398,13 +1410,20 @@ func findWALFiles(dataDir string) (paths []string, maxSeq uint64, err error) {
 }
 
 func wipeLSMDir(dataDir string) error {
+	// Parked WAL segments describe writes in the log being replaced, so a wipe
+	// must take them with it: a cursor into them would address entries that no
+	// longer belong to this store.
+	if err := purgeRetainedWALSegments(dataDir); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
 		return fmt.Errorf("lsm: read dir for wipe: %w", err)
 	}
 	for _, de := range entries {
 		name := de.Name()
-		if walFileRE.MatchString(name) ||
+		_, isWAL := storewal.ParseSegmentSeq(name)
+		if isWAL ||
 			len(name) > 4 && name[len(name)-4:] == ".sst" ||
 			name == "manifest.log" ||
 			name == "manifest.log.tmp" {

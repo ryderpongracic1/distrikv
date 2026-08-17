@@ -10,6 +10,7 @@ import (
 
 	"github.com/ryderpongracic1/distrikv/internal/metrics"
 	"github.com/ryderpongracic1/distrikv/internal/store/lsm"
+	storewal "github.com/ryderpongracic1/distrikv/internal/store/wal"
 )
 
 // ErrNotFound is returned by Get when the key does not exist or has been deleted.
@@ -114,3 +115,24 @@ func (s *Store) RestoreFromSnapshot(ctx context.Context, data map[string][]byte)
 func (s *Store) Close() error {
 	return s.engine.Close()
 }
+
+// ---------------------------------------------------------------------------
+// Replica catch-up (anti-entropy) surface
+// ---------------------------------------------------------------------------
+
+// WALTip returns the position one past the last entry durably appended to this
+// node's WAL. An anti-entropy pass reads up to it and no further.
+func (s *Store) WALTip() storewal.Position { return s.engine.WALTip() }
+
+// WALSegments returns every WAL segment an anti-entropy pass can read: the live
+// segments plus any retained past their flush.
+func (s *Store) WALSegments() ([]storewal.Segment, error) { return s.engine.WALSegments() }
+
+// RetainWALFrom asks the engine to keep WAL segments numbered at or above seq
+// even after they are flushed, so a lagging replica can still be caught up from
+// them. Passing 0 releases retention. Retention is bounded — see
+// lsm.LSMTree.RetainWALFrom.
+func (s *Store) RetainWALFrom(seq uint64) { s.engine.RetainWALFrom(seq) }
+
+// WALRetentionFloor reports the retention request currently in force.
+func (s *Store) WALRetentionFloor() uint64 { return s.engine.WALRetentionFloor() }

@@ -126,6 +126,15 @@ func (m *Memtable) IsFull() bool { return m.size.Load() >= m.maxSize }
 // SizeBytes returns the approximate byte count of live entries.
 func (m *Memtable) SizeBytes() int64 { return m.size.Load() }
 
+// WALSize returns the number of bytes durably appended to this memtable's WAL
+// segment. It is the offset half of the engine's WAL tip.
+func (m *Memtable) WALSize() int64 {
+	if m.w == nil {
+		return 0
+	}
+	return m.w.Size()
+}
+
 // Ascend calls fn for each entry in ascending key order, holding a read lock.
 func (m *Memtable) Ascend(fn func(e Entry) bool) {
 	m.mu.RLock()

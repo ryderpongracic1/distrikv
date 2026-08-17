@@ -40,6 +40,29 @@ type Metrics struct {
 	// ReplicationErrors counts failures when replicating a write to a replica.
 	ReplicationErrors atomic.Uint64
 
+	// --- Anti-entropy (replica catch-up) ------------------------------------
+
+	// AntiEntropyPasses counts completed catch-up passes over this node's WAL,
+	// successful or not. One recovery of one replica normally costs two: the
+	// pass that ships the missed writes and the pass that confirms there is
+	// nothing left to ship.
+	AntiEntropyPasses atomic.Uint64
+
+	// AntiEntropyEntriesSent counts individual mutations replayed from the WAL
+	// to a replica. It is the direct measure of how much divergence the
+	// refused-but-applied writes actually left behind.
+	AntiEntropyEntriesSent atomic.Uint64
+
+	// AntiEntropyPassErrors counts passes that ended early because a replica
+	// stopped accepting entries — the replica died mid-sync, or went away again.
+	AntiEntropyPassErrors atomic.Uint64
+
+	// AntiEntropyStaleCursors counts times a replica's cursor pointed into a WAL
+	// segment that had already been garbage-collected, so the catch-up could not
+	// cover the whole gap. A non-zero value means some keys may stay divergent
+	// until they are written again — the documented v1 bound.
+	AntiEntropyStaleCursors atomic.Uint64
+
 	// --- LSM engine counters (Phase 1 benchmark harness) -------------------
 
 	// BloomHits counts SSTable lookups where the Bloom filter returned true
@@ -121,6 +144,10 @@ func (m *Metrics) Snapshot() map[string]uint64 {
 		"leader_elections":         m.LeaderElections.Load(),
 		"forwarded_requests":       m.ForwardedRequests.Load(),
 		"replication_errors":       m.ReplicationErrors.Load(),
+		"anti_entropy_passes":      m.AntiEntropyPasses.Load(),
+		"anti_entropy_entries":     m.AntiEntropyEntriesSent.Load(),
+		"anti_entropy_errors":      m.AntiEntropyPassErrors.Load(),
+		"anti_entropy_stale":       m.AntiEntropyStaleCursors.Load(),
 		"bloom_hits":               m.BloomHits.Load(),
 		"bloom_misses":             m.BloomMisses.Load(),
 		"bloom_false_positives":    m.BloomFalsePositives.Load(),

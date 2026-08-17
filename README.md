@@ -72,7 +72,7 @@ optimisation, chaos testing, and operational hardening.
 | P3 | Leveled compaction strategy + write-stall backpressure | ✅ Done |
 | P4 | Deterministic fault injection & Jepsen-style linearizability verification | ✅ Done |
 | P5 | In-process sharded LRU block cache (64 MB default, configurable) | ✅ Done |
-| P6 | TBD | 🔲 Planned |
+| P6 | WAL-segment anti-entropy — replica catch-up from the primary's log, with a convergence gate in the chaos harness | ✅ Done |
 | P7 | TBD | 🔲 Planned |
 
 ---
@@ -206,11 +206,17 @@ replication is attempted the mutation is already durable on the primary
 (WAL-fsynced, then applied to the memtable), so a failed fan-out leaves the
 primary **ahead of** the replicas that did not ACK: the client sees a 5xx for a
 write that is in fact present on the primary and that subsequent reads will
-return. The divergence persists until the next successful write for that key
-converges the replica set — there is no anti-entropy, hinted handoff, or read
-repair. Closing that hole properly means either two-phase commit across the
-replica set or routing data writes through the Raft log; both are out of scope
-for the current design (see "Intentional deviations from the paper" above).
+return.
+
+That divergence is now repaired after the fact. **Anti-entropy** replays the
+missed writes from the primary's own WAL once the replica is reachable and stable
+again — see "Anti-entropy: replica catch-up" below for the design, the
+convergence guarantee it does and does not make, and the chaos-harness gate that
+measures it. What has *not* changed is the write path: a write during a fault
+still returns 503, because making it succeed would need either two-phase commit
+across the replica set or routing data writes through the Raft log, both of which
+remain out of scope (see "Intentional deviations from the paper" above). Read
+repair and hinted handoff are still absent.
 
 This is not a theoretical caveat: it is what the first real fault-injection runs
 detected. The linearizability checker rejected both a SIGKILL and a SIGTERM run
@@ -229,6 +235,166 @@ Three smaller guarantees, stated because they are load-bearing:
 - **A single-node deployment still works.** With no other node in the replica
   set (one node, or R=1) the fan-out has no targets and the write completes
   local-only.
+
+---
+
+### Anti-entropy: replica catch-up (`internal/store/wal`, `cmd/node/antientropy.go`)
+
+Every fault window leaves the ring-primary ahead of its replicas, because a write
+whose replica does not ACK is refused to the client and kept locally anyway. The
+chaos harness has always counted those writes — the last kill-restart run measured
+**48,283 refused-but-applied** keys — and nothing converged them afterwards. A
+replica that had been down stayed wrong for every key it missed until that key
+happened to be written again.
+
+Anti-entropy closes that gap after the fact, from the log the primary already
+keeps.
+
+**What it does not change.** The CP write path is untouched: a write during a
+fault still returns 503, and no code here ever makes one succeed. The hash ring
+remains the only authority on key placement — Raft contributes a liveness signal
+and nothing else. And there is no second replication log: the primary's WAL *is*
+the record of what a replica missed.
+
+#### The cursor
+
+Each replica has a **high-water mark**: the WAL position through which it is known
+caught up, addressed as `(segment, byte offset)`. Segment numbers only increase and
+each segment is append-only, so that pair orders exactly as the engine wrote the
+entries. Cursors are persisted to `replica-cursors.json` (atomic temp-file rename,
+directory fsync), so a primary that restarts still knows which replicas it is
+ahead of — that seeding is what makes a restart trigger repair even though no
+health transition is coming to announce it.
+
+Cursors advance two ways:
+
+- **At the end of a pass**, past each entry the replica ACKs.
+- **Over a fault-free window**, on a cluster that is simply working. A tip is
+  captured, and adopted once it is older than `CursorHoldback` (2× the replication
+  deadline) *provided no replication to that replica failed in the meantime*.
+  Because the holdback exceeds the replication deadline, every write appended
+  before that tip has necessarily resolved by the time it is adopted, so "no
+  failures since" really does mean "everything before this reached the replica".
+  Without this, a node that never suffers a fault never advances a cursor, and WAL
+  retention would pin every segment since startup — the happy path has to make
+  progress too, and it has to do so without the write path paying for per-write
+  bookkeeping.
+
+#### The trigger
+
+A catch-up runs when a replica transitions **unreachable → healthy**, gated on
+`DefaultStableChecks` = 3 consecutive healthy observations. A node that has just
+restarted accepts connections before it is useful (WAL to replay, compaction
+backlog to arm), and a flapping peer would otherwise trigger a pass per flap.
+
+Health merges three signals, because no single one is enough:
+
+| Signal | Available on | Detects |
+|---|---|---|
+| Raft heartbeat outcomes | the leader only | failure and recovery, most directly |
+| Replication RPC outcomes | every ring-primary | failure |
+| gRPC channel state probe | every node | recovery |
+
+The heartbeat signal is the one the design called for and is wired in
+(`raft.SetPeerHealthObserver`), but only the Raft leader sends heartbeats — and in
+distrikv ring ownership is deliberately unrelated to Raft leadership, so a
+follower that is nonetheless a ring-primary would learn nothing from it. The
+probe is what lets that node notice its replica came *back*: during a fault,
+writes to the replica are being refused, so the write path produces no successes
+to count.
+
+Two things also schedule a pass: a replica still marked behind is retried every
+`RetryInterval` (5 s), and a durable cursor behind the tip at startup queues one
+immediately.
+
+#### A pass
+
+1. Read the WAL forward from the cursor to the tip observed when the pass started.
+   The tip is a pin, so concurrent writes cannot chase a pass forward indefinitely.
+2. Keep only entries that are this replica's business: keys where **this node is
+   the ring-primary** and the target is in the replica set. The primary check
+   matters because a node's WAL also holds writes it accepted *as* a replica for
+   keys owned elsewhere; replaying those would have it speak for a range it does
+   not own. This is a catch-up of one key range, not a shipment of the log.
+3. **Deduplicate by key, newest wins.** A replica is not a client — reads are
+   served by the ring-primary — so only the final value per key matters. Pass cost
+   becomes proportional to the *distinct keys* written during the fault rather than
+   to the write count: in the measured run, 20 entries instead of 48,283.
+4. Send each surviving entry with the ordinary `Replicate` RPC, in ascending WAL
+   position order, advancing the cursor past each ACK. A replica that dies mid-pass
+   is resumed from exactly where it stopped.
+5. Repeat after a settle delay until a pass ships nothing, which is what proves
+   there is nothing left.
+
+Entries are sent in position order deliberately: the cursor is monotonic, so
+sending a lower position after a higher one would silently drop the lower entry's
+progress. Skipping a superseded entry is safe for the same reason — its
+replacement always lies at a higher position, so it is still ahead of the cursor.
+
+**Why the existing `Replicate` RPC and not a new streaming one.** A per-entry ACK
+gives exact resume-on-failure, which a batch ACK cannot, and deduplication already
+bounds the entry count by the keyspace rather than the write count — so the
+round-trip count a stream would save is small in the case that matters. It also
+needs no regeneration of the protobufs, whose current generated files this
+workspace cannot reproduce byte-for-byte. A `SyncEntries` stream is the right
+optimisation once a pass routinely ships tens of thousands of distinct keys; it is
+noted as future work rather than pretended away.
+
+#### WAL retention
+
+A cursor is only useful while the segment it points into still exists, but the
+engine deletes a segment as soon as its memtable is flushed. Segments at or above
+the retention floor (the oldest position any cursor holds) are therefore **parked**
+in `wal-retained/` instead of deleted.
+
+Parking rather than leaving them in place is the load-bearing detail: recovery
+replays every `wal-NNNN.log` in the data directory, so a flushed segment left
+there would be replayed on the next open — re-applying writes already in an
+SSTable and double-counting them in the live-key estimate the manifest carries.
+One directory down, the segment stays readable by the catch-up reader and invisible
+to recovery, with no new bookkeeping to keep in sync.
+
+Retention is bounded at `maxRetainedWALSegments` = 128. A replica that is gone for
+good must not turn into unbounded disk growth, so past the cap the oldest parked
+segments are dropped with a warning.
+
+#### What is guaranteed, and what is not
+
+**Guaranteed: convergence once writes quiesce.** A repair cycle keeps passing until
+a pass finds nothing to ship, so the final pass in a quiet cluster sees a settled
+log and leaves every affected key equal on primary and replica. That is the
+property `--check-convergence` measures.
+
+**Not guaranteed: convergence under continuous write load.** Live replication is
+deliberately *not* blocked during a pass, so a live RPC for a write inside the
+pass's range can land at the replica after the pass has already shipped a newer
+value for that key, leaving that key stale. The race needs two client-concurrent
+writes to the same key straddling the pass, and it self-corrects the next time the
+key is written. Blocking replication to a recovering replica for the duration of a
+pass would close it — at the cost of refusing writes to a replica that has just
+come back, trading a rare stale key for guaranteed unavailability. That trade was
+declined.
+
+**Bounded recovery.** If a cursor points into a segment that has already been
+collected, the gap cannot be closed from the log. The pass says so
+(`wal.ErrCursorStale`, counted as `anti_entropy_stale`), then catches up from the
+oldest surviving segment — which converges every key written since, and leaves any
+key whose *only* write fell in the lost range divergent until it is written again.
+A full keyspace scan to repair that is deliberately out of scope for v1.
+
+#### Observability
+
+`/metrics` gains `anti_entropy_passes`, `anti_entropy_entries`,
+`anti_entropy_errors` and `anti_entropy_stale`. Node logs carry
+`catch-up scheduled`, `catch-up pass shipped missed writes`, `replica caught up`
+and `replica cursor is older than the retained WAL`.
+
+`GET /keys/{key}?local=true` answers from the node's own store without
+forwarding. It is the only way to ask a *replica* what it holds — a plain GET on a
+non-owning node forwards to the ring-primary and would report the primary's value
+from every node, making a divergent replica indistinguishable from a converged
+one. It exposes no data an ordinary GET could not already reach, but like the rest
+of this API it is unauthenticated and assumes a trusted cluster network.
 
 ---
 
@@ -776,6 +942,43 @@ reported as `heal error` on the window.
 | `--nemesis-interval` | `10s` | Delay between the end of one outage and the start of the next |
 | `--nemesis-downtime` | `5s` | How long a victim stays down |
 | `--nemesis-compose-file` | `docker/docker-compose.yml` | Compose file the nemesis operates on |
+| `--peers` | *(empty)* | Every **other** node's client HTTP address, comma-separated. Required by the convergence gate |
+| `--check-convergence` | `true` | After the run, assert every replica agrees on every key. Only applies when a nemesis is enabled |
+| `--convergence-grace` | `30s` | How long to keep re-checking before declaring the replicas divergent |
+| `--replicas` | `2` | Replication factor R, so the check asks the same question of the ring that the nodes do |
+
+*Convergence gate.* A legal history is not the whole story. Linearizability is
+judged on what clients observed **through the ring-primary**, so a replica that is
+missing everything written during a fault window is invisible to it by
+construction — and that divergence is exactly what a refused-but-applied write
+leaves behind. After the nemesis heals, the runner reads every measured key from
+every node the ring says should hold it (`?local=true`, so each node answers from
+its own store) and asserts they all agree:
+
+```bash
+go run ./cmd/chaos \
+  --target             localhost:8001 \
+  --peers              localhost:8002,localhost:8003 \
+  --duration           60s --warmup 5s --workers 8 \
+  --keyspace           20 --put 50 --delete 5 \
+  --nemesis            kill-restart \
+  --nemesis-services   node2,node3 \
+  --nemesis-interval   10s --nemesis-downtime 5s \
+  --check-convergence  --convergence-grace 30s
+```
+
+```
+  refused-but-applied:     48283
+  converged:               true (after 1.4s, 20 keys × 40 node reads)
+```
+
+The check re-reads on a 500 ms poll until every replica agrees or the grace window
+expires, so the reported elapsed time is the observed time-to-converge. Three
+outcomes are deliberately distinct: **converged**, **divergent** (the replicas were
+read and they disagree — exit 1, with the first few disagreeing keys printed and a
+note pointing at the primaries' catch-up logs), and **skipped/unverified** (no
+`--peers`, or a node could not be read at all — never reported as a pass, because
+a node that cannot be asked cannot be shown to have converged).
 
 `kill-restart` runs `docker compose kill` (SIGKILL) — a real crash, no graceful
 drain, recovery driven entirely by what reached disk. `stop-restart` runs

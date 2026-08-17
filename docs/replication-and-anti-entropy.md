@@ -275,14 +275,14 @@ compare against for any key that has been flushed and would apply such a write
 unconditionally, reinstating the inversion for most of the keyspace over a run.
 The lookup is Bloom-filtered, so the common absent-key case costs no disk read, and
 it is paid on a path that already serialises on the engine write lock behind a WAL
-fsync. **That was an argument about where the cost falls; it is now a measurement,
-and the comparison is acquitted** (2026-08-17, Apple M4 Pro, 3-node Colima
-cluster — [benchmarks.md → Post-H2 re-measurement](benchmarks.md#post-h2-re-measurement-2026-08-17-same-cluster-and-method)):
+fsync. **That was an argument about where the cost falls; it is now measured, and
+the measurement shows no evidence of a regression** (2026-08-17 and 08-18, Apple M4
+Pro, 3-node Colima cluster, fresh cluster and prefill per run — [benchmarks.md → Post-H2 re-measurement](benchmarks.md#post-h2-re-measurement-2026-08-17-same-cluster-and-method)):
 
 | Configuration | Post-H2 | Pre-H2 | Reading |
 | --- | --- | --- | --- |
 | Memtable-resident writes (1,200 qps, Zipf, 100k keys) | p99 **3.8 ms**, p999 8.1 ms | p99 4.6 ms, p999 13.6 ms (08-16 baseline) | No regression; the improvement is within run variance |
-| Flushed-key writes (1,200 qps, Zipf over a 500k prefill) | p99 **40.5 ms**, p999 114.9 ms | p99 53.9 ms, p999 130.6 ms (control at `47958bb`) | The tail is *worse* before the change — it is pre-existing LSM write-load behaviour, not this comparison |
+| Flushed-key writes (1,200 qps, Zipf over a 500k prefill) | p99 **40.5 ms** / **34.8 ms** unsaturated | p99 53.9 ms unsaturated (control at `47958bb`) | No evidence of regression, and no ranking. Across n=3 per build, 5 of 6 runs tripped the saturation flag (~1.2 s p99 of *queue wait*, not service latency) on both builds alike, so no per-build p99 comparison is drawn from the series; the reading is that 1,200 qps against a flushed 500k store is at or above the cluster's capacity knee. Neither the three unsaturated latencies nor the saturation behaviour separates the builds |
 
 The second row is the discriminating one, because the memtable-resident workload
 barely exercises the path that was flagged: with zero flushes there is nothing to
@@ -291,14 +291,20 @@ forces the overwrite-of-a-flushed-key case, and the engine counters confirm the
 comparison really did execute — the post-H2 run shows live Bloom traffic (5,917
 hits / 7,460 misses) and block-cache activity (22.9% hit rate over 23,273 misses),
 while the pre-H2 control shows `bloom_hits=0` and no cache activity at all, because
-a pre-H2 replica write is blind. The instrumentation therefore establishes both
-halves independently: the read happens, and it costs nothing measurable at this
-load.
+a pre-H2 replica write is blind. That is the strongest of the three directions, and
+it is independent of the latency numbers: the read demonstrably happens in one build
+and demonstrably does not in the other, so the comparison is certainly executing in
+the build the latency runs measured. A stable per-build latency comparison would
+need a lower offered load — ≈800 qps is the proposed starting point — to keep every
+run clear of saturation; that is recorded as the next measurement rather than a
+result.
 
-One open observation, offered as a direction rather than a claim: both builds' p99
-on the flushed-key workload lands near the 50 ms soft-stall sleep cap, and a
-compaction ran during the post-H2 measurement. Whoever chases that pre-existing
-tail should start there rather than at the comparison.
+One open observation, offered as a direction rather than a claim: the *unsaturated*
+runs' p99 lands near the 50 ms soft-stall sleep cap on both builds, and a compaction
+ran during the 08-17 post-H2 measurement. Whoever chases that pre-existing tail
+should start at the stall path rather than at the comparison — and should do it
+below the capacity knee, since above it the tail is queue wait and says nothing
+about the store.
 
 **A reachable trigger the per-primary sequence did not survive: a primary that
 comes back without its data directory (fixed by an incarnation epoch).** The
@@ -399,12 +405,48 @@ replica discards — and reports, which is the part that was missing:
 | Observable | Meaning |
 | --- | --- |
 | `replica_writes_discarded` | Every apply-if-newer refusal, puts and deletes alike. A trickle is the mechanism working (suppressed inversions, plus re-shipped catch-up entries a replica already had — which is *why* a pass is idempotent). A rate close to the incoming write rate is the alarming reading: this node's stored sequences sit above everything its primary is sending |
-| `replica_writes_epoch_regressed` | The subset where the arriving epoch was below the stored one. Not an inversion; three causes, which one RPC cannot tell apart — a sender that lost its state and could not be carried forward by its clock, a genuinely stale in-flight write from the sender's previous incarnation, and a **rolling upgrade**, where an un-upgraded peer's bare-counter sequence reads as epoch 0 against a replica's epoch-stamped version. The third is expected and bounded by the upgrade window; the first two are not |
+| `replica_writes_epoch_regressed` | The subset where the arriving epoch was below the stored one **and the mutation arrived on the live replication path**. Not an inversion; three causes, which one RPC cannot tell apart — a sender that lost its state and could not be carried forward by its clock, a genuinely stale in-flight write from the sender's previous incarnation, and a **rolling upgrade**, where an un-upgraded peer's bare-counter sequence reads as epoch 0 against a replica's epoch-stamped version. The third is expected and bounded by the upgrade window; the first two are not |
 | `replica_epoch_regressed` | 0/1 latched gauge, set by the first such discard. It latches because nothing in v1 reconciles a primary that lost history, and because the value of the signal is that it survives until someone reads it |
 
 The first regressed discard also logs at `ERROR` with both epochs and both
 sequences; subsequent ones are carried by the counter rather than repeating the log
 once per write.
+
+**The fourth cause, and why it is excluded rather than reported.** There is one
+more way an arriving epoch lands below the stored one, it needs no clock anomaly at
+all, and it is entirely benign: a catch-up pass re-shipping an entry written by an
+earlier incarnation of the primary. Every step of it is ordinary — the primary
+writes a key while a replica is down (refused to the client, kept locally, cursor
+frozen before that entry); the primary restarts, so its next incarnation is higher;
+the replica returns and a pass pins its range at the WAL tip it reads on entry, and
+collects the pre-restart entry; a client then writes the same key again and live
+replication lands the post-restart version at the replica *first* — past the pinned
+range, so the pass's dedup never sees it and the pass ships the older entry anyway.
+The replica refuses it, correctly, and both nodes hold the right value afterwards.
+
+A receiver that cannot tell that refusal from a live one counts an epoch
+regression, latches a gauge that never clears and logs at `ERROR` — on a healthy
+cluster doing a routine restart. So `ReplicateRequest.replay` marks a mutation as
+one a pass re-shipped: the discard is still counted, and the epoch classification
+is not applied (the refusal is reported at `Debug` with both epochs). The marker
+changes nothing about whether the mutation is applied — the sequence comparison
+decides that identically either way.
+
+Two consequences worth stating plainly:
+
+- **The alarm's coverage is now scoped to live writes, which is where it belongs.**
+  A primary that lost its state does not only replay; it serves clients, and those
+  writes arrive on the live path with the full classification intact. Losing the
+  replay path costs a duplicate signal about the same primary, not the signal.
+- **The marker is one bit of trust in a peer.** A buggy or hostile sender that
+  marked everything as a replay could suppress the classification — it could not
+  suppress `replica_writes_discarded`, whose rate is the reading that matters when a
+  primary's every write is being dropped, and it could not make a wiped primary's
+  live writes look like replays without also giving up having them applied. An
+  un-upgraded peer sends the field absent, which reads as live, so it keeps the
+  previous behaviour — including the false report a replay of *its* own can still
+  produce. That is bounded by the upgrade window and is the conservative direction:
+  over-reporting rather than silence.
 
 Two residuals are worth naming rather than leaving to be discovered. The epoch is
 only as good as its granularity, so a wipe that reopens inside the same millisecond

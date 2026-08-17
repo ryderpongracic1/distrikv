@@ -44,7 +44,7 @@ The deep material lives in [`docs/`](docs/). Start wherever the question is.
 | [raft.md](docs/raft.md) | Raft's honest scope: leader election and heartbeats. Log replication is a stub, and the §5.3 gaps are named |
 | [chaos-harness.md](docs/chaos-harness.md) | The Porcupine model, the nemesis, the convergence gate, the counterexample output, and every measured run |
 | [benchmarks.md](docs/benchmarks.md) | Every table, including the etcd ceiling comparison with its durability confound stated rather than corrected |
-| [defect-log.md](docs/defect-log.md) | **Twelve real defects**, numbered, with the evidence that exposed each one |
+| [defect-log.md](docs/defect-log.md) | **Thirteen real defects**, numbered, with the evidence that exposed each one |
 | [api-and-cli.md](docs/api-and-cli.md) | The HTTP REST surface and `distrikv-cli` |
 | [development.md](docs/development.md) | Running the tests, repository layout, code-quality conventions |
 | [MIGRATION.md](MIGRATION.md) | v1 → v2 data migration |

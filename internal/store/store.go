@@ -103,9 +103,22 @@ func (s *Store) Put(ctx context.Context, key string, value []byte) (uint64, erro
 // key from disagreeing when concurrent writes reach them in different orders;
 // see lsm.LSMTree.PutIfNewer for why arrival order is not enough and why a seq
 // of 0 applies unconditionally.
+//
+// This is the live path. A mutation delivered by an anti-entropy catch-up pass
+// goes through ReplayPutIfNewer.
 func (s *Store) PutIfNewer(ctx context.Context, key string, value []byte, seq uint64) (bool, error) {
 	s.putCount.Add(1)
 	return s.engine.PutIfNewer(ctx, key, value, seq)
+}
+
+// ReplayPutIfNewer is PutIfNewer for a write an anti-entropy catch-up pass
+// re-shipped out of the primary's WAL. It applies identically and differs only in
+// how a refusal is classified — a pass may legitimately deliver an entry from an
+// earlier incarnation of the primary, which is not an epoch regression. See
+// lsm.LSMTree.ReplayPutIfNewer.
+func (s *Store) ReplayPutIfNewer(ctx context.Context, key string, value []byte, seq uint64) (bool, error) {
+	s.putCount.Add(1)
+	return s.engine.ReplayPutIfNewer(ctx, key, value, seq)
 }
 
 // Delete removes key by writing a tombstone, and returns the sequence number
@@ -131,6 +144,13 @@ func (s *Store) Delete(ctx context.Context, key string) (uint64, error) {
 func (s *Store) DeleteIfNewer(ctx context.Context, key string, seq uint64) (bool, error) {
 	s.delCount.Add(1)
 	return s.engine.DeleteIfNewer(ctx, key, seq)
+}
+
+// ReplayDeleteIfNewer is DeleteIfNewer for a tombstone an anti-entropy catch-up
+// pass re-shipped out of the primary's WAL. See ReplayPutIfNewer.
+func (s *Store) ReplayDeleteIfNewer(ctx context.Context, key string, seq uint64) (bool, error) {
+	s.delCount.Add(1)
+	return s.engine.ReplayDeleteIfNewer(ctx, key, seq)
 }
 
 // KeyCount returns the approximate number of live keys.

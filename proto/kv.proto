@@ -67,6 +67,24 @@ message ReplicateRequest {
   // Zero means "no sequence assigned" and is applied unconditionally, so a
   // sender that predates this field still replicates correctly.
   uint64 seq   = 5;
+
+  // replay marks this mutation as one an anti-entropy catch-up pass re-shipped
+  // out of the primary's WAL, rather than one the primary is replicating as it
+  // serves a client's write.
+  //
+  // It changes nothing about whether the replica applies the mutation — the seq
+  // comparison decides that either way. What it changes is how the replica
+  // classifies a *refusal*. A pass covers a range of the log pinned when the pass
+  // started, so it can legitimately ship an entry written by an earlier
+  // incarnation of the primary, and a newer live write for the same key can
+  // already be on the replica. That refusal is the mechanism working, not a
+  // primary whose incarnation went backwards, and a receiver that cannot tell
+  // them apart raises the epoch-regression alarm on a routine restart.
+  //
+  // Absent (false) means "live", which is what a sender predating this field
+  // sends and what keeps the alarm's coverage where it matters: a primary that
+  // lost its state is discovered through the writes it is serving now.
+  bool replay  = 6;
 }
 
 message ReplicateResponse {

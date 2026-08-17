@@ -890,6 +890,15 @@ func (ae *antiEntropy) runPass(ctx context.Context, nodeID string, from, limit s
 			// arrival-order behaviour this replaces, and it only affects segments
 			// already on disk at upgrade time.
 			Seq: e.Seq,
+			// This is a replay, and saying so is what keeps the receiver's
+			// epoch-regression alarm meaningful. The range above was pinned when
+			// this pass started, so an entry in it can predate a restart of this
+			// node while the replica already holds a post-restart version of the
+			// same key — delivered live, past the pinned range. The replica is
+			// right to refuse it, and refusing it is not evidence that any
+			// incarnation went backwards, which is what the receiver would
+			// otherwise record.
+			Replay: true,
 		})
 		cancel()
 		if err != nil {

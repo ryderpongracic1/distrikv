@@ -423,7 +423,7 @@ func TestApplyReplicaWritesLocallyWithoutFanOut(t *testing.T) {
 	n, peers := testNode(t, 3, "node2", "node3")
 	ctx := context.Background()
 
-	if err := n.ApplyReplica(ctx, server.OpPut, "alpha", []byte("one"), 0); err != nil {
+	if err := n.ApplyReplica(ctx, server.OpPut, "alpha", []byte("one"), 0, false); err != nil {
 		t.Fatalf("ApplyReplica put: %v", err)
 	}
 	got, err := n.store.Get(ctx, "alpha")
@@ -431,7 +431,7 @@ func TestApplyReplicaWritesLocallyWithoutFanOut(t *testing.T) {
 		t.Fatalf("store after ApplyReplica put = (%q, %v), want (\"one\", nil)", got, err)
 	}
 
-	if err := n.ApplyReplica(ctx, server.OpDelete, "alpha", nil, 0); err != nil {
+	if err := n.ApplyReplica(ctx, server.OpDelete, "alpha", nil, 0, false); err != nil {
 		t.Fatalf("ApplyReplica delete: %v", err)
 	}
 	if _, err := n.store.Get(ctx, "alpha"); !errors.Is(err, store.ErrNotFound) {
@@ -451,7 +451,7 @@ func TestApplyReplicaWritesLocallyWithoutFanOut(t *testing.T) {
 func TestApplyReplicaDeleteIsIdempotent(t *testing.T) {
 	n, _ := testNode(t, 2)
 
-	if err := n.ApplyReplica(context.Background(), server.OpDelete, "never-written", nil, 0); err != nil {
+	if err := n.ApplyReplica(context.Background(), server.OpDelete, "never-written", nil, 0, false); err != nil {
 		t.Fatalf("ApplyReplica delete of absent key = %v, want nil", err)
 	}
 }
@@ -459,7 +459,7 @@ func TestApplyReplicaDeleteIsIdempotent(t *testing.T) {
 func TestApplyReplicaUnknownOp(t *testing.T) {
 	n, _ := testNode(t, 2)
 
-	if err := n.ApplyReplica(context.Background(), "upsert", "alpha", []byte("one"), 0); err == nil {
+	if err := n.ApplyReplica(context.Background(), "upsert", "alpha", []byte("one"), 0, false); err == nil {
 		t.Fatal("ApplyReplica with unknown op = nil, want an error")
 	}
 }

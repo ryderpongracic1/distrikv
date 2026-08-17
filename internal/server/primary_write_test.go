@@ -24,10 +24,11 @@ import (
 
 // replCall records one call observed by fakeReplicator.
 type replCall struct {
-	Op    string
-	Key   string
-	Value []byte
-	Seq   uint64
+	Op     string
+	Key    string
+	Value  []byte
+	Seq    uint64
+	Replay bool
 }
 
 // fakeReplicator stands in for cmd/node.Node as the ReplicationManager. It
@@ -47,9 +48,9 @@ func (f *fakeReplicator) ReplicateWrite(_ context.Context, op, key string, value
 	return f.writeErr
 }
 
-func (f *fakeReplicator) ApplyReplica(_ context.Context, op, key string, value []byte, seq uint64) error {
+func (f *fakeReplicator) ApplyReplica(_ context.Context, op, key string, value []byte, seq uint64, replay bool) error {
 	f.mu.Lock()
-	f.applies = append(f.applies, replCall{Op: op, Key: key, Value: value, Seq: seq})
+	f.applies = append(f.applies, replCall{Op: op, Key: key, Value: value, Seq: seq, Replay: replay})
 	f.mu.Unlock()
 	return nil
 }

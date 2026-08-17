@@ -148,7 +148,24 @@ type ReplicateRequest struct {
 	//
 	// Zero means "no sequence assigned" and is applied unconditionally, so a
 	// sender that predates this field still replicates correctly.
-	Seq           uint64 `protobuf:"varint,5,opt,name=seq,proto3" json:"seq,omitempty"`
+	Seq uint64 `protobuf:"varint,5,opt,name=seq,proto3" json:"seq,omitempty"`
+	// replay marks this mutation as one an anti-entropy catch-up pass re-shipped
+	// out of the primary's WAL, rather than one the primary is replicating as it
+	// serves a client's write.
+	//
+	// It changes nothing about whether the replica applies the mutation — the seq
+	// comparison decides that either way. What it changes is how the replica
+	// classifies a *refusal*. A pass covers a range of the log pinned when the pass
+	// started, so it can legitimately ship an entry written by an earlier
+	// incarnation of the primary, and a newer live write for the same key can
+	// already be on the replica. That refusal is the mechanism working, not a
+	// primary whose incarnation went backwards, and a receiver that cannot tell
+	// them apart raises the epoch-regression alarm on a routine restart.
+	//
+	// Absent (false) means "live", which is what a sender predating this field
+	// sends and what keeps the alarm's coverage where it matters: a primary that
+	// lost its state is discovered through the writes it is serving now.
+	Replay        bool `protobuf:"varint,6,opt,name=replay,proto3" json:"replay,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -216,6 +233,13 @@ func (x *ReplicateRequest) GetSeq() uint64 {
 		return x.Seq
 	}
 	return 0
+}
+
+func (x *ReplicateRequest) GetReplay() bool {
+	if x != nil {
+		return x.Replay
+	}
+	return false
 }
 
 type ReplicateResponse struct {
@@ -863,13 +887,14 @@ const file_kv_proto_rawDesc = "" +
 	"\x12ForwardKeyResponse\x12\x1f\n" +
 	"\vstatus_code\x18\x01 \x01(\x05R\n" +
 	"statusCode\x12\x12\n" +
-	"\x04body\x18\x02 \x01(\fR\x04body\"p\n" +
+	"\x04body\x18\x02 \x01(\fR\x04body\"\x88\x01\n" +
 	"\x10ReplicateRequest\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x12\x12\n" +
 	"\x04term\x18\x04 \x01(\x04R\x04term\x12\x10\n" +
-	"\x03seq\x18\x05 \x01(\x04R\x03seq\"F\n" +
+	"\x03seq\x18\x05 \x01(\x04R\x03seq\x12\x16\n" +
+	"\x06replay\x18\x06 \x01(\bR\x06replay\"F\n" +
 	"\x11ReplicateResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\"\x95\x01\n" +

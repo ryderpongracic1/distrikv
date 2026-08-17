@@ -620,6 +620,22 @@ func (l *LSMTree) putInternal(_ context.Context, key string, value []byte) (uint
 	return seq, nil
 }
 
+// writeOrigin says how a replicated mutation reached this engine. It has no
+// bearing on whether the mutation is applied — the sequence comparison decides
+// that, identically either way — and exists only so that a refusal can be
+// classified correctly. See noteDiscard.
+type writeOrigin uint8
+
+const (
+	// originLive is a mutation its ring-primary replicated while serving a
+	// client's write.
+	originLive writeOrigin = iota
+
+	// originReplay is a mutation an anti-entropy catch-up pass re-shipped out of
+	// the primary's WAL.
+	originReplay
+)
+
 // PutIfNewer writes key=value stamped with seq, but only if this engine does not
 // already hold a version of key at seq or above. applied reports whether the
 // write was taken.
@@ -652,7 +668,27 @@ func (l *LSMTree) putInternal(_ context.Context, key string, value []byte) (uint
 // A refusal is not silent: see noteDiscard for what is counted, and why a
 // refusal whose epoch has gone backwards is counted separately from an ordinary
 // suppressed inversion.
+//
+// This is the live replication path. A mutation an anti-entropy pass re-shipped
+// out of the primary's WAL goes through ReplayPutIfNewer instead, which applies
+// identically and classifies a refusal differently.
 func (l *LSMTree) PutIfNewer(ctx context.Context, key string, value []byte, seq uint64) (applied bool, err error) {
+	return l.putIfNewer(ctx, key, value, seq, originLive)
+}
+
+// ReplayPutIfNewer is PutIfNewer for a mutation an anti-entropy catch-up pass
+// re-shipped out of the primary's WAL. Whether the write is taken is decided
+// exactly as PutIfNewer decides it; the difference is only in how a refusal is
+// classified, and it is a separate method rather than a flag so that no existing
+// caller can suppress that classification by accident and so the one caller that
+// does is named. See noteDiscard.
+func (l *LSMTree) ReplayPutIfNewer(ctx context.Context, key string, value []byte, seq uint64) (applied bool, err error) {
+	return l.putIfNewer(ctx, key, value, seq, originReplay)
+}
+
+func (l *LSMTree) putIfNewer(
+	ctx context.Context, key string, value []byte, seq uint64, origin writeOrigin,
+) (applied bool, err error) {
 	if seq == 0 {
 		if _, err := l.Put(ctx, key, value); err != nil {
 			return false, err
@@ -666,7 +702,7 @@ func (l *LSMTree) PutIfNewer(ctx context.Context, key string, value []byte, seq 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	newer, err := l.isNewerLocked(key, seq)
+	newer, err := l.isNewerLocked(key, seq, origin)
 	if err != nil || !newer {
 		return false, err
 	}
@@ -719,7 +755,21 @@ func (l *LSMTree) deleteInternal(_ context.Context, key string) (uint64, error) 
 // A tombstone is ordered exactly like a value, which is what makes a delete and
 // a put racing on one key resolve the same way on every replica: the higher
 // sequence wins regardless of which arrived last.
+//
+// This is the live replication path; see ReplayDeleteIfNewer for the catch-up one.
 func (l *LSMTree) DeleteIfNewer(ctx context.Context, key string, seq uint64) (applied bool, err error) {
+	return l.deleteIfNewer(ctx, key, seq, originLive)
+}
+
+// ReplayDeleteIfNewer is DeleteIfNewer for a tombstone an anti-entropy catch-up
+// pass re-shipped out of the primary's WAL. See ReplayPutIfNewer.
+func (l *LSMTree) ReplayDeleteIfNewer(ctx context.Context, key string, seq uint64) (applied bool, err error) {
+	return l.deleteIfNewer(ctx, key, seq, originReplay)
+}
+
+func (l *LSMTree) deleteIfNewer(
+	ctx context.Context, key string, seq uint64, origin writeOrigin,
+) (applied bool, err error) {
 	if seq == 0 {
 		if _, err := l.Delete(ctx, key); err != nil {
 			return false, err
@@ -733,7 +783,7 @@ func (l *LSMTree) DeleteIfNewer(ctx context.Context, key string, seq uint64) (ap
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	newer, err := l.isNewerLocked(key, seq)
+	newer, err := l.isNewerLocked(key, seq, origin)
 	if err != nil || !newer {
 		return false, err
 	}
@@ -763,8 +813,9 @@ func (l *LSMTree) DeleteIfNewer(ctx context.Context, key string, seq uint64) (ap
 // The comparison is on the whole sequence, which compares (epoch, counter)
 // lexicographically for free — so nothing here has to know about the split. What
 // the split buys is the classification of a *refusal*: noteDiscard separates a
-// suppressed inversion from a sender whose epoch has gone backwards.
-func (l *LSMTree) isNewerLocked(key string, seq uint64) (bool, error) {
+// suppressed inversion from a sender whose epoch has gone backwards, and origin
+// is what tells it which of those a lower epoch actually means.
+func (l *LSMTree) isNewerLocked(key string, seq uint64, origin writeOrigin) (bool, error) {
 	stored, found, err := l.storedSeqLocked(key)
 	if err != nil {
 		return false, err
@@ -775,7 +826,7 @@ func (l *LSMTree) isNewerLocked(key string, seq uint64) (bool, error) {
 	if seq > stored {
 		return true, nil
 	}
-	l.noteDiscard(key, seq, stored)
+	l.noteDiscard(key, seq, stored, origin)
 	return false, nil
 }
 
@@ -801,11 +852,42 @@ func (l *LSMTree) isNewerLocked(key string, seq uint64) (bool, error) {
 // stay silent: the pre-epoch behaviour ACKed such a write with nothing recorded
 // anywhere, so the client saw success while the replica kept a value the primary no
 // longer had.
-func (l *LSMTree) noteDiscard(key string, seq, stored uint64) {
+//
+// There is a fourth reading, and it is the reason origin exists: a catch-up pass
+// legitimately re-ships entries written by an earlier incarnation of the primary.
+// A pass covers a range of the log pinned when the pass started, so a live write
+// that lands after that point is outside the range — and if it reaches this replica
+// first, the pass then delivers a pre-restart entry for a key already holding a
+// post-restart version. The refusal is the mechanism working exactly as designed,
+// the data is right on both nodes, and no incarnation went backwards; only the
+// pass's own range boundary and a restart are involved. Counting that as a
+// regression would latch a gauge that never clears and log at ERROR on a routine
+// restart, so a replay's refusal is counted as a discard and reported at Debug
+// with both epochs, and nothing else.
+//
+// That scoping is what the alarm is worth keeping: a primary that lost its state
+// does not only replay, it serves clients, and those writes arrive on the live path
+// where the full classification still applies. A sender that marked every mutation
+// as a replay — buggy, or hostile — could suppress the alarm, which is the cost of
+// trusting one bit from a peer; it cannot suppress the discard count, and it cannot
+// make a wiped primary's live writes look like replays without also giving up
+// having them applied.
+func (l *LSMTree) noteDiscard(key string, seq, stored uint64, origin writeOrigin) {
 	if l.metrics != nil {
 		l.metrics.ReplicaWritesDiscarded.Add(1)
 	}
 	if seqEpoch(seq) >= seqEpoch(stored) {
+		return
+	}
+	if origin == originReplay {
+		l.logger.Debug("lsm: discarded a catch-up replay of an entry from an earlier "+
+			"incarnation of the sender; a newer version of this key is already stored, "+
+			"which is what the sequence comparison is for",
+			"key", key,
+			"arriving_epoch", seqEpoch(seq),
+			"stored_epoch", seqEpoch(stored),
+			"arriving_seq", seq,
+			"stored_seq", stored)
 		return
 	}
 	if l.metrics != nil {

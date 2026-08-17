@@ -1,6 +1,6 @@
 # Defect Log
 
-Twelve real defects, found and closed. Each one is recorded with the evidence that
+Thirteen real defects, found and closed. Each one is recorded with the evidence that
 exposed it rather than quietly fixed, because in most cases the *way* it surfaced
 is the more interesting half: the measurement infrastructure kept paying compound
 interest, and every fix made the next layer visible.
@@ -15,6 +15,7 @@ The pattern, stated once so the individual entries can be read quickly:
 - the **convergence gate** caught WAL segment reuse ([10](#defect-10-wal-segment-numbers-reused-across-a-graceful-restart))
 - and the **Porcupine checker**, within hours of that convergence noise being cleared out of its way, caught the sequence counter ([11](#defect-11-lsm-sequence-counter-reopened-at-zero))
 - and an **external read review** of that fix caught the case its seed could not cover — a store that comes back without its data directory ([12](#defect-12-a-primary-that-lost-its-data-directory-had-its-writes-discarded-and-acked))
+- and the **next review round** caught the benign trigger the new alarm had, which an in-process repro of the interleaving then confirmed ([13](#defect-13-a-catch-up-replay-after-a-restart-raised-the-epoch-regression-alarm))
 
 > **On the numbering.** These numbers are assigned here, in this document, for
 > reference. They are not a pre-existing scheme carried over from anywhere: before
@@ -28,8 +29,9 @@ The pattern, stated once so the individual entries can be read quickly:
 > [Smaller findings](#smaller-findings) rather than folded into the count, so the
 > headline number is not inflated by them.
 >
-> Defect 12 was added by a later review round. The earlier numbering was left
-> alone rather than renumbered, so links from other documents keep resolving.
+> Defect 12 was added by a later review round, and defect 13 by the round after
+> it. The earlier numbering was left alone rather than renumbered, so links from
+> other documents keep resolving.
 
 ---
 
@@ -493,9 +495,49 @@ wiped mid-test), `TestRestoreAdvancesTheIncarnationEpoch`,
 
 ---
 
+## Defect 13: A catch-up replay after a restart raised the epoch-regression alarm
+
+**Class:** the alarm, not the data · **Found by:** external read review of defect
+12's fix, confirmed by an in-process repro · **Narrated in:** [replication-and-anti-entropy.md → What is guaranteed, and what is not](replication-and-anti-entropy.md#what-is-guaranteed-and-what-is-not)
+
+The signal defect 12 added had a benign trigger that needed no clock anomaly at
+all, and the chaos gate reaches it: a primary restarts between a write refused
+during a fault and a later write to the same key. The pass replaying the first
+write covers a range of the log pinned when the pass started, so the second write —
+delivered live, past that range — is invisible to the pass's dedup and the pass
+ships the pre-restart entry anyway. The replica refuses it, correctly, and both
+nodes hold the right value; but the arriving epoch is below the stored one, so a
+receiver that could not tell a replay from a live write counted an epoch
+regression, latched a gauge that never clears, and logged at `ERROR` on a healthy
+cluster doing a routine restart.
+
+**Why the live chaos gate had not shown it.** It had run on the epoch build with
+both epoch counters reading 0 on every node — which does not refute the mechanism.
+The window is a few hundred milliseconds per pass and needs the live write to land
+between the tip being pinned and the pass delivering. An in-process repro driving
+that exact interleaving settled it: pre-fix it reported
+`replica_writes_epoch_regressed=1`, the latched gauge, and the `ERROR`, with the
+two epochs 19 ms apart — the duration of the restart.
+
+**Fix.** `ReplicateRequest.replay` marks a mutation an anti-entropy pass
+re-shipped. The discard is still counted; the epoch classification is not applied
+to it, and the refusal is reported at `Debug` with both epochs. The engine exposes
+replay as separate entry points (`ReplayPutIfNewer`, `ReplayDeleteIfNewer`) rather
+than a flag on the existing ones, so every pre-existing caller keeps meaning "live"
+and the one call site that can relax the classification is named. The alarm's
+remaining coverage is live writes, which is where a wiped primary is discovered —
+it serves clients, it does not only replay.
+
+Pinned by `TestCatchUpReplayAfterARestartIsNotAnEpochRegression` (the full
+interleaving, end to end), `TestCatchUpReplayCarriesTheReplayMarker`,
+`TestLiveWriteIsNotMarkedAsReplay`, `TestReplayRefusalIsNotAnEpochRegression` and
+`TestReplicateHandlerPassesReplayMarker`.
+
+---
+
 ## Smaller findings
 
-Fixed alongside the above, and not counted in the twelve — recorded because
+Fixed alongside the above, and not counted in the thirteen — recorded because
 leaving them out would make the list look tidier than the work was:
 
 | Finding | Where |

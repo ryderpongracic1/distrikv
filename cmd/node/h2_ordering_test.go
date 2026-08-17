@@ -20,17 +20,18 @@ import (
 // inversions. Every test here asserts on the value the replica ends up holding,
 // because that is the divergence a convergence check reports.
 
-// deliver applies one replicated mutation the way GRPCServer.Replicate does.
+// deliver applies one replicated mutation the way GRPCServer.Replicate does for a
+// live (non-replay) write, which is the origin every test in this file is about.
 func deliverPut(t *testing.T, n *Node, key, value string, seq uint64) {
 	t.Helper()
-	if err := n.ApplyReplica(context.Background(), server.OpPut, key, []byte(value), seq); err != nil {
+	if err := n.ApplyReplica(context.Background(), server.OpPut, key, []byte(value), seq, false); err != nil {
 		t.Fatalf("ApplyReplica put %q seq=%d: %v", key, seq, err)
 	}
 }
 
 func deliverDelete(t *testing.T, n *Node, key string, seq uint64) {
 	t.Helper()
-	if err := n.ApplyReplica(context.Background(), server.OpDelete, key, nil, seq); err != nil {
+	if err := n.ApplyReplica(context.Background(), server.OpDelete, key, nil, seq, false); err != nil {
 		t.Fatalf("ApplyReplica delete %q seq=%d: %v", key, seq, err)
 	}
 }
@@ -166,10 +167,10 @@ func TestApplyReplicaAcksAStaleWrite(t *testing.T) {
 	const key = "stale-ack"
 
 	deliverPut(t, n, key, "new", 20)
-	if err := n.ApplyReplica(context.Background(), server.OpPut, key, []byte("old"), 19); err != nil {
+	if err := n.ApplyReplica(context.Background(), server.OpPut, key, []byte("old"), 19, false); err != nil {
 		t.Fatalf("a discarded write must still ACK, got: %v", err)
 	}
-	if err := n.ApplyReplica(context.Background(), server.OpDelete, key, nil, 19); err != nil {
+	if err := n.ApplyReplica(context.Background(), server.OpDelete, key, nil, 19, false); err != nil {
 		t.Fatalf("a discarded delete must still ACK, got: %v", err)
 	}
 	wantValue(t, n, key, "new")

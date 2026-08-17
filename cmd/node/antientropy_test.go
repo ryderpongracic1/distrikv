@@ -208,7 +208,7 @@ func TestAntiEntropySkipsKeysThisNodeDoesNotOwn(t *testing.T) {
 
 	foreign := keyOwnedElsewhere(t, n)
 	// Applied the way a replica applies a write it was sent.
-	if err := n.ApplyReplica(context.Background(), server.OpPut, foreign, []byte("not mine"), 0); err != nil {
+	if err := n.ApplyReplica(context.Background(), server.OpPut, foreign, []byte("not mine"), 0, false); err != nil {
 		t.Fatalf("ApplyReplica: %v", err)
 	}
 

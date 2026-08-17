@@ -314,16 +314,24 @@ func (n *Node) Run(ctx context.Context) error {
 // state the mutation describes, which is exactly what the primary wanted — so it
 // ACKs. Reporting a failure instead would refuse the client's write on the
 // primary and mark this node behind for a divergence that does not exist.
-func (n *Node) ApplyReplica(ctx context.Context, op, key string, value []byte, seq uint64) error {
+//
+// replay says the mutation came from an anti-entropy catch-up pass rather than
+// from the live path. It does not change whether the write is applied. It changes
+// how the engine classifies a refusal: a pass covers a range of the primary's log
+// pinned when the pass started, so it can legitimately deliver an entry written
+// by an earlier incarnation of that primary while this replica already holds a
+// newer one, and calling that an epoch regression would raise a latched alarm on
+// an ordinary restart. See lsm.LSMTree.noteDiscard.
+func (n *Node) ApplyReplica(ctx context.Context, op, key string, value []byte, seq uint64, replay bool) error {
 	switch op {
 	case server.OpPut:
-		applied, err := n.store.PutIfNewer(ctx, key, value, seq)
+		applied, err := n.applyPut(ctx, key, value, seq, replay)
 		if err != nil {
 			return err
 		}
 		if !applied {
 			n.logger.Debug("ApplyReplica: discarded a write older than the version held",
-				"key", key, "seq", seq)
+				"key", key, "seq", seq, "replay", replay)
 		}
 		return nil
 	case server.OpDelete:
@@ -333,18 +341,37 @@ func (n *Node) ApplyReplica(ctx context.Context, op, key string, value []byte, s
 		// so an absent key is not an error to begin with — but the tombstone is
 		// still written when it is newer, because it must shadow any earlier
 		// value this replica holds.
-		applied, err := n.store.DeleteIfNewer(ctx, key, seq)
+		applied, err := n.applyDelete(ctx, key, seq, replay)
 		if err != nil {
 			return err
 		}
 		if !applied {
 			n.logger.Debug("ApplyReplica: discarded a delete older than the version held",
-				"key", key, "seq", seq)
+				"key", key, "seq", seq, "replay", replay)
 		}
 		return nil
 	default:
 		return fmt.Errorf("node: ApplyReplica: unknown op %q", op)
 	}
+}
+
+// applyPut and applyDelete select the store entry point for the origin of the
+// mutation. The selection is a switch on one bit rather than a parameter threaded
+// into the engine so that every other caller of the apply-if-newer path keeps
+// meaning "live" and only this one, named, path can suppress the
+// epoch-regression classification.
+func (n *Node) applyPut(ctx context.Context, key string, value []byte, seq uint64, replay bool) (bool, error) {
+	if replay {
+		return n.store.ReplayPutIfNewer(ctx, key, value, seq)
+	}
+	return n.store.PutIfNewer(ctx, key, value, seq)
+}
+
+func (n *Node) applyDelete(ctx context.Context, key string, seq uint64, replay bool) (bool, error) {
+	if replay {
+		return n.store.ReplayDeleteIfNewer(ctx, key, seq)
+	}
+	return n.store.DeleteIfNewer(ctx, key, seq)
 }
 
 // ReplicateWrite implements server.ReplicationManager. It fans out a mutation

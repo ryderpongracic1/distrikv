@@ -75,7 +75,7 @@ saturation:    false   max_queue_depth=30
 | --- | --- |
 | `bloom_misses` | Bloom said *definitely absent* — saved a block read. Higher is better for negative lookups. |
 | `bloom_hits` | Bloom said *might be present* — block was read. Includes true hits and false positives. |
-| `bloom_fp_rate` | `false_positives / bloom_hits`. A correctly sized Bloom filter stays well under 1%. |
+| `bloom_fp_rate` | `false_positives / bloom_hits`. Both terms are exact `atomic.Uint64` counters incremented in `SSTableReader.Get`, so this is a measured rate and not an estimate — only its *display* is rounded, to two decimals. A correctly sized Bloom filter stays well under 1%. |
 | `block_cache_hits` / `block_cache_misses` / `hit_rate` | Whether an SSTable block read was served from the in-process LRU cache or cost a `ReadAt`. Zero on a memtable-resident workload — nothing reached an SSTable. |
 | `prefill` | Present only with `--prefill`: keys written, achieved keys/s, retries, and failures. A non-zero `failed` aborts the run, because a read-path ratio measured over a partly-written keyspace is not a measurement. |
 | `during prefill` | Write-path counters (`flush_bytes`, `compactions`, `write_stalls`) attributed to the prefill phase, which is where they are earned — a read-only measurement window cannot produce a flush. |
@@ -139,6 +139,10 @@ that is not memtable-resident is a Bloom-filtered SSTable lookup taken *inside* 
 engine write lock. The cost of that was argued rather than measured, so both
 configurations were re-run. Same cluster, same method, same flags.
 
+The heading's date is when this section opened; the flushed-key table below also
+carries the n=3-per-build series run on 2026-08-18, and the anchor is left alone so
+links from other documents keep resolving.
+
 **Memtable-resident (the baseline's own configuration — Zipf α=1.1, 100k keys):**
 
 | Workload | Target QPS | p50 | p90 | p99 | p999 | Errors | Pre-H2 p99 |
@@ -155,30 +159,94 @@ the comparison answers from the memtable and the flagged path is barely exercise
 **Flushed-key writes (the discriminating configuration — 500k-key prefill, then
 writes at 1,200 qps Zipf, so overwrites land on keys that have been flushed):**
 
-| Build | p50 | p90 | p99 | p999 | Errors | Saturated? |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Post-H2 (`cab1dd9`) | 1.8 ms | 4.7 ms | **40.5 ms** | 114.9 ms | 0 | No |
-| Pre-H2 control (`47958bb`) | 1.7 ms | 4.6 ms | **53.9 ms** | 130.6 ms | 0 | No |
+Every run below is a fresh cluster with its own prefill. The first pair was the
+single run per build that opened the question; the six that follow are the n=3 per
+build that was outstanding. **Read the saturation column before the p99 column** —
+it is what the rest of this section turns on.
 
-**The comparison is acquitted: the pre-H2 tail is worse.** 40.5 ms against 53.9 ms
-on the same bench, same cluster, same day — so the flushed-key write tail is
-pre-existing LSM write-load behaviour rather than a cost this change introduced. The
-first run alone could not have said that, which is why the control was run: a
-compaction (97.9 MB written, WAF 4.35) overlapped the post-H2 measurement, and
-there was no baseline for this configuration at all — the 08-16 write table is
-memtable-resident and the earlier prefilled runs were reads-only.
+| Date | Build | Run | p99 | Max queue depth | Saturated? |
+| --- | --- | ---: | ---: | ---: | --- |
+| 08-17 | Post-H2 (`cab1dd9`) | 1 | **40.5 ms** | 36 | No |
+| 08-17 | Pre-H2 (`47958bb`) | 1 | **53.9 ms** | 57 | No |
+| 08-18 | Post-H2 (`c2495b0`) | 1 | **34.8 ms** | 20 | No |
+| 08-18 | Post-H2 (`c2495b0`) | 2 | 1,119 ms | 513 | **TRUE** |
+| 08-18 | Post-H2 (`c2495b0`) | 3 | 1,366 ms | 512 | **TRUE** |
+| 08-18 | Pre-H2 (`47958bb`) | 1 | 1,055 ms | — | **TRUE** |
+| 08-18 | Pre-H2 (`47958bb`) | 2 | 1,254 ms | — | **TRUE** |
+| 08-18 | Pre-H2 (`47958bb`) | 3 | 1,260 ms | — | **TRUE** |
 
-The engine counters establish the other half independently. The post-H2 run shows
-the comparison actually executing — `bloom_hits=5917`, `bloom_misses=7460`, block
-cache at 22.9% over 23,273 misses — while the pre-H2 control shows `bloom_hits=0`
-and no block-cache activity, because a pre-H2 replica write reads nothing. So the
-read path is demonstrably live post-H2 and demonstrably absent pre-H2, and the
-tail did not move in the direction that would implicate it.
+A dash in the queue column means the depth was not recorded for that run, not that
+it was zero; the saturation flag is what was captured.
 
-One open observation, a direction rather than a claim: both builds' p99 sits near
+Full percentiles for the two unsaturated 08-17 runs, which are the only pair
+measured with the whole distribution recorded: post-H2 `cab1dd9` p50 1.8 ms, p90
+4.7 ms, p99 40.5 ms, p999 114.9 ms, 0 errors; pre-H2 `47958bb` p50 1.7 ms, p90
+4.6 ms, p99 53.9 ms, p999 130.6 ms, 0 errors. Note that p50 and p90 are within
+~0.1 ms of each other across builds — the divergence is confined to the tail, which
+is the part this regime measures worst.
+
+**The bimodality is the finding, and it is not a per-build one.** Five of the six
+n=3 runs tripped the harness's saturation flag (`max_queue_depth` at its 512 cap,
+achieved QPS behind target), which means their ~1.2 s p99 figures are **queue wait,
+not service latency** — the cluster was not keeping up, so the tail measures how
+long requests sat in the arrival queue rather than how long the store took. Across
+all eight runs nothing landed in between: each one either held in the tens of
+milliseconds or tipped over past a second, and both builds did both — the pre-H2
+build held only in its 08-17 run, while the post-H2 build held once on each day.
+
+The reading that fits is that this operating point — 1,200 qps of writes against a
+flushed 500k-key store — sits at or above the cluster's **capacity knee**. That is
+an interpretation of eight observations at a single offered load, not a measurement
+of the knee: nothing here locates it, and the series cannot say whether the two
+builds' knees differ, only that 1,200 qps is above both.
+
+That also means **no per-build p99 comparison can be drawn from this series**, and
+none is drawn here. Ranking two builds on a metric that is measuring queue depth in
+5 of 6 observations would be worse than the n=1 claim it was meant to replace.
+
+**No evidence of regression, from three independent directions — and no stronger
+claim than that:**
+
+1. **The unsaturated observations do not separate the builds.** Post-H2 40.5 ms and
+   34.8 ms; pre-H2 53.9 ms. Three observations of a metric this bursty, unbalanced
+   two-to-one across builds and drawn from two different days, cannot rank anything.
+   What they can do is fail to show a cost, and they do fail to show one: nothing
+   here puts post-H2 above pre-H2.
+2. **Saturation behaviour does not separate them either.** A meaningful per-write
+   cost should show up as the post-H2 build tipping over at a *lower* offered load
+   than the control. At the one load tested there is no such separation — both
+   builds saturate at 1,200 qps. This rules out a cost large enough to move the knee
+   past that load; it says nothing about smaller ones, because only one load was
+   tested.
+3. **The counter evidence, which is independent of latency altogether — and the
+   strongest of the three.** The post-H2 run reports `bloom_hits=5917`,
+   `bloom_misses=7460` and block cache at 22.9% over 23,273 misses; the pre-H2
+   control reports `bloom_hits=0` and no block-cache activity at all, because a
+   pre-H2 replica write reads nothing before writing. The read path this change adds
+   is demonstrably live in one build and demonstrably absent in the other — so the
+   comparison is definitely executing, and the two latency directions above are
+   measuring a build that really does perform it.
+
+**Why this regime resists fine-grained comparison, and what would fix that.** Two
+confounds sit on top of the saturation. Both builds' *unsaturated* p99 lands near
 the 50 ms soft-stall sleep cap
-([write-stall backpressure](lsm-engine.md#write-stall-backpressure)). Anyone
-chasing that pre-existing tail should start there.
+([write-stall backpressure](lsm-engine.md#write-stall-backpressure)), so even there
+p99 is largely counting stall *incidence*, which is bursty by construction. And
+these were back-to-back heavy runs — each one a 500k-key prefill followed by a 60 s
+warmup and a 60 s measurement — on a laptop VM, so thermal and VM drift are in
+play; the only unsaturated run of the evening was the first one.
+
+The methodology that would produce a stable per-build comparison is therefore a
+**lower offered load** — 800 qps rather than 1,200 — chosen to sit clear of wherever
+the knee actually is, so that every run measures service latency instead of queue
+wait, with the cluster given time to settle between runs. The 800 figure is a
+proposal derived from the one load that failed, not a measured safe point; the run
+that establishes it has not been done, and this table does not contain it.
+
+A compaction (97.9 MB written, WAF 4.35) also overlapped the 08-17 post-H2
+measurement, which is the confound the control was run to address in the first
+place — there was no baseline for this configuration anywhere before it. The 08-16
+write table is memtable-resident and the earlier prefilled runs were reads-only.
 
 Reproducing the discriminating run (the prefill is what puts the overwritten keys
 on disk; everything after it is the ordinary write workload):
@@ -195,6 +263,13 @@ The one thing this configuration needs that the memtable-resident one does not i
 a **fresh cluster per build** (`docker compose … down -v` between runs): the
 prefill is what establishes the on-disk state, so comparing two builds means
 prefilling for each rather than reusing a volume one of them wrote.
+
+And if the goal is a per-build *latency* comparison rather than a capacity
+observation, drop the offered load until every run reports `saturation: false` —
+`--qps 800` is the proposed starting point, not a verified one — so that each p99 is
+service latency instead of queue wait. Discard, or re-run, any run whose
+`saturation` reads `TRUE`: at that point the number describes the arrival queue, not
+the store, and averaging it with an unsaturated run mixes two different quantities.
 
 Note for anyone re-running this after the incarnation-epoch change: **both builds
 measured above predate it** (`cab1dd9` and `47958bb`). The epoch adds work to the

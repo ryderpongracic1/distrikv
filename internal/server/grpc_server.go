@@ -55,7 +55,13 @@ type ReplicationManager interface {
 	// bypassing the replication fan-out — this node IS the replica receiving
 	// the write, so re-fanning-out would replicate forever. The mutation is
 	// applied only if seq is newer than the version already held for the key.
-	ApplyReplica(ctx context.Context, op, key string, value []byte, seq uint64) error
+	//
+	// replay says the mutation was re-shipped by an anti-entropy catch-up pass
+	// rather than replicated live. It does not affect whether the mutation is
+	// applied, only how a refusal is classified: a pass can legitimately deliver
+	// an entry from an earlier incarnation of the primary, which must not be
+	// reported as that primary's epoch going backwards.
+	ApplyReplica(ctx context.Context, op, key string, value []byte, seq uint64, replay bool) error
 
 	// ReplicateWrite fans a mutation this node has already applied locally out
 	// to the other replicas for the key, and reports an error unless every one
@@ -184,10 +190,17 @@ func forwardError(code int, msg string) *kvpb.ForwardKeyResponse {
 // req.Seq is the primary's write sequence, which ApplyReplica uses to discard a
 // mutation that is older than the version this node already holds. A peer
 // predating the field sends 0, which applies unconditionally.
+//
+// req.Replay says the mutation is a catch-up replay out of the primary's WAL. A
+// peer predating that field sends false, which is the live reading — so an old
+// sender keeps the pre-existing behaviour, including the false epoch-regression
+// report a replay of its own can produce. That is bounded by the upgrade window
+// and is the conservative direction: it over-reports rather than staying silent.
 func (g *GRPCServer) Replicate(ctx context.Context, req *kvpb.ReplicateRequest) (*kvpb.ReplicateResponse, error) {
-	g.logger.Debug("Replicate RPC received", "op", req.Op, "key", req.Key, "seq", req.Seq)
+	g.logger.Debug("Replicate RPC received",
+		"op", req.Op, "key", req.Key, "seq", req.Seq, "replay", req.Replay)
 
-	if err := g.repMgr.ApplyReplica(ctx, req.Op, req.Key, req.Value, req.Seq); err != nil {
+	if err := g.repMgr.ApplyReplica(ctx, req.Op, req.Key, req.Value, req.Seq, req.Replay); err != nil {
 		g.logger.Warn("Replicate failed", "op", req.Op, "key", req.Key, "seq", req.Seq, "error", err)
 		return &kvpb.ReplicateResponse{Success: false, NodeId: g.raft.ID()}, nil
 	}

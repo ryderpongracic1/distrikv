@@ -1,0 +1,8 @@
+# Build output. `go build ./...` names the binary after the directory, so an
+# untracked file called `etcd` appears next to the source; `etcd-ceiling` is the
+# name the README's runbook builds.
+/etcd
+/etcd-ceiling
+
+# Result files from the runbook
+etcd_*.txt

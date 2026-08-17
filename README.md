@@ -484,6 +484,223 @@ are forwarded to the ring-primary via gRPC (`forwarded_requests` ≈ ops × 2/3
 per node on a 3-node ring), so forwarding overhead is already included in
 every percentile above.
 
+### Ceiling — vs etcd (SOTA CP key-value store)
+
+The tables above say what distrikv does. They do not say whether that is fast,
+because they have nothing to sit next to. [etcd](https://etcd.io) is the
+reference implementation of a consistent distributed key-value store — the
+thing Kubernetes stores its entire cluster state in, a decade of production
+hardening, Raft consensus done properly — so it is the honest ceiling to
+measure against.
+
+**These are different classes of system, and the comparison is a reference
+point rather than a competition.** Both are CP, but they buy consistency in
+structurally different ways:
+
+- **etcd** commits every write through a single Raft leader. The leader appends
+  to its log, replicates to followers, and applies once a majority has
+  persisted the entry. Every key in the cluster is serialised through that one
+  log. Reads are linearizable by default, which also costs a leader round-trip.
+- **distrikv** never puts data on a Raft log (see *Intentional deviations*
+  above). A key's ring-primary applies the write locally and synchronously
+  replicates to its R−1 replicas, returning success only if **every** replica
+  ACKs and `503` otherwise. Different keys have different primaries, so writes
+  to different parts of the key space proceed in parallel. Reads go to the
+  ring-primary directly, with no quorum step.
+
+So the interesting output is not a winner. It is the shape of the gap, and what
+the shape says about the trade each design made.
+
+`bench/etcd/` is a separate Go module containing a harness that runs **the same
+workload** against etcd: the same Zipfian key distribution (α=1.1), the same
+open-loop Poisson arrivals, the same key format, the same value bytes, the same
+worker count. It launches its own 3-member etcd cluster on loopback and reports
+exact latency percentiles per operation type. Keeping it in its own module keeps
+etcd's dependency tree out of distrikv's `go.mod`.
+
+#### Results
+
+> **Not yet measured.** The harness is committed and reproducible; the etcd
+> column is filled in from the runbook below. distrikv's column is the
+> validated 2026-08-16 baseline reproduced from the table above. Placeholders
+> are marked `—` so a half-filled table cannot be mistaken for a finding.
+
+| Workload (60s, 256 B values, 100k-key Zipf α=1.1, 128 workers) | distrikv achieved | etcd achieved | distrikv p99 | etcd p99 |
+| --- | ---: | ---: | ---: | ---: |
+| 100% writes (PUT), target 1,200 QPS | **1,199 /s** | — | 4.6 ms | — |
+| 100% reads (GET), target 6,000 QPS | **6,017 /s** | — | 1.7 ms | — |
+| 20% write / 80% read, target 3,000 QPS | **3,000 /s** | — | 2.5 ms | — |
+
+| Per-op latency, mixed workload | distrikv p50 | etcd p50 | distrikv p99 | etcd p99 |
+| --- | ---: | ---: | ---: | ---: |
+| PUT | — | — | — | — |
+| GET | — | — | — | — |
+
+#### Why the gap has the shape it does
+
+Three mechanisms account for it, and they push in different directions — which
+is why a single "distrikv is N× faster/slower" number would be meaningless.
+
+1. **Write throughput: Raft log serialisation vs ring fan-out.** etcd's leader
+   is a single serialisation point for the whole key space: every PUT is an
+   append to one log, in one order, on one node, whose disk and CPU are shared
+   by all keys. distrikv has three concurrent write paths, one per ring
+   primary, each with its own WAL and its own fsync stream. A 3-node distrikv
+   ring can therefore absorb roughly 3× the independent write streams before
+   any single node's disk becomes the bottleneck. This is the design's main
+   throughput advantage and it grows with node count, where etcd's write
+   throughput is flat in node count (and mildly *decreasing*, since a larger
+   majority means more replication work per commit).
+
+2. **Read latency: linearizable quorum read vs primary-local read.** An etcd
+   `Get` is linearizable by default: it goes through the leader's read-index
+   protocol, confirming with a quorum that the leader is still the leader before
+   answering. distrikv reads route to the key's ring-primary and answer from its
+   memtable/LSM with no coordination at all. distrikv's read path therefore does
+   strictly less work, and buys a strictly weaker guarantee — it is a read of
+   the primary's latest state, which is only linearizable to the extent the
+   primary has not just crashed with an in-flight write. **This is the largest
+   single confound in the read comparison and the reason the read rows should
+   not be read as "distrikv's reads are better".**
+
+3. **Durability quorum: majority-of-3 vs all-of-R.** etcd commits on a majority
+   — leader plus one follower — so it tolerates one dead or slow member and
+   keeps serving writes. distrikv requires *every* replica in `ring.GetN(key,R)`
+   to ACK, so with R=2 a single unreachable replica means `503` for every key
+   whose replica set contains it. Both designs wait for exactly one remote ACK
+   on the happy path, which is why their per-write latency is closer than the
+   throughput difference suggests. The divergence is entirely in the unhappy
+   path: etcd degrades gracefully, distrikv refuses. Phase 4's nemesis runs
+   quantify that refusal (48,283 refused-but-applied writes across four fault
+   windows) — and it is a deliberate choice, not an oversight, because refusing
+   is what keeps the store CP without a consensus log.
+
+#### What etcd buys that distrikv does not have
+
+Worth stating plainly, because the throughput table flatters distrikv and the
+list below is where the decade of engineering actually went:
+
+- **Linearizable reads**, guaranteed by protocol rather than by "reads go to
+  the primary and the primary usually has the data".
+- **Consensus-backed durability.** A committed etcd write survives any minority
+  failure with the "if committed, all future leaders have it" guarantee.
+  distrikv's ring replication has no such property — the ring-primary and its
+  replicas can diverge under partition, and nothing converges them afterwards.
+- **Dynamic membership.** etcd adds and removes members through a Raft config
+  change, online. distrikv's ring is static and requires a cluster restart.
+- **Availability under single-member failure**, per the quorum point above.
+- **Watches, leases, MVCC revisions, and mini-transactions** (`Txn`,
+  compare-and-swap). distrikv has none of these; `distrikv-cli watch` polls.
+- **Multi-key atomicity** via `Txn`. distrikv has no cross-key primitive at all.
+
+#### What distrikv trades for
+
+- **Write throughput that scales with node count** rather than being pinned to
+  one leader's disk.
+- **Lower read latency**, by charging the caller a weaker guarantee for it.
+- **A far smaller operational surface**: no consensus log to compact, no
+  snapshot transfer to tune, no revision history to defragment.
+- **Legible failure semantics** in exchange for availability: `503` = the
+  primary took it but a replica did not ACK; `502` = the primary was
+  unreachable, with `forward_outcome` saying whether anything was written.
+
+#### Confounds this comparison does not control for
+
+Disclosed rather than corrected, because pretending they are not there would be
+worse than the asymmetry itself:
+
+- **Deployment shape.** distrikv's published numbers come from three Docker
+  containers inside a Colima VM (8 CPU / 8 GB), fsyncing through virtiofs. The
+  etcd harness launches three *native* host processes fsyncing to APFS
+  directly. That difference favours etcd, and on write latency it is probably
+  the second-largest effect after the read-path asymmetry — an fsync through
+  virtiofs is materially more expensive than a native one. The controlled
+  variant is in the runbook below: run distrikv natively too, and treat the
+  containerised row as the deployment-inclusive number.
+- **Transport and encoding.** distrikv speaks HTTP/1.1 with JSON bodies; etcd
+  speaks gRPC with protobuf over HTTP/2 with request multiplexing. The 256-byte
+  value is identical, but distrikv additionally pays JSON framing and one
+  connection per in-flight request.
+- **Read consistency**, as above. etcd is left at its default linearizable read
+  rather than being weakened with `WithSerializable()`, so etcd is measured at
+  the guarantee it advertises.
+- **Maturity.** etcd's numbers reflect years of tuning against exactly this
+  kind of benchmark. distrikv's reflect a few weeks.
+
+#### Running it (Mac validation runbook)
+
+```bash
+# 1. Install etcd (the harness launches it; it never needs to be running first)
+brew install etcd
+etcd --version        # expect 3.5.x or 3.6.x
+
+# 2. Build the harness. Separate module, so build from its own directory.
+cd ~/documents/github/distrikv/bench/etcd
+GOPROXY=direct go mod download
+CGO_ENABLED=0 go build -o etcd-ceiling .
+
+# 3. Run the three workloads. Flags mirror the distrikv baseline exactly:
+#    128 workers, 256 B values, 100k-key Zipf, 60s after a 5s warmup.
+./etcd-ceiling --qps 1200 --duration 60s --warmup 5s \
+  --mix 100:0:0 --workers 128 --valuesize 256 --keyspace 100000 --keydist zipf \
+  2>&1 | tee etcd_writes.txt
+
+./etcd-ceiling --qps 6000 --duration 60s --warmup 5s \
+  --mix 0:100:0 --workers 128 --valuesize 256 --keyspace 100000 --keydist zipf \
+  2>&1 | tee etcd_reads.txt
+
+./etcd-ceiling --qps 3000 --duration 60s --warmup 5s \
+  --mix 20:80:0 --workers 128 --valuesize 256 --keyspace 100000 --keydist zipf \
+  2>&1 | tee etcd_mixed.txt
+```
+
+Then re-measure distrikv with the identical workload so both columns come from
+one sitting on one machine:
+
+```bash
+cd ~/documents/github/distrikv
+GOPROXY=direct docker compose -f docker/docker-compose.yml up -d --build && sleep 20
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bench-linux ./cmd/bench
+
+for spec in "1200 100:0:0 writes" "6000 0:100:0 reads" "3000 20:80:0 mixed"; do
+  set -- $spec
+  docker run --rm --network docker_default -v "$PWD:/b" alpine \
+    /b/bench-linux --target node1:8001 --qps $1 --duration 60s --warmup 5s \
+    --mix $2 --workers 128 --valuesize 256 --keyspace 100000 --keydist zipf \
+    2>&1 | tee distrikv_$3.txt
+done
+```
+
+Optional, and the thing that removes the biggest confound — the same distrikv
+workload against three **native** nodes, so both stores are measured outside a VM:
+
+```bash
+cd ~/documents/github/distrikv
+go build -o distrikv-node ./cmd/node
+# start three nodes on 8001/8002/8003 per the "Running the Cluster" section, then:
+go build -o bench ./cmd/bench
+./bench --target localhost:8001 --qps 1200 --duration 60s --warmup 5s \
+  --mix 100:0:0 --workers 128 --valuesize 256 --keyspace 100000 --keydist zipf
+```
+
+**Validity gates, in order of what invalidates a run:**
+
+1. `errors: 0` in every run. A non-zero count means the run measured failure
+   handling, not the store.
+2. `saturation: false`. A saturated queue means the tail is arrival-queue wait
+   and the run describes the harness, not the store.
+3. `achieved_qps ≈ target`. If achieved falls materially below target with
+   `saturation: false`, the arrival process was starved and the run is suspect.
+
+To drive an etcd cluster that is already running instead of launching one:
+
+```bash
+./etcd-ceiling --no-cluster --endpoints 127.0.0.1:2379,127.0.0.1:2381,127.0.0.1:2383 --qps 1200
+```
+
+`bench/etcd/README.md` documents the harness's flags and the exact points where
+its methodology matches — and deliberately diverges from — `cmd/bench`.
+
 ### Phase 2 WAL allocation profile (2026-05-21, Apple M1 Max)
 
 `go test -bench=BenchmarkWAL_Append -benchmem` after the Phase 2 refactor:
@@ -1392,6 +1609,13 @@ distrikv/
 │       └── config.go        # LoadFromEnv(): typed config from env vars
 ├── proto/
 │   └── kv.proto             # KVService gRPC definitions
+├── bench/
+│   └── etcd/                # Separate module: etcd ceiling comparison harness
+│       ├── main.go          # Orchestration: cluster launch, warmup, measurement
+│       ├── cluster.go       # 3-member etcd launcher (loopback 2379/2381/2383)
+│       ├── workload.go      # Port of cmd/bench's workload — identical keys/values/mix
+│       ├── openloop.go      # Poisson arrivals, per-op latency samples
+│       └── report.go        # Exact percentiles, per-op-type results table
 ├── Makefile                 # build-cli, build-node, test, install-cli
 └── docker/
     ├── Dockerfile

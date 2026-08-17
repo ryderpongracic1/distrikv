@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -169,6 +170,31 @@ func (h *HTTPServer) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	h.metrics.GetTotal.Add(1)
 
+	// ?local=true answers from this node's own store and never forwards, which is
+	// the only way to ask a *replica* what it holds: an ordinary GET on a
+	// non-owning node forwards to the ring-primary and would answer with the
+	// primary's value, hiding exactly the divergence a convergence check is
+	// looking for.
+	//
+	// It exposes no data an ordinary GET could not already reach — the same keys
+	// are readable through the forwarding path — but it does expose per-replica
+	// state, and like the rest of this API it is unauthenticated and intended for
+	// a trusted cluster network. Do not expose distrikv's HTTP port publicly.
+	if localOnly(r) {
+		val, err := h.store.Get(r.Context(), key)
+		if errors.Is(err, store.ErrNotFound) {
+			h.metrics.GetMiss.Add(1)
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, map[string]string{"value": string(val)})
+		return
+	}
+
 	if !h.isLocalOwner(key) {
 		h.metrics.ForwardedRequests.Add(1)
 		h.forwardRequest(w, r, key, "GET", nil)
@@ -252,6 +278,21 @@ func (h *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // Routing helpers
 // ---------------------------------------------------------------------------
+
+// localOnly reports whether the request asked to be answered from this node's
+// own store without forwarding. Any of ?local, ?local=1, ?local=true and
+// ?local=yes count; an explicit false-y value does not.
+func localOnly(r *http.Request) bool {
+	if !r.URL.Query().Has("local") {
+		return false
+	}
+	switch strings.ToLower(r.URL.Query().Get("local")) {
+	case "", "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
 
 // isLocalOwner returns true if this node is the ring-primary for key. Falls
 // back to true on ring errors (empty ring) so single-node deployments work.

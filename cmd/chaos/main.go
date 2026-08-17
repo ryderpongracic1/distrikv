@@ -90,7 +90,7 @@ import (
 func main() {
 	var (
 		target       = flag.String("target", "localhost:8001", "primary cluster node host:port")
-		peers        = flag.String("peers", "", "additional nodes, comma-separated (for future multi-target support)")
+		peers        = flag.String("peers", "", "other nodes' client HTTP addresses, comma-separated — required by --check-convergence")
 		duration     = flag.Duration("duration", 30*time.Second, "how long to run operations")
 		warmup       = flag.Duration("warmup", 2*time.Second, "warmup window — ops issued but not recorded")
 		workers      = flag.Int("workers", 8, "number of concurrent client goroutines")
@@ -105,6 +105,13 @@ func main() {
 		nemesisInterval = flag.Duration("nemesis-interval", 10*time.Second, "delay between the end of one outage and the start of the next")
 		nemesisDowntime = flag.Duration("nemesis-downtime", 5*time.Second, "how long a victim stays down")
 		nemesisCompose  = flag.String("nemesis-compose-file", "docker/docker-compose.yml", "compose file the nemesis operates on")
+
+		// Convergence verification: did the cluster ever repair the writes it
+		// refused but kept? Default on for the fault-injecting nemeses, where
+		// divergence is expected to happen and therefore expected to be fixed.
+		checkConverge     = flag.Bool("check-convergence", true, "after the run, assert every replica agrees on every key (requires --peers; only applies when a nemesis is enabled)")
+		convergenceGrace  = flag.Duration("convergence-grace", 30*time.Second, "how long to keep re-checking convergence before declaring the replicas divergent")
+		convergenceReplic = flag.Int("replicas", 2, "cluster replication factor R, used to decide which nodes must agree on a key")
 	)
 	flag.Parse()
 
@@ -112,7 +119,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error: --put + --delete must be ≤ 100")
 		os.Exit(3)
 	}
-	_ = *peers // reserved for future multi-target partition tests
+	if *convergenceReplic < 1 {
+		fmt.Fprintln(os.Stderr, "error: --replicas must be ≥ 1")
+		os.Exit(3)
+	}
 
 	ncfg, err := parseNemesisFlags(*nemesisMode, *nemesisServices, *nemesisCompose, *nemesisInterval, *nemesisDowntime)
 	if err != nil {
@@ -234,6 +244,32 @@ func main() {
 		windows = scheduler.Windows()
 	}
 
+	// Convergence gate. It runs before the linearizability check so the grace
+	// window is spent waiting for the cluster to repair itself, not waiting behind
+	// a check that can take a minute — and because a divergent cluster is worth
+	// knowing about even if the history turns out to be unverifiable.
+	var converge convergenceResult
+	switch {
+	case !*checkConverge:
+		converge = convergenceResult{}
+	case !ncfg.Enabled():
+		converge = convergenceResult{Skipped: "no nemesis — nothing was refused, so nothing needed repairing"}
+	default:
+		log.Printf("waiting up to %s for replicas to converge …", *convergenceGrace)
+		converge = checkConvergence(context.Background(), convergenceConfig{
+			Enabled:  true,
+			Grace:    *convergenceGrace,
+			Nodes:    parseNodeAddrs(*target, *peers),
+			Replicas: *convergenceReplic,
+		}, keys, &http.Client{Transport: transport})
+		if converge.Checked {
+			log.Printf("convergence: converged=%t divergent=%d attempts=%d in %s",
+				converge.Converged, converge.Divergent, converge.Attempts, converge.Elapsed)
+		} else {
+			log.Printf("convergence check skipped: %s", converge.Skipped)
+		}
+	}
+
 	ops := measured.ops.Load()
 	errs := measured.errors.Load()
 	indeterminate := measured.indeterminateWrites.Load()
@@ -254,6 +290,19 @@ func main() {
 	} else if !ok {
 		result = "FAIL"
 		exitCode = 1
+	}
+
+	// A cluster that never repaired its refused-but-applied writes has failed,
+	// even with a legal history: linearizability is about what clients observed
+	// through the primary, and divergence between a primary and its replicas is
+	// invisible to it by construction.
+	if converge.Checked && !converge.Converged {
+		if exitCode == 0 {
+			result = "FAIL (replicas divergent)"
+		}
+		if exitCode != 2 {
+			exitCode = 1
+		}
 	}
 
 	if *output == "json" {
@@ -277,6 +326,7 @@ func main() {
 			FaultsInjected      int                 `json:"faults_injected"`
 			FaultsAttempted     int                 `json:"faults_attempted"`
 			FaultWindows        []faultWindowReport `json:"fault_windows,omitempty"`
+			Convergence         convergenceResult   `json:"convergence"`
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -300,6 +350,7 @@ func main() {
 			FaultsInjected:      injected,
 			FaultsAttempted:     len(windows),
 			FaultWindows:        faultWindowReports(windows, measureStart),
+			Convergence:         converge,
 		})
 	} else {
 		sep := strings.Repeat("─", 60)
@@ -314,6 +365,9 @@ func main() {
 		fmt.Printf("  %-24s %d\n", "ops:", ops)
 		fmt.Printf("  %-24s %d\n", "errors:", errs)
 		fmt.Printf("  %-24s %d\n", "refused-but-applied:", refused)
+		for _, line := range converge.convergenceLines() {
+			fmt.Printf("%s\n", line)
+		}
 		fmt.Printf("  %-24s %d\n", "indeterminate writes:", indeterminate)
 		fmt.Printf("  %-24s %d\n", "events:", rec.Len())
 		fmt.Printf("  %-24s %s\n", "nemesis:", ncfg.Describe())
@@ -327,7 +381,7 @@ func main() {
 				fmt.Printf("    %s\n", line)
 			}
 		}
-		for _, line := range verdictNotes(exitCode, refused, indeterminate) {
+		for _, line := range verdictNotes(exitCode, refused, indeterminate, converge) {
 			if line == "" {
 				fmt.Printf("%s\n", sep)
 				continue
@@ -349,7 +403,31 @@ func main() {
 // writes are now classified instead of assumed — a refused write is modelled as
 // applied, an unknown one as a pending operation the checker may place anywhere
 // — so a FAIL no longer has that escape hatch, and the note says so.
-func verdictNotes(exitCode int, refused, indeterminate int64) []string {
+func verdictNotes(exitCode int, refused, indeterminate int64, converge convergenceResult) []string {
+	// A FAIL caused by divergent replicas is a different finding from an illegal
+	// history, and the guidance for it is different: the history may be perfectly
+	// legal, because linearizability is judged on what clients saw through the
+	// ring-primary and cannot see a replica that is behind.
+	if exitCode == 1 && converge.Checked && !converge.Converged {
+		notes := []string{
+			"",
+			"NOTE: the replicas did not converge. Every write refused with 503 during a",
+			"      fault window was still applied on the ring-primary, and anti-entropy is",
+			"      what is supposed to replay those to the replica once it is healthy again.",
+			"      A divergent result means that repair did not happen or did not finish.",
+			"      Check the primaries' logs for \"catch-up\" and \"replica cursor is older\",",
+			"      and /metrics for anti_entropy_passes, anti_entropy_entries and",
+			"      anti_entropy_stale. Raising --convergence-grace only helps if repair was",
+			"      still in progress.",
+		}
+		if len(converge.Unreachable) > 0 {
+			notes = append(notes,
+				"      Some nodes could not be read at all, so this is 'unverified' rather",
+				"      than 'proven divergent' — bring every node up and re-run.")
+		}
+		return notes
+	}
+
 	switch exitCode {
 	case 1:
 		notes := []string{

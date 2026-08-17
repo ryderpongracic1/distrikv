@@ -119,6 +119,10 @@ type RaftNode struct {
 	metrics       metricsInterface
 	logger        *slog.Logger
 
+	// peerHealth, when set, receives the outcome of every heartbeat RPC this
+	// node sends as leader. Guarded by mu. See SetPeerHealthObserver.
+	peerHealth PeerHealthObserver
+
 	snapshotThreshold int
 
 	// --- Timing ---
@@ -465,14 +469,46 @@ func (r *RaftNode) sendHeartbeat(ctx context.Context, peer PeerClient, term, pre
 		PrevLogTerm:  prevLogTerm,
 	})
 	if err != nil {
+		r.notePeerHeartbeat(peer.NodeID, false)
 		r.logger.Warn("heartbeat failed", "peer", peer.NodeID, "error", err)
 		return
 	}
+	r.notePeerHeartbeat(peer.NodeID, true)
 	r.mu.Lock()
 	if resp.Term > r.currentTerm {
 		r.stepDownLocked(resp.Term)
 	}
 	r.mu.Unlock()
+}
+
+// SetPeerHealthObserver registers a sink for heartbeat outcomes. Passing nil
+// clears it. Call before Run.
+//
+// This is how the leader's heartbeats — the most direct liveness signal the
+// cluster has — reach the replica catch-up trigger, which lives outside Raft
+// because data placement is the hash ring's business, not Raft's. The
+// registration is optional so that Raft keeps no hard dependency on the
+// replication layer, and so that raft's own tests need no sink.
+func (r *RaftNode) SetPeerHealthObserver(o PeerHealthObserver) {
+	r.mu.Lock()
+	r.peerHealth = o
+	r.mu.Unlock()
+}
+
+// PeerHealthObserver receives the outcome of each heartbeat RPC the leader
+// sends. Implementations must not block: they are called on the per-peer
+// heartbeat goroutine, whose promptness the cluster's stability depends on.
+type PeerHealthObserver interface {
+	ObserveHeartbeat(nodeID string, ok bool)
+}
+
+func (r *RaftNode) notePeerHeartbeat(nodeID string, ok bool) {
+	r.mu.Lock()
+	o := r.peerHealth
+	r.mu.Unlock()
+	if o != nil {
+		o.ObserveHeartbeat(nodeID, ok)
+	}
 }
 
 // heartbeatRPCTimeout is the per-RPC deadline for a heartbeat. It is

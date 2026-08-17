@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 
 	"github.com/ryderpongracic1/distrikv/internal/cluster"
 	"github.com/ryderpongracic1/distrikv/internal/config"
@@ -33,6 +34,9 @@ type Node struct {
 	metrics     *metrics.Metrics
 	peerClients map[string]kvpb.KVServiceClient // nodeID → gRPC client
 	peerConns   []*grpc.ClientConn              // held for Clean shutdown
+	cursors     *store.CursorStore              // per-replica WAL catch-up cursors
+	health      *cluster.PeerHealth             // peer liveness, drives catch-up
+	antiEntropy *antiEntropy                    // replica convergence engine
 	logger      *slog.Logger
 }
 
@@ -90,6 +94,7 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 
 	// 4. Dial all peer gRPC connections with retry.
 	peerClients := make(map[string]kvpb.KVServiceClient, len(cfg.Peers))
+	peerConnByID := make(map[string]*grpc.ClientConn, len(cfg.Peers))
 	raftPeers := make([]raft.PeerClient, 0, len(cfg.Peers))
 
 	for _, p := range cfg.Peers {
@@ -99,6 +104,12 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 			return nil, fmt.Errorf("node: dial peer %s: %w", p.ID, err)
 		}
 		n.peerConns = append(n.peerConns, conn)
+		// Keyed here, where the connection and the peer it belongs to are both in
+		// hand. Pairing them up afterwards by slice index would work only as long
+		// as this loop and that one iterate cfg.Peers identically — a coupling that
+		// costs nothing to avoid and would mis-key a peer's health probe if it ever
+		// broke.
+		peerConnByID[p.ID] = conn
 		client := server.NewPeerClient(conn)
 		peerClients[p.ID] = client
 		raftPeers = append(raftPeers, raft.PeerClient{
@@ -147,6 +158,61 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 		logger,
 	)
 
+	// 8. Anti-entropy: converge replicas from this node's WAL after a fault.
+	//
+	//    Health is tracked from three signals — Raft heartbeats (leader only),
+	//    replication outcomes (this node's own writes), and a transport probe
+	//    over the peer channels, which is the only one that tells a non-leader
+	//    that a peer has come back. See cluster.PeerHealth.
+	cursors, err := store.OpenCursorStore(cfg.DataDir)
+	if err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("node: open replica cursors: %w", err)
+	}
+	n.cursors = cursors
+
+	peerIDs := make([]string, 0, len(cfg.Peers))
+	for _, p := range cfg.Peers {
+		peerIDs = append(peerIDs, p.ID)
+	}
+
+	n.health = cluster.NewPeerHealth(peerIDs, cluster.HealthConfig{
+		Interval: cfg.HeartbeatInterval,
+		Probe: func(nodeID string) bool {
+			conn, ok := peerConnByID[nodeID]
+			if !ok {
+				return false
+			}
+			// A channel that is Ready has a live connection to the peer. Idle is
+			// also treated as reachable: gRPC parks a channel with no traffic in
+			// Idle, and reporting that as unreachable would demote a peer this
+			// node simply has not spoken to recently.
+			switch conn.GetState() {
+			case connectivity.Ready, connectivity.Idle:
+				return true
+			default:
+				return false
+			}
+		},
+		Logger: logger,
+	})
+	raftNode.SetPeerHealthObserver(n.health)
+
+	n.antiEntropy = newAntiEntropy(
+		cfg.NodeID,
+		cfg.ReplicaCount,
+		peerIDs,
+		s,
+		cursors,
+		ring,
+		peerClients,
+		n.health,
+		raftNode.CurrentTerm,
+		n.metrics,
+		logger,
+		antiEntropyConfig{},
+	)
+
 	return n, nil
 }
 
@@ -182,6 +248,22 @@ func (n *Node) Run(ctx context.Context) error {
 		n.raft.Run(gCtx)
 		return nil
 	})
+
+	// Peer liveness tracking and replica catch-up. Both are pure background
+	// convergence work: they never gate a client write, and a failure in either
+	// leaves the CP write path exactly as it was.
+	if n.health != nil {
+		g.Go(func() error {
+			n.health.Run(gCtx)
+			return nil
+		})
+	}
+	if n.antiEntropy != nil {
+		g.Go(func() error {
+			n.antiEntropy.Run(gCtx)
+			return nil
+		})
+	}
 
 	// Wait for the parent context to be cancelled (SIGINT/SIGTERM), then
 	// trigger a coordinated shutdown by cancelling the run context.
@@ -282,19 +364,51 @@ func (n *Node) ReplicateWrite(ctx context.Context, op, key string, value []byte)
 		})
 		if err != nil {
 			n.metrics.ReplicationErrors.Add(1)
+			n.noteReplicationFailure(vn.NodeID)
 			errs = append(errs, fmt.Errorf("replicate to %s: %w", vn.NodeID, err))
 			continue
 		}
 		if !resp.Success {
 			n.metrics.ReplicationErrors.Add(1)
+			n.noteReplicationFailure(vn.NodeID)
 			errs = append(errs, fmt.Errorf("replica %s rejected write", vn.NodeID))
+			continue
 		}
+		n.noteReplicationSuccess(vn.NodeID)
 	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("node: replication errors: %w", errors.Join(errs...))
 	}
 	return nil
+}
+
+// noteReplicationFailure records that a replica did not take a write, so the
+// anti-entropy engine knows this node is now ahead of it and the health tracker
+// knows the peer looks unreachable.
+//
+// It deliberately does not change what the client is told: the write is still
+// refused with 503. Convergence happens afterwards, out of the request's way.
+// The helpers are nil-safe because the tests construct a Node without the
+// convergence subsystems.
+func (n *Node) noteReplicationFailure(nodeID string) {
+	if n.antiEntropy != nil {
+		n.antiEntropy.NoteReplicationFailure(nodeID)
+		return
+	}
+	if n.health != nil {
+		n.health.ObserveReplication(nodeID, false)
+	}
+}
+
+func (n *Node) noteReplicationSuccess(nodeID string) {
+	if n.antiEntropy != nil {
+		n.antiEntropy.NoteReplicationSuccess(nodeID)
+		return
+	}
+	if n.health != nil {
+		n.health.ObserveReplication(nodeID, true)
+	}
 }
 
 // metricsAdapter bridges metrics.Metrics to raft.metricsInterface.

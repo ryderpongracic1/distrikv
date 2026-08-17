@@ -32,12 +32,29 @@ type fakePeer struct {
 	refuse bool          // ACK with Success=false
 	delay  time.Duration // how long the replica takes to answer
 	nodeID string
+
+	// failAfterN, when > 0, makes the replica fail every request after the first
+	// N — a replica that dies part-way through a catch-up pass.
+	failAfterN   int
+	failAfterErr error
 }
 
 func (f *fakePeer) Replicate(ctx context.Context, in *kvpb.ReplicateRequest, _ ...grpc.CallOption) (*kvpb.ReplicateResponse, error) {
 	f.mu.Lock()
-	f.reqs = append(f.reqs, in)
 	delay := f.delay
+	err := f.err
+	// A replica killed part-way through a pass never applies the write, so that
+	// request is deliberately not recorded: a caller asserting on reqs is then
+	// asserting on what the replica actually took. A transport-level f.err is
+	// recorded as before — those tests assert that the attempt was made.
+	dropped := false
+	if err == nil && f.failAfterN > 0 && len(f.reqs) >= f.failAfterN {
+		err, dropped = f.failAfterErr, true
+	}
+	if !dropped {
+		f.reqs = append(f.reqs, in)
+	}
+	refuse := f.refuse
 	f.mu.Unlock()
 
 	// Honour the caller's deadline the way a real gRPC call does, so a test can
@@ -50,10 +67,34 @@ func (f *fakePeer) Replicate(ctx context.Context, in *kvpb.ReplicateRequest, _ .
 		}
 	}
 
-	if f.err != nil {
-		return nil, f.err
+	if err != nil {
+		return nil, err
 	}
-	return &kvpb.ReplicateResponse{Success: !f.refuse, NodeId: f.nodeID}, nil
+	return &kvpb.ReplicateResponse{Success: !refuse, NodeId: f.nodeID}, nil
+}
+
+// failAfter makes the replica take n requests and then fail every later one with
+// err. Passing n == 0 clears the behaviour.
+func (f *fakePeer) failAfter(n int, err error) {
+	f.mu.Lock()
+	f.failAfterN, f.failAfterErr = n, err
+	f.mu.Unlock()
+}
+
+// reset forgets every recorded request, so an assertion can be scoped to what
+// happened after it.
+func (f *fakePeer) reset() {
+	f.mu.Lock()
+	f.reqs = nil
+	f.mu.Unlock()
+}
+
+// setErr sets (or clears) the transport-level failure under the lock, so a test
+// can take the replica down while background goroutines may be calling it.
+func (f *fakePeer) setErr(err error) {
+	f.mu.Lock()
+	f.err = err
+	f.mu.Unlock()
 }
 
 func (f *fakePeer) requests() []*kvpb.ReplicateRequest {

@@ -44,6 +44,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -66,6 +67,14 @@ const (
 type WAL struct {
 	f  *os.File
 	bw *bufio.Writer // persistent; allocated once at Open, reused across Append calls
+
+	// size is the number of bytes durably appended to this segment: the file's
+	// size at Open plus the wire size of every entry Append has fsynced since.
+	// It is the offset an anti-entropy reader resumes from, so it is maintained
+	// here rather than derived from a Seek: the file is opened O_APPEND and
+	// Replay seeks it back to the start, so the file offset says nothing useful
+	// about where the log ends.
+	size atomic.Int64
 }
 
 // entryBufPool is a pool of *[]byte scratch buffers used during Replay to
@@ -89,11 +98,23 @@ func Open(path string) (*WAL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wal: open %q: %w", path, err)
 	}
-	return &WAL{
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("wal: stat %q: %w", path, err)
+	}
+	w := &WAL{
 		f:  f,
 		bw: bufio.NewWriterSize(f, 64*1024),
-	}, nil
+	}
+	w.size.Store(info.Size())
+	return w, nil
 }
+
+// Size returns the number of bytes durably present in this segment. Together
+// with the segment's sequence number it is the log's tip — the position an
+// anti-entropy pass reads up to.
+func (w *WAL) Size() int64 { return w.size.Load() }
 
 // Append writes one log entry and fsyncs before returning.
 //
@@ -168,6 +189,10 @@ func (w *WAL) appendEntry(op OpType, key string, value []byte) error {
 	if err := w.f.Sync(); err != nil {
 		return fmt.Errorf("wal: sync: %w", err)
 	}
+	// The entry is now durable, so the log's end has moved. Advancing here
+	// rather than before the fsync keeps Size() a statement about what a reader
+	// can actually find on disk.
+	w.size.Add(EntryWireSize(key, value))
 	return nil
 }
 

@@ -114,8 +114,19 @@ func newWorkload(keyspace int, keyDist string, mix string, valueSize int) (*work
 	return w, nil
 }
 
-// nextKey returns the next key as a 16-char zero-padded decimal so keys sort
-// lexicographically (matches the LSM's key ordering).
+// keyForIndex formats key index n as a 16-char zero-padded decimal so keys sort
+// lexicographically (matching the LSM's key ordering).
+//
+// Every phase of the bench derives its keys from this one function, which is
+// what lets a prefill guarantee it wrote exactly the keys a later read phase
+// will ask for. Changing the format here changes it everywhere, so a prefilled
+// keyspace can never drift out of alignment with the workload reading it.
+func keyForIndex(n uint64) string {
+	return fmt.Sprintf("k%015d", n)
+}
+
+// nextKey returns the next key for the configured distribution. seq is the
+// arrival sequence number, used only by the "sequential" distribution.
 func (w *workload) nextKey(seq uint64) string {
 	var n uint64
 	switch w.keyDist {
@@ -130,8 +141,7 @@ func (w *workload) nextKey(seq uint64) string {
 		n = uint64(r.Intn(w.keyspace))
 		w.rngPool.Put(r)
 	}
-	// 16-char zero-padded width so keys sort lexicographically.
-	return fmt.Sprintf("k%015d", n)
+	return keyForIndex(n)
 }
 
 // nextOp picks an op based on the configured mix.

@@ -43,6 +43,7 @@ func main() {
 		queueCap  = flag.Int("queue-cap", 0, "arrival queue capacity (default: workers*4)")
 		output    = flag.String("output", "table", "table|json")
 		clientTO  = flag.Duration("client-timeout", 10*time.Second, "per-request HTTP timeout")
+		prefill   = flag.Bool("prefill", false, "write every key in [0,keyspace) once before warmup, so reads traverse SSTables instead of the memtable (see prefill.go)")
 	)
 	flag.Parse()
 
@@ -109,6 +110,55 @@ func main() {
 		clients:  clients,
 	}
 
+	// ---- Prefill phase ------------------------------------------------------
+	// Runs before warmup so the warmup window doubles as cache-warming and
+	// compaction-settling time, leaving the measurement window to observe a
+	// steady-state read path.
+	var pf *prefillResult
+	if *prefill {
+		fmt.Fprintf(os.Stderr, "bench: prefilling %d keys @ %dB values (closed-loop, not rate-limited) ...\n",
+			*keyspace, *valueSize)
+		preMetrics, err := scrapeMetrics(ctx, clients[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bench: scrape pre-prefill metrics: %v\n", err)
+			preMetrics = map[string]uint64{}
+		}
+		pf = runPrefill(ctx, prefillConfig{
+			keyspace: *keyspace,
+			value:    wl.value,
+			workers:  *workers,
+			clients:  clients,
+			progress: os.Stderr,
+		})
+		if postMetrics, err := scrapeMetrics(ctx, clients[0]); err == nil {
+			pf.engineDelta = metricsDelta(preMetrics, postMetrics)
+		} else {
+			fmt.Fprintf(os.Stderr, "bench: scrape post-prefill metrics: %v\n", err)
+		}
+		if ctx.Err() != nil {
+			// Ctrl-C during a multi-minute prefill: report it as an interruption
+			// rather than a cluster failure, and do not measure a keyspace we
+			// know is incomplete.
+			fmt.Fprintf(os.Stderr, "bench: prefill interrupted after %d/%d keys\n",
+				pf.keysWritten, *keyspace)
+			os.Exit(1)
+		}
+		if pf.failed > 0 {
+			// A partly-written keyspace makes every read-path ratio meaningless:
+			// reads of never-written keys are bloom misses that inflate the miss
+			// count and deflate the cache hit rate. Refuse rather than publish a
+			// number that looks measured but is not.
+			fmt.Fprintf(os.Stderr,
+				"bench: prefill FAILED — %d of %d keys unwritten after %d attempts each; first error: %v\n",
+				pf.failed, *keyspace, prefillMaxAttempts, pf.firstErr)
+			fmt.Fprintln(os.Stderr,
+				"bench: refusing to measure over an incomplete keyspace (read-path ratios would be invalid)")
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "bench: prefill done — %d keys in %s (%.0f keys/s), retries=%d\n",
+			pf.keysWritten, pf.elapsed.Round(time.Millisecond), pf.keysPerSec(), pf.retries)
+	}
+
 	// ---- Warmup phase --------------------------------------------------------
 	if *warmup > 0 {
 		fmt.Fprintf(os.Stderr, "bench: warmup %s @ %.0f qps ...\n", *warmup, *qps)
@@ -136,7 +186,7 @@ func main() {
 		endMetrics = map[string]uint64{}
 	}
 
-	rep := buildReport(measureCfg, phase, startMetrics, endMetrics, hostList[0], *valueSize, *mix)
+	rep := buildReport(measureCfg, phase, startMetrics, endMetrics, hostList[0], *valueSize, *mix, pf)
 
 	switch *output {
 	case "json":

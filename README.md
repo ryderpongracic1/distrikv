@@ -72,7 +72,7 @@ optimisation, chaos testing, and operational hardening.
 | P3 | Leveled compaction strategy + write-stall backpressure | ✅ Done |
 | P4 | Deterministic fault injection & Jepsen-style linearizability verification | ✅ Done |
 | P5 | In-process sharded LRU block cache (64 MB default, configurable) | ✅ Done |
-| P6 | TBD | 🔲 Planned |
+| P6 | Cluster-level LSM read-path measurement (`cmd/bench --prefill`: Bloom, block cache and compaction counters proven under load) | ✅ Done |
 | P7 | TBD | 🔲 Planned |
 
 ---
@@ -385,6 +385,11 @@ go run ./cmd/bench \
     --valuesize 1024
 ```
 
+To measure the **LSM read path** (Bloom filters, block cache, compaction) rather
+than the memtable, add `--prefill` and a keyspace larger than the memtable can
+hold — see [Read-path engine metrics](#read-path-engine-metrics---prefill) for
+why this is required and what the numbers look like.
+
 ### Why open-loop?
 
 A naive closed-loop bench (N workers each `for { client.Put(...) }`) hides
@@ -415,6 +420,9 @@ saturation:    false   max_queue_depth=30
 | `bloom_misses` | Bloom said *definitely absent* — saved a block read. Higher is better for negative lookups. |
 | `bloom_hits` | Bloom said *might be present* — block was read. Includes true hits and false positives. |
 | `bloom_fp_rate` | `false_positives / bloom_hits`. A correctly sized Bloom filter stays well under 1%. |
+| `block_cache_hits` / `block_cache_misses` / `hit_rate` | Whether an SSTable block read was served from the in-process LRU cache or cost a `ReadAt`. Zero on a memtable-resident workload — nothing reached an SSTable. |
+| `prefill` | Present only with `--prefill`: keys written, achieved keys/s, retries, and failures. A non-zero `failed` aborts the run, because a read-path ratio measured over a partly-written keyspace is not a measurement. |
+| `during prefill` | Write-path counters (`flush_bytes`, `compactions`, `write_stalls`) attributed to the prefill phase, which is where they are earned — a read-only measurement window cannot produce a flush. |
 | `WAF` (Write Amplification Factor) | `(flush_bytes + compaction_bytes_written) / flush_bytes`. 1.0× means no compaction overhead; 2-3× is normal for size-tiered compaction; Phase 3 (leveled) will trade higher WAF for better read amp. |
 | `forwarded_requests` | Ring routed the key to a peer instead of handling it locally. |
 | `replication_errors` | Replica fan-out failures — a replica that did not ACK a primary's PUT/DELETE (unreachable, or an explicit rejection). Each one also fails the client's write with `503`, so a non-zero value means writes were **refused**, not merely under-replicated. Reports produced before replication was wired read `0` by construction; see the Phase 3 note under Status. |
@@ -456,8 +464,10 @@ Engine-side counters for these runs show `flush_bytes=0`, `bloom_*=0` and
 accumulates *unique*-key bytes slowly (overwrites replace in place in the
 memtable), so each node stays under the 4 MB flush threshold and every read is
 served from the memtable. The Bloom filter and block cache are only consulted
-on the SSTable path; exercising them requires a larger value size or keyspace
-(see the Zipfian hit-rate baseline below, which builds its SSTables explicitly).
+on the SSTable path. Reaching that path from a cluster bench requires writing
+each key once, which `--prefill` does — see
+[Read-path engine metrics](#read-path-engine-metrics---prefill) for the measured
+counters and the mechanism behind the zeros.
 
 #### Why these numbers replaced the earlier table
 
@@ -700,6 +710,181 @@ To drive an etcd cluster that is already running instead of launching one:
 
 `bench/etcd/README.md` documents the harness's flags and the exact points where
 its methodology matches — and deliberately diverges from — `cmd/bench`.
+
+### Read-path engine metrics (`--prefill`)
+
+Every cluster bench before this one reported `bloom_hits=0`, `bloom_misses=0`,
+`block_cache_hits=0`, `block_cache_misses=0` and `compactions=0`. The counters
+were never broken — they are wired from `lsm.WithMetrics` through
+`store.NewWithMetrics` (`cmd/node/node.go`) and incremented in `sstable.go`
+(Bloom, block cache) and `compaction.go`. The workload simply never left memory.
+
+**Mechanism.** `Memtable.Put` subtracts the replaced entry's bytes before adding
+the new ones, so the memtable accounts for **live** entries only. A Zipfian
+workload rewrites a small hot set, so resident bytes plateau far below the 4 MB
+flush threshold no matter how many ops are issued: at 16 B keys and 256 B values
+it takes roughly 15,400 *distinct* keys to fill a memtable, and a
+Zipfian α = 1.1 draw over 100,000 keys does not reach that many distinct keys in
+a 60 s run. No flush means no SSTable, and no SSTable means there is no Bloom
+filter, block cache or compaction to measure. The zeros were honest.
+
+**`--prefill`** writes every key in `[0, keyspace)` exactly once, before the
+warmup window, so resident bytes grow monotonically: the memtable fills,
+flushes, L0 accumulates, compaction runs, and reads must then traverse SSTables.
+
+Why a flag and not just existing flags: `--mix 100:0:0 --keydist sequential`
+gets close, but coverage of the keyspace becomes a function of
+`--qps × --duration`, arrivals are Poisson-scheduled rather than exhaustive, and
+any write that fails leaves a hole. A hit rate measured over a partly-written
+keyspace is not a hit rate — reads of never-written keys are Bloom *misses* that
+inflate the miss count and deflate the cache hit rate. `--prefill` is therefore
+exhaustive, closed-loop (not rate-limited), and retries transient
+`503 ErrWriteStalled` backpressure, which a prefill is the workload most likely
+to provoke. If any key cannot be written after its retry budget, the run
+**aborts** rather than publishing a number that looks measured but is not.
+
+```bash
+# Prefill 500k keys, then measure a read-only Zipfian window over them.
+# (The measured table below used --keyspace 200000; 500k is the recommended
+#  size when you have the wall-clock budget for it — see the runbook.)
+docker run --rm --network docker_default -v "$PWD:/b" alpine \
+  /b/bench-linux --target node1:8001 --prefill \
+    --qps 4000 --duration 60s --warmup 60s \
+    --mix 0:100:0 --keyspace 500000 --keydist zipf \
+    --workers 128 --valuesize 256
+```
+
+#### Measured (2026-08-17, 3-node cluster, Linux dev container, 200k-key prefill)
+
+**Read this table for the engine ratios, not for throughput.** All three nodes
+ran on one fsync-bound container filesystem, which held the prefill to 406
+keys/s and every read pass to ~400 QPS; the cluster throughput and latency
+numbers remain the M4 Pro figures in the table above. What transfers across
+hardware is which counters move and in what proportion.
+
+Prefill phase — 200,000 keys × 256 B, written once each:
+
+| Prefill | Value |
+| --- | ---: |
+| Keys written / failed | 200,000 / **0** |
+| Wall time (throughput) | 492 s (406 keys/s) |
+| `flush_bytes` (node1) | 34.9 MB across 8 flushes |
+| `compactions_total` (node1) | **2** |
+| `compaction_bytes_written` | 52.3 MB |
+| `write_stall_count` | 0 |
+| Write amplification (WAF) | **2.50×** |
+
+Read phase — three 60 s read-only windows over that same prefilled data,
+changing only the access pattern:
+
+| Read pattern | `bloom_hits` | `bloom_misses` | cache hits | cache misses | **hit rate** | `bloom_fp_rate` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Zipf α=1.1, 200k keys, 20 s warm | 12,624 | 0 | 11,675 | 949 | **92.5%** | 0.00% |
+| Zipf α=1.1, 200k keys, 60 s warm (cache already warmed by prior passes) | 12,547 | 0 | 12,465 | 82 | **99.3%** | 0.00% |
+| Uniform, 200k keys | 7,136 | 0 | 4,338 | 2,798 | **60.8%** | 0.00% |
+| Uniform, 400k keys (half absent) | 3,536 | **3,963** | 2,908 | 628 | 82.2% | 0.00% |
+
+Four things this measures that the unit-level benchmarks could not:
+
+1. **The read path is real end to end.** Client → HTTP → ring → gRPC forward →
+   LSM → SSTable → Bloom filter → block cache all execute, and the counters
+   reconcile: of 23,918 reads, 11,253 were forwarded to peers, leaving 12,665
+   served locally against 12,624 Bloom lookups — essentially every locally
+   served read consulted an SSTable.
+2. **The cache earns its keep on skew, and only on skew.** Same data, same
+   cluster, same cache: 92.5% under Zipfian versus **60.8% under uniform**. The
+   32-point gap is the block cache's entire value proposition, isolated by
+   changing one flag.
+3. **The hit rate is warm-window-dependent, and converges on the unit-test
+   figure.** A 20 s warmup still pays first-touch misses on cold blocks (92.5%);
+   a longer warm window reaches **99.3%**, which agrees with
+   `TestBlockCache_ZipfHitRate`'s 99.2% at the same 64 MB default cache. The
+   cluster read path and the synthetic bench measure the same thing.
+4. **Bloom filters only pay off on absent keys — and here they pay off
+   perfectly.** In these runs `bloom_misses` is 0, and the reason has two parts.
+   Structurally, `Compactor.Compact` merges *all* L0 plus *all* L1 into a single
+   output SSTable with no size-based split, so **L1 is always exactly one file**
+   at any data volume, and neither `LSMTree.Get` nor `SSTableReader.Get` prunes
+   by key range before consulting the filter. Contingently, the prefill happened
+   to end just after a compaction, leaving `l0_file_count=0` — so a read
+   consulted exactly one filter for a key that was present, which a Bloom filter
+   can only answer "might contain". Had 1–3 L0 files been resident (the normal
+   state between compactions), each read would have paid one Bloom *miss* per L0
+   file lacking the key, so this row is a floor on Bloom activity, not a ceiling.
+   Point half the reads at keys that were never written and the negative path
+   appears unambiguously: **3,963 of 7,499 lookups (52.8%) were answered
+   "definitely absent" without touching a block**, at a **0.00% false-positive
+   rate** (0 of 3,536 positives).
+
+#### Reproducing on a Docker cluster
+
+```bash
+# 0. Fresh cluster — a prefill measurement must not inherit another run's data
+docker compose -f docker/docker-compose.yml down -v
+GOPROXY=direct docker compose -f docker/docker-compose.yml up -d --build && sleep 20
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bench-linux ./cmd/bench
+
+# 1. Prefill + Zipfian read window (one command: prefill runs before warmup)
+docker run --rm --network docker_default -v "$PWD:/b" alpine \
+  /b/bench-linux --target node1:8001 --prefill \
+    --qps 4000 --duration 60s --warmup 60s --mix 0:100:0 \
+    --keyspace 500000 --keydist zipf --workers 128 --valuesize 256 \
+  2>&1 | tee bench_readpath_zipf.txt
+
+# 2. Same data, uniform reads — isolates what the cache is worth on skew
+docker run --rm --network docker_default -v "$PWD:/b" alpine \
+  /b/bench-linux --target node1:8001 \
+    --qps 4000 --duration 60s --warmup 60s --mix 0:100:0 \
+    --keyspace 500000 --keydist uniform --workers 128 --valuesize 256 \
+  2>&1 | tee bench_readpath_uniform.txt
+
+# 3. Same data, double the keyspace — half the reads are absent keys, which is
+#    the only condition under which the Bloom filter's negative path is visible
+docker run --rm --network docker_default -v "$PWD:/b" alpine \
+  /b/bench-linux --target node1:8001 \
+    --qps 4000 --duration 60s --warmup 60s --mix 0:100:0 \
+    --keyspace 1000000 --keydist uniform --workers 128 --valuesize 256 \
+  2>&1 | tee bench_readpath_negative.txt
+```
+
+Validity gates, in order of what invalidates the run:
+
+- `failed=0` on the prefill line. Any other value aborts the run by design.
+- `errors: 0` and `saturation: false` on each read pass.
+- `compactions` non-zero on the `during prefill` line — if it is 0, the keyspace
+  was too small to fill 4 memtables per node and no SSTable merge ever ran.
+- `block_cache_hits` non-zero in steps 1–3 and `bloom_misses` non-zero in step 3.
+  A zero there means reads never left the memtable.
+
+Steps 2 and 3 deliberately skip `--prefill`: the cluster already holds the data,
+and re-prefilling would only rewrite it.
+
+
+
+#### On the 86.3% cache hit rate
+
+The frequently quoted 86.3% is the **8 MB point of a cache-size sweep** in
+`TestBlockCache_ZipfHitRate`, not the shipped configuration: `defaultBlockCacheBytes`
+is **64 MB**, which that same sweep measures at 99.2%. The cluster-level number
+above (99.3% warm) matches the default-configuration figure, not the 8 MB one.
+Any summary of this project's cache performance should quote 99.2–99.3% at the
+64 MB default, or state the cache size alongside 86.3%.
+
+#### What the scrape can and cannot see
+
+`cmd/bench` scrapes `/metrics` from the **first `--target` only**. Reads for keys
+owned by another node are forwarded and served there, so their Bloom and cache
+counters are recorded on that peer: roughly half of the ops above never touch
+node1's engine. Absolute counter values are therefore one node's share, not the
+cluster total — but every **ratio** (hit rate, FP rate, WAF) is computed from
+counters taken on the same node over the same window and is unaffected.
+
+Write-path counters (`flush_bytes`, `compactions_total`, `write_stall_count`) are
+reported for the **prefill phase** rather than the measurement window, because a
+read-only window cannot produce a flush — and neither can a *write* window after
+a full prefill: once every key exists, further writes are same-size overwrites,
+which the memtable's live-entry accounting does not count as growth. The flushes
+and compactions that put the data on disk all belong to the prefill.
 
 ### Phase 2 WAL allocation profile (2026-05-21, Apple M1 Max)
 

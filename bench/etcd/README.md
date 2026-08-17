@@ -38,9 +38,19 @@ running, only installed.
 brew install etcd                      # or apt, or a release tarball on PATH
 CGO_ENABLED=0 go build -o etcd-ceiling .
 
-./etcd-ceiling --qps 1200 --duration 60s --warmup 5s \
-  --mix 100:0:0 --workers 128 --valuesize 256 --keyspace 100000 --keydist zipf
+# The write workload as the repository README's ceiling table was measured:
+# offered 2000 QPS, 60s after a 5s warmup, harness defaults for distribution
+# (uniform) and worker count (256), left explicit so the run is reproducible.
+./etcd-ceiling --qps 2000 --duration 60s --warmup 5s \
+  --mix 100:0:0 --workers 256 --valuesize 256 --keyspace 100000 --keydist uniform
 ```
+
+The published reads and mixed rows are the same command with
+`--qps 6000 --mix 0:100:0` and `--qps 3000 --mix 20:80:0`. To remove the two
+disclosed asymmetries against the distrikv baseline instead — matching its
+distribution, worker count and offered write load — use
+`--qps 1200 --workers 128 --keydist zipf`; that variant is not what the published
+table reports.
 
 Members are launched on loopback with client ports **2379 / 2381 / 2383** and
 peer ports **2380 / 2382 / 2384**, into a temporary data directory that is

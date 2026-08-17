@@ -2,7 +2,13 @@
 
 [![CI](https://github.com/ryderpongracic1/distrikv/actions/workflows/ci.yml/badge.svg)](https://github.com/ryderpongracic1/distrikv/actions/workflows/ci.yml)
 
-A production-quality distributed key-value store written in Go from scratch.
+A distributed key-value store written in Go from scratch, hardened through seven
+phases of measured bug-hunting (P1–P7 under [Status](#status)) on top of the
+seven developmental phases that built it. The defects those phases found —
+including a compaction path that dropped acknowledged writes, and a leader that
+had never sent a heartbeat — are documented where they happened rather than
+quietly fixed. It is not production-grade; it is measured, and it says what the
+measurements found.
 
 ```
                 ┌──────────────────────────────────────────────────────┐
@@ -51,7 +57,7 @@ optimisation, chaos testing, and operational hardening.
 | 3 | Write replication to R=2 replicas via gRPC | ✅ Done |
 | 4 | Raft leader election + heartbeats | ✅ Done |
 | 5 | Docker Compose cluster + demo script | ✅ Done |
-| 6 | LSM-Tree storage engine + complete Raft (snapshots, pre-vote) | ✅ Done |
+| 6 | LSM-Tree storage engine + Raft pre-vote and snapshot codec (the log path is a stub — see [Raft](#raft-internalraft)) | ✅ Done |
 | 7 | `distrikv-cli` — first-class CLI tool | ✅ Done |
 
 > **Phase 3 note — honest disclosure.** The replication fan-out
@@ -115,9 +121,9 @@ Every `Put` and `Delete` is appended to a binary WAL file **before** the MemTabl
 - `AppendEntries` **heartbeats only** (75 ms send period). Heartbeats carry no entries, so they serve purely as a liveness signal and a leader-authority assertion. Each heartbeat RPC carries its own deadline, deliberately decoupled from the send period and bounded by the minimum election timeout: a heartbeat is useful to a follower right up until that follower's election timer expires, and pointless after it.
 - Atomic persistence of `currentTerm`/`votedFor` via write-temp-then-`os.Rename`.
 
-**Implemented but dormant — exercised by unit tests, never by a running cluster:**
+**Stubs and dormant paths — exercised by unit tests, never by a running cluster:**
 
-- **Log replication.** `AppendEntries` entry handling, `applyEntryLocked`, and the `nextIndex`/`matchIndex` bookkeeping are all implemented, but nothing in the system ever proposes an entry to the Raft log. Client writes go to the storage engine directly (see deviation 1). Consequence: `r.log` stays empty for the lifetime of the process.
+- **Log replication is a stub, not a finished implementation parked outside the data path.** Nothing in the system ever proposes an entry to the Raft log — client writes go to the storage engine directly (see deviation 1) — so `r.log` stays empty for the lifetime of the process, and the entry-handling code has never had to be correct. Read against the paper, it is not. In `HandleAppendEntries` (`internal/raft/raft.go`): `PrevLogIndex`/`PrevLogTerm` are never checked, a conflicting suffix is never truncated, and `Success = true` is set for every request whose term is not stale — so the §5.3 Log Matching Property is neither enforced nor detectable. `LeaderCommit` is ignored, and there is no `commitIndex` field in the struct at all, so nothing tracks what is committed. `applyEntryLocked` writes each entry to the store **on receipt** rather than on commit, which inverts the paper's ordering. On the leader side, `nextIndex` is initialised at election and overwritten after a snapshot install, but never decremented on a rejection — the backtracking loop that repairs a divergent follower does not exist — and `matchIndex` never advances. Before this path could carry data it would need §5.3 log matching (consistency check, conflict truncation, `nextIndex` backoff) and commit-index tracking (majority `matchIndex` → `commitIndex` → apply) built on top of it.
 - **Snapshot delivery.** `InstallSnapshot` and the snapshot codec work, and `internal/raft/snapshot_test.go` covers them. But snapshots are triggered by log growth past `snapshotThreshold: 1000`, and since the log never grows, that trigger never fires. No `InstallSnapshot` RPC is ever sent outside tests.
 
     Traced end to end, because it decides whether the state-machine restore path can ever run in production: `takeSnapshot` is called from exactly one place, `applyEntryLocked`, which only runs when an `AppendEntries` request carries entries. Heartbeats never carry any and nothing proposes, so `takeSnapshot` never runs, `SnapshotStore.Save` is never called, and **`raft_snapshot.bin` never exists**. That makes *both* callers of `store.RestoreFromSnapshot` unreachable in a running cluster: the startup restore in `raft.New` (guarded on a snapshot file being present) and `HandleInstallSnapshot` (a leader must send one first, and `sendInstallSnapshot` returns immediately when there is no snapshot to send). The restore path is still kept correct and fast — see the bulk-load note below — but it is dead code today, so it was **not** the cause of the recovery-availability collapse the write-stall section describes.
@@ -147,7 +153,7 @@ project's first boot.
 
 1. **Data writes bypass Raft consensus.** Writes flow through the consistent-hash ring, not through the Raft log. Raft here is a leader-election and failure-detection mechanism only. This means Raft's "if committed, all future leaders have it" guarantee does **not** apply to data. Under partition the ring-primary and its replicas can diverge.
 
-2. **The Raft log is never written, so log-based guarantees are vacuous.** There is no log truncation on leader change because there are no entries to truncate, and no commit index advancing because nothing is proposed. Mitigation for data: all reads route to the ring-primary, so stale reads are bounded to the in-flight crash window.
+2. **The Raft log is never written, so log-based guarantees are vacuous.** There is no log truncation on leader change because there are no entries to truncate, and no commit index at all — the field does not exist, because nothing is proposed. Mitigation for data: all reads route to the ring-primary, so stale reads are bounded to the in-flight crash window.
 
 3. **Static membership.** No membership-change protocol. Adding/removing a node requires a cluster restart.
 
@@ -676,6 +682,13 @@ go run ./cmd/bench \
     --valuesize 1024
 ```
 
+That form goes through the host's port forward, which is fine for a smoke run but
+**not** for a number worth publishing: on macOS it adds a proxy hop and caps
+concurrent connections at the ephemeral port range. Any figure meant for a table
+must be measured from inside the cluster's Docker network — see the methodology
+note under
+[Throughput baseline with replication](#throughput-baseline-with-replication-2026-08-16-3-node-docker-compose-apple-m4-pro-colima-vm-8-cpu--8-gb).
+
 To measure the **LSM read path** (Bloom filters, block cache, compaction) rather
 than the memtable, add `--prefill` and a keyspace larger than the memtable can
 hold — see [Read-path engine metrics](#read-path-engine-metrics---prefill) for
@@ -780,10 +793,16 @@ work per request — a synchronous replica ACK — and still post a 15× better
 p99**, because the connection churn cost far more than replication does.
 
 Reads are never replicated; read throughput is bounded by ring lookup,
-memtable/LSM reads, and HTTP round-trip overhead. Roughly half of all requests
-are forwarded to the ring-primary via gRPC (`forwarded_requests` ≈ ops × 2/3
-per node on a 3-node ring), so forwarding overhead is already included in
-every percentile above.
+memtable/LSM reads, and HTTP round-trip overhead. A request that lands on a node
+which is not the key's ring-primary is forwarded there over gRPC, and that
+forwarding overhead is already inside every percentile above. The measured
+fraction is **distribution-dependent, not the 2/3 a uniformly-owned 3-node ring
+would predict**: the read run above forwarded 167,334 of 361,026 ops (**46%**),
+while the uniform read-path runs in
+[Read-path engine metrics](#read-path-engine-metrics---prefill) forwarded 160,486
+of 239,923 (**67%**, i.e. 2/3 as predicted). The Zipfian shortfall is consistent
+with node1 owning more than a third of the *hot* keys — under skew the forward
+fraction tracks ownership of the small hot set, not of the whole key space.
 
 ### Ceiling — vs etcd (SOTA CP key-value store)
 
@@ -812,48 +831,80 @@ structurally different ways:
 So the interesting output is not a winner. It is the shape of the gap, and what
 the shape says about the trade each design made.
 
-`bench/etcd/` is a separate Go module containing a harness that runs **the same
-workload** against etcd: the same Zipfian key distribution (α=1.1), the same
-open-loop Poisson arrivals, the same key format, the same value bytes, the same
-worker count. It launches its own 3-member etcd cluster on loopback and reports
-exact latency percentiles per operation type. Keeping it in its own module keeps
-etcd's dependency tree out of distrikv's `go.mod`.
+`bench/etcd/` is a separate Go module containing a harness able to run **the same
+workload** against etcd: the same key format, the same value bytes, the same
+open-loop Poisson arrivals, and the same Zipfian generator (α=1.1, seeded
+identically) when asked for it. It launches its own 3-member etcd cluster on
+loopback and reports exact latency percentiles per operation type. Keeping it in
+its own module keeps etcd's dependency tree out of distrikv's `go.mod`.
+
+The published run below did **not** use every one of those knobs: it ran the
+harness at its defaults for key distribution (uniform) and worker count (256),
+against a distrikv baseline that used Zipf α=1.1 and 128 workers. Both
+asymmetries are disclosed under the table; the runbook reproduces the run as it
+actually happened, and notes the matched-parameter variant alongside it.
 
 #### Results (2026-08-17, Apple M4 Pro, etcd 3.7.1 native vs distrikv 3-node Colima)
 
 etcd: 3-member cluster on loopback, native APFS, uniform 100k-key distribution,
-256 B values, 60 s runs, 128 workers, 0 errors across all three workloads.
+256 B values, 60 s runs after a 5 s warmup, **256 workers** (harness default),
+0 errors across all three workloads. Offered load: 2,000 / 6,000 / 3,000 QPS.
 distrikv: 3-node docker-compose inside Colima VM (8 CPU / 8 GB), Zipfian α=1.1,
-same value size and duration — reproduced from the validated baseline above.
+**128 workers**, same value size and duration, offered 1,200 / 6,000 / 3,000 QPS
+— reproduced from the validated baseline above.
 
-| Workload (60s, 256 B values, 128 workers) | distrikv achieved | etcd achieved | distrikv p99 | etcd p99 |
-| --- | ---: | ---: | ---: | ---: |
-| 100% writes (PUT) | **1,199 /s** | **1,995 /s** | 4.6 ms | 73.7 ms |
-| 100% reads (GET) | **6,017 /s** | **6,009 /s** | 1.7 ms | 0.79 ms |
-| 20% write / 80% read | **3,000 /s** | **2,993 /s** | 2.5 ms | 80.9 ms† |
+| Workload (60s, 256 B values) | distrikv offered | distrikv achieved | etcd offered | etcd achieved | distrikv p99 | etcd p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100% writes (PUT) | 1,200 /s | **1,199 /s** | 2,000 /s | **1,995 /s** | 4.6 ms | 73.7 ms |
+| 100% reads (GET) | 6,000 /s | **6,017 /s** | 6,000 /s | **6,009 /s** | 1.7 ms | 0.79 ms |
+| 20% write / 80% read | 3,000 /s | **3,000 /s** | 3,000 /s | **2,993 /s** | 2.5 ms | 80.9 ms† |
 
 † Mixed p99 is the worse of the two op types; etcd's gets queue behind puts.
 
-| Per-op latency, mixed workload (20:80) | distrikv p50 | etcd p50 | distrikv p99 | etcd p99 |
+**Both write rows are achieved-equals-offered, so neither is a throughput
+ceiling** — and the two rows were not offered the same load. See mechanism 1
+below before reading anything about write throughput out of this table.
+
+| Per-op latency, mixed workload (20:80) | distrikv p50‡ | etcd p50 | distrikv p99‡ | etcd p99 |
 | --- | ---: | ---: | ---: | ---: |
 | PUT | 0.70 ms | 34.1 ms | 2.5 ms | 70.3 ms |
 | GET | 0.70 ms | 36.2 ms | 2.5 ms | 80.9 ms |
+
+‡ `cmd/bench` reports one merged latency distribution, not a per-op split, so
+both distrikv rows repeat the overall figure — its PUT and GET tails are not
+measured separately. Only the etcd columns are genuinely per-op (that split is
+one of the harness's deliberate divergences; see `bench/etcd/README.md`).
 
 **The honest headline is the read comparison, not the write comparison.** At
 matched throughput (~6,000 reads/s), etcd's p99 is **0.79 ms vs distrikv's
 1.7 ms** — etcd reads are ~2× faster at the tail despite paying a linearizable
 quorum round-trip. distrikv's extra latency is consistent with the HTTP hop plus
-the 2/3-probability internal gRPC forward that a non-primary node pays. The
+the internal gRPC forward that a non-primary node pays — measured at 46% of
+requests on this Zipfian baseline (167,334 forwards over 361,026 reads). The
 read path has no fsync on either side, so this comparison is clean.
 
 The write comparison is **not clean** — see the durability confound below.
 
-> **Distribution mismatch (disclosed).** The etcd harness used uniform random
-> over 100k keys (its default workload generator); distrikv's baseline used
-> Zipfian α=1.1 over 100k keys. For the read and mixed rows this means etcd
-> paid uniform cache pressure while distrikv benefited from hot-key locality.
-> For writes the difference is smaller (both distributions produce distinct
-> keys at similar rates over 60 s at these QPS levels), but it is not zero.
+> **Parameter mismatches (disclosed).** Two knobs differed between the columns,
+> both because the etcd run took the value both harnesses default to while
+> distrikv's baseline had overridden it on the command line:
+>
+> - **Key distribution.** The etcd harness used uniform random over 100k keys
+>   (its default generator); distrikv's baseline used Zipfian α=1.1 over 100k
+>   keys. For the read and mixed rows this means etcd paid uniform cache
+>   pressure while distrikv benefited from hot-key locality. For writes the
+>   difference is smaller (both distributions produce distinct keys at similar
+>   rates over 60 s at these QPS levels), but it is not zero.
+> - **Worker count.** etcd ran with 256 concurrent workers, distrikv with 128.
+>   Neither run saturated (`saturation: false`, `max_queue_depth ≪ cap` on both
+>   sides), and latency is measured from the *scheduled* arrival time on both
+>   harnesses, so the concurrency difference does not inflate either tail
+>   through coordinated omission — but it does mean the two stores were held at
+>   different in-flight depths, and etcd's deeper pool is a mild handicap on its
+>   fsync-bound write path.
+>
+> The runbook below reproduces the run as it happened; matching both knobs is
+> listed there as the variant that removes these two asymmetries.
 
 #### Why the gap has the shape it does
 
@@ -866,10 +917,30 @@ is why a single "distrikv is N× faster/slower" number would be meaningless.
    by all keys. distrikv has three concurrent write paths, one per ring
    primary, each with its own WAL and its own fsync stream. A 3-node distrikv
    ring can therefore absorb roughly 3× the independent write streams before
-   any single node's disk becomes the bottleneck. This is the design's main
-   throughput advantage and it grows with node count, where etcd's write
-   throughput is flat in node count (and mildly *decreasing*, since a larger
-   majority means more replication work per commit).
+   any single node's disk becomes the bottleneck, and that advantage grows with
+   node count, where etcd's write throughput is flat in node count (and mildly
+   *decreasing*, since a larger majority means more replication work per
+   commit).
+
+   **This claim is supported by structure only — nothing on this page measures
+   it.** distrikv's write row was offered 1,200 QPS and achieved 1,199; etcd's
+   was offered ~2,000 and achieved 1,995. Both systems delivered the load they
+   were asked for, unsaturated (`saturation: false` on both), so **neither
+   number is a throughput ceiling** — they are two different offered rates, and
+   the 1,199-vs-1,995 gap in the table is a gap in what was *requested*, not in
+   what either store could do. Nothing here establishes that ring fan-out has a
+   higher write ceiling than a Raft log; it establishes only that both stores
+   were comfortable below theirs.
+
+   The measurement that would settle it is a **saturation sweep**: raise offered
+   write QPS on each store in steps until achieved QPS stops tracking target or
+   `saturation: true` trips, and report the knee. Run against distrikv at 1, 2
+   and 3 nodes, that also tests the scaling half of the claim — the ceiling
+   should move with node count for the ring and stay flat for etcd. Until that
+   exists, treat this mechanism as a design argument, not a result. (The
+   durability confound below would have to be neutralised first — a ceiling
+   measured against fsyncs that may be absorbed by a VM page cache is not a
+   ceiling.)
 
 2. **Read latency: linearizable quorum read vs primary-local read.** An etcd
    `Get` is linearizable by default: it goes through the leader's read-index
@@ -904,7 +975,9 @@ list below is where the decade of engineering actually went:
 - **Consensus-backed durability.** A committed etcd write survives any minority
   failure with the "if committed, all future leaders have it" guarantee.
   distrikv's ring replication has no such property — the ring-primary and its
-  replicas can diverge under partition, and nothing converges them afterwards.
+  replicas can diverge under partition. Anti-entropy repairs that divergence
+  afterwards, within the limits its own section states, but there is no
+  protocol-level guarantee at commit time.
 - **Dynamic membership.** etcd adds and removes members through a Raft config
   change, online. distrikv's ring is static and requires a cluster restart.
 - **Availability under single-member failure**, per the quorum point above.
@@ -962,30 +1035,46 @@ worse than the asymmetry itself:
 ```bash
 # 1. Install etcd (the harness launches it; it never needs to be running first)
 brew install etcd
-etcd --version        # expect 3.5.x or 3.6.x
+etcd --version        # the published table was measured on 3.7.1
 
 # 2. Build the harness. Separate module, so build from its own directory.
 cd ~/documents/github/distrikv/bench/etcd
 GOPROXY=direct go mod download
 CGO_ENABLED=0 go build -o etcd-ceiling .
 
-# 3. Run the three workloads. Flags mirror the distrikv baseline exactly:
-#    128 workers, 256 B values, 100k-key Zipf, 60s after a 5s warmup.
-./etcd-ceiling --qps 1200 --duration 60s --warmup 5s \
-  --mix 100:0:0 --workers 128 --valuesize 256 --keyspace 100000 --keydist zipf \
+# 3. Run the three workloads exactly as the published table was measured:
+#    offered 2000 / 6000 / 3000 QPS, 60s after a 5s warmup, 256 B values,
+#    100k-key uniform distribution and 256 workers (both harness defaults,
+#    left explicit here so the run is reproducible from this block alone).
+./etcd-ceiling --qps 2000 --duration 60s --warmup 5s \
+  --mix 100:0:0 --workers 256 --valuesize 256 --keyspace 100000 --keydist uniform \
   2>&1 | tee etcd_writes.txt
 
 ./etcd-ceiling --qps 6000 --duration 60s --warmup 5s \
-  --mix 0:100:0 --workers 128 --valuesize 256 --keyspace 100000 --keydist zipf \
+  --mix 0:100:0 --workers 256 --valuesize 256 --keyspace 100000 --keydist uniform \
   2>&1 | tee etcd_reads.txt
 
 ./etcd-ceiling --qps 3000 --duration 60s --warmup 5s \
-  --mix 20:80:0 --workers 128 --valuesize 256 --keyspace 100000 --keydist zipf \
+  --mix 20:80:0 --workers 256 --valuesize 256 --keyspace 100000 --keydist uniform \
   2>&1 | tee etcd_mixed.txt
 ```
 
-Then re-measure distrikv with the identical workload so both columns come from
-one sitting on one machine:
+**Matched-parameter variant** — removes the two disclosed asymmetries by driving
+etcd at distrikv's distribution, worker count and offered write load. Run it in
+addition to the block above, not instead of it, so the published numbers stay
+reproducible:
+
+```bash
+./etcd-ceiling --qps 1200 --duration 60s --warmup 5s \
+  --mix 100:0:0 --workers 128 --valuesize 256 --keyspace 100000 --keydist zipf \
+  2>&1 | tee etcd_writes_matched.txt
+```
+
+Then re-measure distrikv so both columns come from one sitting on one machine.
+Note this reproduces the distrikv column *as published* — Zipf, 128 workers,
+1,200 QPS offered on writes — which is why it is not flag-for-flag identical to
+the etcd block above; the matched-parameter variant is the one that closes that
+gap, from the etcd side:
 
 ```bash
 cd ~/documents/github/distrikv
@@ -1025,7 +1114,7 @@ go build -o bench ./cmd/bench
 To drive an etcd cluster that is already running instead of launching one:
 
 ```bash
-./etcd-ceiling --no-cluster --endpoints 127.0.0.1:2379,127.0.0.1:2381,127.0.0.1:2383 --qps 1200
+./etcd-ceiling --no-cluster --endpoints 127.0.0.1:2379,127.0.0.1:2381,127.0.0.1:2383 --qps 2000
 ```
 
 `bench/etcd/README.md` documents the harness's flags and the exact points where
@@ -1065,8 +1154,8 @@ to provoke. If any key cannot be written after its retry budget, the run
 
 ```bash
 # Prefill 500k keys, then measure a read-only Zipfian window over them.
-# (The measured table below used --keyspace 200000; 500k is the recommended
-#  size when you have the wall-clock budget for it — see the runbook.)
+# (This is the command that produced the measured table below. The older
+#  dev-container table further down used --keyspace 200000.)
 docker run --rm --network docker_default -v "$PWD:/b" alpine \
   /b/bench-linux --target node1:8001 --prefill \
     --qps 4000 --duration 60s --warmup 60s \
@@ -1105,10 +1194,18 @@ Three things the Mac validation adds over the DevSpaces measurement (below):
    cache covers fewer of the keyspace's distinct blocks — and the effect is in
    the expected direction.
 2. **Bloom false-positive rate measured on the negative-lookup run: 0.01%.**
-   Of 39,078 bloom hits in the 1M-key run (half absent), an estimated ~0.01%
-   were false positives — well below the 1% design target. The DevSpaces run
-   reported exactly 0.00% at 200k scale; 500k keys with more L0 residency
-   between compactions produced the first measurable (but negligible) FP rate.
+   Of 39,078 bloom hits in the 1M-key run (half absent), 0.01% were false
+   positives — well below the 1% design target. This is measured, not estimated:
+   `bloom_fp_rate` is `BloomFalsePositives / BloomHits`, and both are hard
+   `atomic.Uint64` counters in `internal/metrics`, incremented in
+   `SSTableReader.Get` (`internal/store/lsm/sstable.go`) — `BloomHits` on every
+   filter positive, `BloomFalsePositives` at both sites where that positive then
+   fails to produce the key (no block covers it, and the block scan misses). The
+   only imprecision is display: the harness prints the rate to two decimals, so
+   0.01% pins the underlying false-positive count to single digits rather than to
+   an exact value. The DevSpaces run reported exactly 0.00% at 200k scale; 500k
+   keys with more L0 residency between compactions produced the first measurable
+   (but negligible) FP rate.
 3. **Latency stable across patterns.** p50 ~633 µs and p99 ~1.6 ms regardless
    of access pattern — the SSTable read path is dominated by the HTTP + ring
    forward hop, not by cache hits/misses. Cache misses trade a `ReadAt` syscall

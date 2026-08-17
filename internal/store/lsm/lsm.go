@@ -598,7 +598,11 @@ func (l *LSMTree) putInternal(_ context.Context, key string, value []byte) (uint
 //
 // A seq of 0 means "the sender did not supply one" (a peer predating the wire
 // field, or a WAL record written before the log carried sequence numbers) and
-// applies unconditionally, which is the pre-sequence behaviour.
+// applies unconditionally, which is the pre-sequence behaviour. Such a write is
+// routed through Put so that it is stamped with a fresh local sequence rather
+// than stored at 0: an entry at sequence 0 loses to every other version of the
+// key, so compaction's keep-the-higher merge would silently drop it at the next
+// merge, and the write would appear to apply and then revert.
 //
 // Cost: deciding needs the stored sequence, so a key that is not resident in a
 // memtable is looked up through the SSTables — bloom-filtered, so the common
@@ -608,6 +612,12 @@ func (l *LSMTree) putInternal(_ context.Context, key string, value []byte) (uint
 // the key is not in memory — would silently reinstate the inversion for any key
 // that has been flushed.
 func (l *LSMTree) PutIfNewer(ctx context.Context, key string, value []byte, seq uint64) (applied bool, err error) {
+	if seq == 0 {
+		if _, err := l.Put(ctx, key, value); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
 	if err := l.maybeStallWrite(ctx); err != nil {
 		return false, err
 	}
@@ -669,6 +679,12 @@ func (l *LSMTree) deleteInternal(_ context.Context, key string) (uint64, error) 
 // a put racing on one key resolve the same way on every replica: the higher
 // sequence wins regardless of which arrived last.
 func (l *LSMTree) DeleteIfNewer(ctx context.Context, key string, seq uint64) (applied bool, err error) {
+	if seq == 0 {
+		if _, err := l.Delete(ctx, key); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
 	if err := l.maybeStallWrite(ctx); err != nil {
 		return false, err
 	}
@@ -698,12 +714,11 @@ func (l *LSMTree) DeleteIfNewer(ctx context.Context, key string, seq uint64) (ap
 // to other writers: two inverted arrivals for one key serialise here, so the
 // older one always sees the newer one's entry.
 //
-// seq 0 is "unknown", and is reported as newer so the caller applies
-// unconditionally.
+// seq is required to be non-zero. Zero means "the sender supplied no ordering",
+// which PutIfNewer and DeleteIfNewer resolve before they reach here by routing
+// the write through Put/Delete so it is stamped with a real local sequence —
+// comparing against 0, or storing it, would both be wrong.
 func (l *LSMTree) isNewerLocked(key string, seq uint64) (bool, error) {
-	if seq == 0 {
-		return true, nil
-	}
 	stored, found, err := l.storedSeqLocked(key)
 	if err != nil {
 		return false, err
@@ -722,12 +737,12 @@ func (l *LSMTree) isNewerLocked(key string, seq uint64) (bool, error) {
 // the SSTable readers without taking a reference: installCompactionResult takes
 // the same lock, so no reader can be released underneath this traversal.
 func (l *LSMTree) storedSeqLocked(key string) (uint64, bool, error) {
-	if e, ok := l.mem.Get(key); ok {
-		return e.SeqNum, true, nil
+	if seq, ok := l.mem.GetSeqNum(key); ok {
+		return seq, true, nil
 	}
 	if l.imm != nil {
-		if e, ok := l.imm.Get(key); ok {
-			return e.SeqNum, true, nil
+		if seq, ok := l.imm.GetSeqNum(key); ok {
+			return seq, true, nil
 		}
 	}
 	for _, r := range l.l0 {

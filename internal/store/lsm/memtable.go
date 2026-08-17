@@ -185,6 +185,25 @@ func (m *Memtable) Get(key string) (Entry, bool) {
 	return m.tree.Get(Entry{Key: key})
 }
 
+// GetSeqNum returns the sequence number of this memtable's entry for key, and
+// whether such an entry exists. It is a single BTree lookup that hands back only
+// the version, because the replica apply path calls it on every replicated write
+// and needs to compare versions rather than read one — returning the whole entry
+// would hand out an alias of the stored value slice for no reason.
+//
+// A tombstone answers like any other entry: a delete is a version of the key,
+// and an apply-if-newer check that ignored tombstones would let an older value
+// overwrite a newer delete.
+func (m *Memtable) GetSeqNum(key string) (uint64, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	e, ok := m.tree.Get(Entry{Key: key})
+	if !ok {
+		return 0, false
+	}
+	return e.SeqNum, true
+}
+
 // IsFull reports whether the memtable has reached its flush threshold.
 func (m *Memtable) IsFull() bool { return m.size.Load() >= m.maxSize }
 

@@ -58,12 +58,14 @@ message ReplicateRequest {
   uint64 term  = 4; // Raft term at the time of the write
 
   // seq is the write sequence the ring-primary's storage engine assigned to
-  // this mutation. The replica applies it only if it does not already hold a
-  // version of the key at this sequence or above, so two writes to one key that
-  // arrive out of order resolve to the later write on every replica.
+  // this mutation. It is monotonic per primary, so for a given key — which has
+  // exactly one primary under the consistent-hash ring — a higher seq is
+  // strictly newer. Replicas apply-if-newer on it, which is what makes two
+  // near-simultaneous writes to one key converge on the same value even when
+  // they arrive at a replica in the opposite order.
   //
-  // 0 means "not supplied" (a peer predating this field) and applies
-  // unconditionally, which is the pre-sequence arrival-order behaviour.
+  // Zero means "no sequence assigned" and is applied unconditionally, so a
+  // sender that predates this field still replicates correctly.
   uint64 seq   = 5;
 }
 

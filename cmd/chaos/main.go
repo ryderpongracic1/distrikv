@@ -99,6 +99,7 @@ func main() {
 		delPct       = flag.Int("delete", 5, "percentage of operations that are deletes (0-100)")
 		checkTimeout = flag.Duration("check-timeout", 60*time.Second, "time limit for linearizability check")
 		output       = flag.String("output", "table", "output format: table|json")
+		cxFile       = flag.String("counterexample-file", "", "where to write the counterexample on FAIL (default: chaos-counterexample-<timestamp>.json; \"none\" disables)")
 
 		nemesisMode     = flag.String("nemesis", nemesisNone, "fault injection during measurement: none|kill-restart|stop-restart")
 		nemesisServices = flag.String("nemesis-services", "", "comma-separated compose service names to draw victims from (required unless --nemesis=none)")
@@ -292,6 +293,32 @@ func main() {
 		exitCode = 1
 	}
 
+	// Localise a FAIL before printing it. The whole-history verdict says only
+	// that some key's sub-history is illegal; the counterexample says which key,
+	// and which operations the checker could not order. Only a genuine
+	// non-linearizable verdict is localised: a timeout has no frontier to find,
+	// and a legal history that failed the convergence gate is a different
+	// finding with its own note.
+	var (
+		cx     *linearizability.Counterexample
+		cxPath string
+	)
+	if !ok && !timedOut {
+		cx = rec.Counterexample(*checkTimeout)
+		var cxErr error
+		cxPath, cxErr = writeCounterexampleFile(*cxFile, cx, counterexampleMeta{
+			Verdict:          result,
+			Target:           *target,
+			Nemesis:          ncfg.Describe(),
+			MeasurementStart: measureStart,
+			MeasuredFor:      measuredFor,
+			Windows:          windows,
+		})
+		if cxErr != nil {
+			log.Printf("counterexample: %v", cxErr)
+		}
+	}
+
 	// A cluster that never repaired its refused-but-applied writes has failed,
 	// even with a legal history: linearizability is about what clients observed
 	// through the primary, and divergence between a primary and its replicas is
@@ -327,6 +354,10 @@ func main() {
 			FaultsAttempted     int                 `json:"faults_attempted"`
 			FaultWindows        []faultWindowReport `json:"fault_windows,omitempty"`
 			Convergence         convergenceResult   `json:"convergence"`
+			// Counterexample is present only on a non-linearizable verdict that
+			// the per-key scan could localise.
+			Counterexample     *counterexampleReport `json:"counterexample,omitempty"`
+			CounterexampleFile string                `json:"counterexample_file,omitempty"`
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -351,6 +382,15 @@ func main() {
 			FaultsAttempted:     len(windows),
 			FaultWindows:        faultWindowReports(windows, measureStart),
 			Convergence:         converge,
+			Counterexample: buildCounterexampleReport(cx, counterexampleMeta{
+				Verdict:          result,
+				Target:           *target,
+				Nemesis:          ncfg.Describe(),
+				MeasurementStart: measureStart,
+				MeasuredFor:      measuredFor,
+				Windows:          windows,
+			}),
+			CounterexampleFile: cxPath,
 		})
 	} else {
 		sep := strings.Repeat("─", 60)
@@ -387,6 +427,15 @@ func main() {
 				continue
 			}
 			fmt.Printf("  %s\n", line)
+		}
+		if !ok && !timedOut {
+			for _, line := range formatCounterexample(cx, measureStart, windows, cxPath) {
+				if line == "" {
+					fmt.Printf("%s\n", sep)
+					continue
+				}
+				fmt.Printf("  %s\n", line)
+			}
 		}
 		fmt.Printf("%s\n\n", sep)
 	}
@@ -609,7 +658,7 @@ func runWorkers(
 					val := fmt.Sprintf("w%d-t%d", id, time.Now().UnixNano())
 					var cid int
 					if rec != nil {
-						cid = rec.Begin(linearizability.Input{Op: "put", Key: key, Value: val})
+						cid = rec.BeginWorker(id, linearizability.Input{Op: "put", Key: key, Value: val})
 					}
 					err := client.Put(ctx, key, val)
 					finishWrite(ctx, rec, cid, err, c)
@@ -617,7 +666,7 @@ func runWorkers(
 				case roll < putPct+delPct:
 					var cid int
 					if rec != nil {
-						cid = rec.Begin(linearizability.Input{Op: "delete", Key: key})
+						cid = rec.BeginWorker(id, linearizability.Input{Op: "delete", Key: key})
 					}
 					err := classifyDeleteErr(client.Delete(ctx, key))
 					finishWrite(ctx, rec, cid, err, c)
@@ -625,7 +674,7 @@ func runWorkers(
 				default: // get
 					var cid int
 					if rec != nil {
-						cid = rec.Begin(linearizability.Input{Op: "get", Key: key})
+						cid = rec.BeginWorker(id, linearizability.Input{Op: "get", Key: key})
 					}
 					val, err := client.Get(ctx, key)
 					if rec != nil {

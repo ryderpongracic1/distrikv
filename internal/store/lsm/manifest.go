@@ -34,6 +34,26 @@ type ManifestEvent struct {
 	// Pointer + omitempty keeps manifests written before this field existed
 	// decodable, and keeps "no count recorded" distinguishable from zero.
 	LiveKeys *int64 `json:"live_keys,omitempty"`
+
+	// MaxSeqNum records the highest write sequence number of any entry in this
+	// SSTable. Every add — flush, compaction and restore alike — records it,
+	// because it is what lets the engine reopen its write-sequence counter above
+	// everything already on disk.
+	//
+	// Sequence numbers are the total write order compaction uses to resolve two
+	// versions of a key: the higher one wins. The counter lives in memory, so
+	// without this field it restarts at zero on every open, and "newer" comes to
+	// mean "written earlier in a longer-lived process". A key written before a
+	// restart then outranks the value that replaced it after, and the first
+	// compaction to merge the two files keeps the stale one — silently, and
+	// durably, since the loser is dropped rather than shadowed. The same
+	// inversion resurrects a deleted key, because a tombstone that loses is
+	// discarded at the bottom level.
+	//
+	// Pointer + omitempty for the same reason as LiveKeys: a manifest written
+	// before this field must stay decodable, and "not recorded" has to be
+	// distinguishable from zero so the engine knows to fall back to a scan.
+	MaxSeqNum *uint64 `json:"max_seq_num,omitempty"`
 }
 
 // Manifest is the source of truth for which SSTable files are live.
@@ -73,11 +93,16 @@ func OpenManifest(path string) (*Manifest, error) {
 }
 
 // Add records a new SSTable as live and rewrites the manifest atomically.
-// level is the LSM level of the SSTable (0 = L0, 1 = L1, …).
-func (m *Manifest) Add(baseName string, sstSeq uint64, level int) error {
+// level is the LSM level of the SSTable (0 = L0, 1 = L1, …). maxSeqNum is the
+// highest write sequence number in the file — see ManifestEvent.MaxSeqNum for
+// why every add must supply it.
+func (m *Manifest) Add(baseName string, sstSeq uint64, level int, maxSeqNum uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.events = append(m.events, ManifestEvent{Type: "add", Path: baseName, SSTSeq: sstSeq, Level: level})
+	seq := maxSeqNum
+	m.events = append(m.events, ManifestEvent{
+		Type: "add", Path: baseName, SSTSeq: sstSeq, Level: level, MaxSeqNum: &seq,
+	})
 	return m.writeAll()
 }
 
@@ -86,14 +111,40 @@ func (m *Manifest) Add(baseName string, sstSeq uint64, level int) error {
 // flushes may use it — see the ManifestEvent.LiveKeys doc for why compactions
 // must not. Folding the count into the same event keeps it to one atomic
 // manifest rewrite per flush.
-func (m *Manifest) AddWithLiveKeys(baseName string, sstSeq uint64, level int, liveKeys int64) error {
+func (m *Manifest) AddWithLiveKeys(baseName string, sstSeq uint64, level int, liveKeys int64, maxSeqNum uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n := liveKeys
+	seq := maxSeqNum
 	m.events = append(m.events, ManifestEvent{
-		Type: "add", Path: baseName, SSTSeq: sstSeq, Level: level, LiveKeys: &n,
+		Type: "add", Path: baseName, SSTSeq: sstSeq, Level: level, LiveKeys: &n, MaxSeqNum: &seq,
 	})
 	return m.writeAll()
+}
+
+// MaxSeqNum returns the highest write sequence number recorded across the live
+// SSTables, and whether every live file carried one.
+//
+// A false second result means the manifest predates the field for at least one
+// live file, so this value is not an upper bound on what is on disk and the
+// caller must establish one another way. Answering "0, true" for a store with no
+// live SSTables is correct rather than incomplete: there is nothing on disk to
+// outrank.
+func (m *Manifest) MaxSeqNum() (uint64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var max uint64
+	complete := true
+	for _, ev := range m.liveFilesLocked() {
+		if ev.MaxSeqNum == nil {
+			complete = false
+			continue
+		}
+		if *ev.MaxSeqNum > max {
+			max = *ev.MaxSeqNum
+		}
+	}
+	return max, complete
 }
 
 // LastLiveKeys returns the most recently recorded live-key count and whether
@@ -123,7 +174,11 @@ func (m *Manifest) Remove(baseName string) error {
 func (m *Manifest) LiveFiles() []ManifestEvent {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.liveFilesLocked()
+}
 
+// liveFilesLocked is LiveFiles without the lock. Caller must hold m.mu.
+func (m *Manifest) liveFilesLocked() []ManifestEvent {
 	counts := make(map[string]int)
 	seqs := make(map[string]uint64)
 	for _, ev := range m.events {
@@ -137,16 +192,20 @@ func (m *Manifest) LiveFiles() []ManifestEvent {
 	}
 
 	levels := make(map[string]int)
+	maxSeqs := make(map[string]*uint64)
 	for _, ev := range m.events {
 		if ev.Type == "add" {
 			levels[ev.Path] = ev.Level
+			maxSeqs[ev.Path] = ev.MaxSeqNum
 		}
 	}
 
 	var live []ManifestEvent
 	for path, cnt := range counts {
 		if cnt > 0 {
-			live = append(live, ManifestEvent{Path: path, SSTSeq: seqs[path], Level: levels[path]})
+			live = append(live, ManifestEvent{
+				Path: path, SSTSeq: seqs[path], Level: levels[path], MaxSeqNum: maxSeqs[path],
+			})
 		}
 	}
 	sort.Slice(live, func(i, j int) bool { return live[i].SSTSeq < live[j].SSTSeq })

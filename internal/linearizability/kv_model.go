@@ -223,32 +223,88 @@ type Recorder struct {
 	// deferredReturns holds the returns of pending operations. They are appended
 	// after every recorded event when the history is checked; see EndUnknown.
 	deferredReturns []porcupine.Event
-	nextID          int64 // atomic for Begin; protected by mu for append
+	// meta is indexed by call ID and carries what the model deliberately does
+	// not: which client issued the operation and when it was called and
+	// returned in wall-clock time. Porcupine's event API uses each event's
+	// index as its timestamp, so a checked history has no real times in it —
+	// but a counterexample is useless without them, because correlating an
+	// anomaly with a fault window is the whole point of printing one. See
+	// Counterexample.
+	meta   []opMeta
+	nextID int64 // atomic for Begin; protected by mu for append
+}
+
+// opMeta is the reporting-only record of one operation. It is never shown to
+// the model.
+type opMeta struct {
+	worker   int // -1 when the caller did not attribute the operation
+	input    Input
+	output   Output
+	returned bool
+	call     time.Time
+	ret      time.Time
 }
 
 // Begin records the invocation of an operation and returns a unique call ID.
 // The caller must call End(id, out) or EndUnknown(id) when the operation
 // returns.
+//
+// The operation is not attributed to a client; use BeginWorker to record which
+// one issued it.
 func (r *Recorder) Begin(inp Input) int {
+	return r.begin(-1, inp)
+}
+
+// BeginWorker is Begin, attributing the operation to a client/worker id so a
+// counterexample can name which concurrent client issued it.
+func (r *Recorder) BeginWorker(worker int, inp Input) int {
+	return r.begin(worker, inp)
+}
+
+func (r *Recorder) begin(worker int, inp Input) int {
 	id := int(atomic.AddInt64(&r.nextID, 1)) - 1
+	now := time.Now()
+	clientID := worker
+	if clientID < 0 {
+		clientID = 0
+	}
 	r.mu.Lock()
 	r.events = append(r.events, porcupine.Event{
-		Kind:  porcupine.CallEvent,
-		Value: inp,
-		Id:    id,
+		Kind:     porcupine.CallEvent,
+		Value:    inp,
+		Id:       id,
+		ClientId: clientID,
 	})
+	m := r.metaFor(id)
+	m.worker = worker
+	m.input = inp
+	m.call = now
 	r.mu.Unlock()
 	return id
 }
 
+// metaFor returns the metadata slot for id, growing the slice as needed. The
+// caller must hold r.mu.
+func (r *Recorder) metaFor(id int) *opMeta {
+	for id >= len(r.meta) {
+		r.meta = append(r.meta, opMeta{worker: -1})
+	}
+	return &r.meta[id]
+}
+
 // End records the return of an operation previously started with Begin.
 func (r *Recorder) End(id int, out Output) {
+	now := time.Now()
 	r.mu.Lock()
 	r.events = append(r.events, porcupine.Event{
 		Kind:  porcupine.ReturnEvent,
 		Value: out,
 		Id:    id,
 	})
+	m := r.metaFor(id)
+	m.output = out
+	m.returned = true
+	m.ret = now
 	r.mu.Unlock()
 }
 
@@ -281,15 +337,21 @@ func (r *Recorder) End(id int, out Output) {
 // caller should keep the unknown class small by classifying precisely, not by
 // guessing an outcome.
 func (r *Recorder) EndUnknown(id int) {
+	now := time.Now()
+	out := Output{Err: true, Applied: true, Deferred: true}
 	r.mu.Lock()
 	r.deferredReturns = append(r.deferredReturns, porcupine.Event{
 		Kind: porcupine.ReturnEvent,
 		// Applied so the write is a state transition wherever it lands;
 		// Deferred so a failing history says "pending" rather than implying the
 		// store confirmed it.
-		Value: Output{Err: true, Applied: true, Deferred: true},
+		Value: out,
 		Id:    id,
 	})
+	m := r.metaFor(id)
+	m.output = out
+	m.returned = true
+	m.ret = now
 	r.mu.Unlock()
 }
 

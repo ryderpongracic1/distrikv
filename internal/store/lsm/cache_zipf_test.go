@@ -160,7 +160,7 @@ func buildZipfDataset(t *testing.T, dataDir string) {
 		}
 
 		// Register as L1 — does not trigger compaction (threshold is L0 count).
-		if err := manifest.Add(sstName, sstSeq, 1 /*L1*/); err != nil {
+		if err := manifest.Add(sstName, sstSeq, 1 /*L1*/, writer.MaxSeqNum()); err != nil {
 			t.Fatalf("buildZipfDataset: manifest.Add[%d]: %v", s, err)
 		}
 	}

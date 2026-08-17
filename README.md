@@ -100,6 +100,32 @@ SSTables are organised into levels. A background compaction goroutine merges ove
 
 All writes also append to a **WAL** before touching the MemTable. On restart, unflushed WAL entries replay into a fresh MemTable before the node begins serving traffic.
 
+**Write sequence numbers are the total write order, and they must survive a
+restart (fixed).** Every entry carries a sequence number, and that number is how
+compaction decides between two versions of a key: the higher one wins and the
+loser is **dropped**, not shadowed. The counter lived only in memory, so it
+restarted at zero on every open while the SSTables on disk still carried the
+previous process's numbers. "Newer" therefore came to mean "written earlier in a
+longer-lived process": a value written before a restart outranked the value that
+replaced it after, and the first compaction to merge the two files kept the stale
+one. The same inversion resurrects a deleted key, because a tombstone that loses
+is discarded outright at the bottom level.
+
+Nothing is visible until that compaction runs, which is what makes it a
+*consistency* bug rather than a crash: reads are served newest-file-first, so the
+correct value is returned right up until the merge silently replaces it on disk.
+The engine now records each SSTable's highest sequence number in the manifest
+(`ManifestEvent.MaxSeqNum`) and seeds the counter above all of them at open. A
+data directory written before that field existed cannot answer, and the numbers
+live in the entries themselves, so those files are scanned once — logged as
+`lsm: manifest predates per-SSTable sequence numbers`, and self-limiting, since
+the first compaction replaces the whole live set with a file that records it.
+
+This was found while investigating a chaos run that reported `converged: true`
+with `linearizable: FAIL` — data consistent at rest, history illegal — and it is
+sufficient to produce exactly that pair: a resurrected value fails a read
+mid-run, and the next write to the key converges every copy again.
+
 ### Write-Ahead Log (`internal/store/wal`)
 
 Every `Put` and `Delete` is appended to a binary WAL file **before** the MemTable is updated. Each entry is framed as:
@@ -1598,6 +1624,10 @@ threshold (≤ 4 files in steady state), so read amplification stays predictable
 | `TestRestore_EmptySnapshotEmptiesStore` | An empty payload empties the store and leaves it writable |
 | `TestLCS_WriteStallMetrics` | `WriteStallCount` and `WriteStallMicros` increment correctly during soft-stall loops |
 | `TestLCS_L0CountTracking` | `l0Count` atomic, `L0FileCount` metric, and `len(l.l0)` stay consistent before and after compaction |
+| `TestCompactionKeepsTheNewerWriteAcrossARestart` | A write acknowledged after a restart survives the compaction that merges it with a pre-restart file — the sequence counter is seeded from disk, so "newer" cannot mean "written in a longer-lived process" |
+| `TestCompactionKeepsATombstoneAcrossARestart` | The same defect on the delete path, which is the worse half: a tombstone that loses is dropped at the bottom level, so the deleted key comes back |
+| `TestLegacyManifestRecoversTheWriteOrderByScanning` | A data directory whose manifest predates the recorded sequence numbers still reopens above everything on disk, by scanning its live SSTables once |
+| `TestSequenceNumbersAreMonotonicAcrossARestart` | The invariant on its own, so a future change that zeroes the counter fails with a readable reason |
 
 ### Phase 4 — Deterministic Fault Injection & Jepsen-style Linearizability Verification (2026-05-21)
 
@@ -1702,6 +1732,63 @@ reported as `heal error` on the window.
 | `--check-convergence` | `true` | After the run, assert every replica agrees on every key. Only applies when a nemesis is enabled |
 | `--convergence-grace` | `30s` | How long to keep re-checking before declaring the replicas divergent |
 | `--replicas` | `2` | Replication factor R, so the check asks the same question of the ring that the nodes do |
+| `--counterexample-file` | *(auto)* | Where to write the counterexample on FAIL. Default names it `chaos-counterexample-<timestamp>.json`; `none` disables writing |
+
+*Counterexample on FAIL.* A verdict of FAIL used to be one word. The history
+behind it is half a million events long and the anomaly lives on one of 20 keys,
+so diagnosing a 1-in-4 race meant re-running until it happened again. The runner
+now localises the failure and prints it.
+
+Porcupine reports a verdict over the whole history, and with the verbose check
+the *maximal partial linearizations* it found — but not which partition failed,
+and `LinearizationInfo`'s internals are unexported, so there is no public way to
+ask. The model already partitions by key and KV keys are independent registers,
+so the localisation comes from re-checking each key's sub-history on its own: a
+whole-history FAIL means at least one of them is illegal, and checking them one at
+a time says which. Within that key, the longest partial linearization is the
+frontier — the operations the checker could order — and the earliest operation
+outside it is where the history stopped being satisfiable.
+
+```
+  counterexample — key chaos-m1786979100942982000-00004
+    1 of 20 key(s) failed to linearize
+    the checker ordered 81 of 83 operation(s) on this key; the earliest one it
+    could not place is marked ✗ — that is where the history stopped being
+    satisfiable, not a proof that this one operation is the defect
+    offsets are from measurement start, so they line up with the fault windows above
+────────────────────────────────────────────────────────────
+    … 69 earlier operation(s) on this key omitted
+        +46.412s→+46.413s w3   refused-applied put "w3-t1786983730621729510"   [fault #3 node3]
+        +46.418s→+46.419s w6   ok              get -> "w3-t1786983730621729510"   [fault #3 node3]
+        +46.702s→+46.703s w3   ok              put "w3-t1786979165937481000"   [fault #3 node3]
+    ✗   +46.884s→+46.885s w1   ok              get -> <absent>   [fault #3 node3]
+        +46.901s→+46.902s w5   no-op           delete   [fault #3 node3]
+    full window written to chaos-counterexample-20260817-161122.json
+```
+
+Four things make the window readable, and each one is there because its absence
+cost a debugging session: the **modelling column** (`ok`,
+`refused-applied`, `no-op`, `pending`, `failed-read`) says how the operation
+entered the history, since a failing read next to a refused-but-applied write
+means something different from the same read next to a no-op; **offsets from
+measurement start** match the fault-window table above rather than being
+wall-clock; the **worker id** identifies which concurrent client issued it; and
+the **fault annotation** marks every operation whose call/return interval
+intersected an outage, so "which fault exposed this" is answered on the line
+rather than by arithmetic.
+
+The window is bounded — 12 operations before the frontier and 6 after on stdout,
+120 and 40 in the file — because a 60s run records tens of thousands of
+operations per key. Both ends report how many were omitted. The file carries the
+same detail as JSON plus the run's context and its fault windows, so two runs can
+be diffed.
+
+Two limits are stated rather than papered over. The localisation is a separate
+claim from the verdict: if the per-key scan cannot reproduce the illegality inside
+its budget, the report says so and leaves the whole-history verdict standing. And
+the marked operation is where the search got stuck, not an accusation — an anomaly
+is a property of a set of operations, not of one.
+
 
 *Convergence gate.* A legal history is not the whole story. Linearizability is
 judged on what clients observed **through the ring-primary**, so a replica that is
@@ -2138,6 +2225,12 @@ cluster:
 | `TestFinishWriteEncodesEachOutcome` | End-to-end encoding, asserted through the checker: for each failure class, whether a later read may see the value and whether it may miss it |
 | `TestFinishWriteToleratesANilRecorder` | Statistics are still counted when history recording is off |
 | `TestVerdictNotesMatchTheEncoding` | The printed guidance matches the current encoding — a FAIL is reported as real, and the superseded "failed writes are no-ops" explanation is gone |
+| `TestCounterexampleReportsTheOffendingWindow` | A synthetic lost-write history produces a printed window naming the key, marking the operation the checker could not place, and labelling how each one was modelled |
+| `TestCounterexampleCorrelatesWithFaultWindows` | Operations inside an outage are annotated with it, and operations outside one are not |
+| `TestOverlappingWindowBoundaries` | The overlap relation, case by case: an interval that touches an outage counts, one that finished before it does not, a failed strike is not an outage, and an unhealed one stays open |
+| `TestCounterexampleFileIsWrittenAndComparable` | The file is valid JSON carrying the key, the frontier, the run context and the omission accounting, so two runs can be diffed |
+| `TestCounterexampleFileCanBeDisabled` | `--counterexample-file none` writes nothing |
+| `TestCounterexampleNoteWhenNotLocalisable` | A FAIL the per-key scan cannot localise says so, and leaves the whole-history verdict's authority intact |
 
 Model semantics (`internal/linearizability`) — the three outcomes a failed write
 can have, each asserted by running a hand-built history through the checker:
@@ -2150,6 +2243,10 @@ can have, each asserted by running a hand-built history through the checker:
 | `TestPendingWriteIsUnconstrained` | A pending write is legal whether or not any read observes it, may linearize between two reads, and does not license a lost write on another key |
 | `TestPendingReturnsComeAfterEveryRecordedEvent` | The mechanism: a pending operation recorded first is still placeable after 20 later reads that never observed it |
 | `TestDescribeOperationLabelsEachOutcome` | A failing history distinguishes "the store confirmed this" from "we never found out" |
+| `TestCounterexampleLocalizesTheFailingKey` | A history illegal on one key names that key and leaves the legal ones unaccused, and marks the operation the checker could not place |
+| `TestCounterexampleIsNilForALegalHistory` | Nothing to localise reads as nothing, rather than as the first key |
+| `TestCounterexampleLabelsHowEachOpWasModelled` | Every modelling class — ok, refused-applied, no-op, pending, failed read — is labelled in the report |
+| `TestCounterexampleWindowIsBounded` | The printed window is capped and centred on the frontier, and its omission counts add up to the full operation list |
 
 ### Phase 5 — In-process Sharded LRU Block Cache
 

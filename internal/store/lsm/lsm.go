@@ -394,6 +394,24 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 	}
 	l.walSeq.Store(maxWalSeq)
 
+	// Seed the write-sequence counter above every entry already on disk.
+	//
+	// Sequence numbers are the total write order compaction uses to resolve two
+	// versions of a key — higher wins, and the loser is dropped rather than
+	// shadowed. The counter is in memory, so left at zero on open it makes every
+	// write in this process rank *below* the data it replaces: the first
+	// compaction to merge a pre-restart file with a post-restart one keeps the
+	// pre-restart value, and a tombstone that loses is discarded at the bottom
+	// level, so a deleted key comes back. Neither is visible until that
+	// compaction runs, and by then the acknowledged write is gone from disk.
+	//
+	// This must happen before the active memtable is created, because WAL replay
+	// draws from the same counter and its entries are newer than anything the
+	// SSTables hold.
+	if err := l.seedSeqNum(); err != nil {
+		return nil, err
+	}
+
 	// Replay existing WAL files into a fresh Memtable.
 	//
 	// Live-key count recovery: seed from the count the last flush recorded in
@@ -829,7 +847,7 @@ func (l *LSMTree) flushMemtable(imm *Memtable) error {
 		return fmt.Errorf("lsm: flush close writer: %w", err)
 	}
 
-	if err := l.manifest.AddWithLiveKeys(outName, sstSeq, 0 /*level=L0*/, imm.liveKeysAtSeal); err != nil {
+	if err := l.manifest.AddWithLiveKeys(outName, sstSeq, 0 /*level=L0*/, imm.liveKeysAtSeal, writer.MaxSeqNum()); err != nil {
 		os.Remove(outPath)
 		return fmt.Errorf("lsm: flush manifest add: %w", err)
 	}
@@ -1259,7 +1277,7 @@ func (l *LSMTree) bulkLoadL0(data map[string][]byte) error {
 	// Commit point: before this the file is invisible, after it the restored
 	// state is the store. The live-key count goes in the same record so a
 	// restart straight after a restore recovers it without a scan.
-	if err := l.manifest.AddWithLiveKeys(outName, sstSeq, 0 /*level=L0*/, int64(len(keys))); err != nil {
+	if err := l.manifest.AddWithLiveKeys(outName, sstSeq, 0 /*level=L0*/, int64(len(keys)), writer.MaxSeqNum()); err != nil {
 		os.Remove(outPath)
 		return fmt.Errorf("lsm: restore manifest add: %w", err)
 	}
@@ -1379,7 +1397,7 @@ func (l *LSMTree) flushMemtableDirect(mem *Memtable) error {
 	// so the count to persist is simply the current one: every write is either
 	// already in an SSTable or in the memtable being flushed here, and this
 	// memtable's WAL is removed below.
-	if err := l.manifest.AddWithLiveKeys(outName, sstSeq, 0 /*L0*/, l.liveKeys.Load()); err != nil {
+	if err := l.manifest.AddWithLiveKeys(outName, sstSeq, 0 /*L0*/, l.liveKeys.Load(), writer.MaxSeqNum()); err != nil {
 		os.Remove(outPath)
 		return err
 	}
@@ -1405,6 +1423,78 @@ func (l *LSMTree) flushMemtableDirect(mem *Memtable) error {
 }
 
 // ---- Helpers ---------------------------------------------------------------
+
+// seedSeqNum sets the write-sequence counter above every entry on disk, so that
+// writes made after a restart outrank the data they replace. See the call site in
+// NewLSMTree for what an unseeded counter costs.
+//
+// The manifest records each SSTable's highest sequence number, which makes the
+// common case free. A manifest written before that field existed cannot answer,
+// and there is no cheap upper bound to substitute — the numbers live in the
+// entries themselves — so those files are scanned once. It is a one-time cost per
+// data directory: every file this engine writes records the field, and the first
+// compaction replaces the whole live set with one file that has it.
+func (l *LSMTree) seedSeqNum() error {
+	recorded, complete := l.manifest.MaxSeqNum()
+	if complete {
+		l.seqNum.Store(recorded)
+		return nil
+	}
+
+	start := time.Now()
+	scanned, entries, err := l.scanMaxSeqNum()
+	if err != nil {
+		return err
+	}
+	if scanned < recorded {
+		scanned = recorded
+	}
+	l.seqNum.Store(scanned)
+	l.logger.Warn("lsm: manifest predates per-SSTable sequence numbers; scanned to recover the write order",
+		"max_seq_num", scanned,
+		"entries_scanned", entries,
+		"took", time.Since(start).String())
+	return nil
+}
+
+// scanMaxSeqNum reads every live SSTable and returns the highest sequence number
+// it finds, together with the number of entries read.
+//
+// The lock is defensive rather than load-bearing: the only caller runs during
+// NewLSMTree, before the flush and compaction goroutines exist, so nothing can
+// swap the reader set underneath it yet. It is taken anyway so this stays correct
+// if it is ever called from anywhere else.
+func (l *LSMTree) scanMaxSeqNum() (uint64, int, error) {
+	l.mu.RLock()
+	readers := make([]*SSTableReader, 0, len(l.l0)+len(l.l1))
+	readers = append(readers, l.l0...)
+	readers = append(readers, l.l1...)
+	l.mu.RUnlock()
+
+	var max uint64
+	entries := 0
+	for _, r := range readers {
+		it := r.Iterator()
+		for {
+			e, ok := it.Next()
+			if !ok {
+				break
+			}
+			entries++
+			if e.SeqNum > max {
+				max = e.SeqNum
+			}
+		}
+		// The iterator stops on error the same way it stops at EOF, so a read
+		// failure would otherwise read as "this file holds no sequence numbers"
+		// — which would seed the counter too low and reintroduce the inversion
+		// this scan exists to prevent.
+		if err := it.Err(); err != nil {
+			return 0, entries, fmt.Errorf("lsm: scan %q for write order: %w", r.path, err)
+		}
+	}
+	return max, entries, nil
+}
 
 // findWALFiles returns the live WAL segments in dataDir — the ones recovery must
 // replay — sorted by ascending sequence number.

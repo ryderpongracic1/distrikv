@@ -38,6 +38,7 @@ type SSTableWriter struct {
 	filter     *BloomFilter
 	offset     uint32 // current logical write position
 	firstEntry bool   // true until the first entry is written
+	maxSeqNum  uint64 // highest Entry.SeqNum written; recorded in the manifest
 }
 
 // NewSSTableWriter creates a new SSTable file at path.
@@ -69,8 +70,17 @@ func (w *SSTableWriter) Write(entry Entry) error {
 	}
 	w.blockEnc.appendEntry(entry)
 	w.filter.Add(entry.Key)
+	if entry.SeqNum > w.maxSeqNum {
+		w.maxSeqNum = entry.SeqNum
+	}
 	return nil
 }
+
+// MaxSeqNum returns the highest write sequence number of any entry written to
+// this file. Every caller records it in the manifest at the same time it records
+// the file, so the engine can reopen its sequence counter above everything on
+// disk — see ManifestEvent.MaxSeqNum for what goes wrong when it cannot.
+func (w *SSTableWriter) MaxSeqNum() uint64 { return w.maxSeqNum }
 
 func (w *SSTableWriter) flushBlock() error {
 	if w.blockEnc.size() == 0 {

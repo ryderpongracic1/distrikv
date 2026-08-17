@@ -225,14 +225,14 @@ func TestManifest_LiveKeysRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenManifest: %v", err)
 	}
-	if err := m.AddWithLiveKeys("sst-00000001.sst", 1, 0, 7); err != nil {
+	if err := m.AddWithLiveKeys("sst-00000001.sst", 1, 0, 7, 40); err != nil {
 		t.Fatalf("AddWithLiveKeys: %v", err)
 	}
 	// A compaction event must not clobber the recorded count.
-	if err := m.Add("sst-00000002.sst", 2, 1); err != nil {
+	if err := m.Add("sst-00000002.sst", 2, 1, 55); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	if err := m.AddWithLiveKeys("sst-00000003.sst", 3, 0, 11); err != nil {
+	if err := m.AddWithLiveKeys("sst-00000003.sst", 3, 0, 11, 70); err != nil {
 		t.Fatalf("AddWithLiveKeys: %v", err)
 	}
 

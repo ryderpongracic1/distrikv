@@ -35,6 +35,11 @@ type CursorStore struct {
 	mu      sync.Mutex
 	cursors map[string]storewal.Position
 	dirty   bool
+
+	// fullSync latches the "this node's WAL cannot converge its replicas"
+	// condition set by InvalidateAll. See CursorStore.FullSyncRequired.
+	fullSync       bool
+	fullSyncReason string
 }
 
 // cursorFile is the on-disk representation. Positions are stored as their
@@ -43,6 +48,19 @@ type CursorStore struct {
 type cursorFile struct {
 	Version int               `json:"version"`
 	Cursors map[string]string `json:"cursors"`
+
+	// FullSyncRequired records that this node replaced its store from a snapshot,
+	// so its WAL no longer describes the data it holds. It is persisted because
+	// the condition outlives the process that discovered it: a restart must not
+	// forget that the log cannot converge this node's replicas.
+	//
+	// Both fields are additive and omitted when unset, which is why the file
+	// version is NOT bumped for them. A version bump would be a hard failure for
+	// every node holding a version-1 file (OpenCursorStore rejects a version it
+	// does not recognise), so adding a field that older readers ignore and newer
+	// readers default to false is the compatible move.
+	FullSyncRequired bool   `json:"full_sync_required,omitempty"`
+	FullSyncReason   string `json:"full_sync_reason,omitempty"`
 }
 
 const cursorFileVersion = 1
@@ -83,6 +101,8 @@ func OpenCursorStore(dataDir string) (*CursorStore, error) {
 		}
 		cs.cursors[node] = pos
 	}
+	cs.fullSync = f.FullSyncRequired
+	cs.fullSyncReason = f.FullSyncReason
 	return cs, nil
 }
 
@@ -136,6 +156,88 @@ func (cs *CursorStore) Forget(nodeID string) {
 	cs.dirty = true
 }
 
+// InvalidateAll drops every cursor and latches the full-sync-required
+// condition, persisting both before it returns. It is called by the snapshot
+// restore path, which replaces the whole logical store.
+//
+// # Why the cursors must go
+//
+// A restore rewrites the store from a snapshot payload and starts a fresh WAL at
+// segment 1, reusing segment numbers the old log had already used. A surviving
+// cursor is then not merely stale, it is actively wrong in three ways, all
+// verified against this package and the anti-entropy engine:
+//
+//  1. It orders *after* the new tip (a pre-restore 1:990 against a post-restore
+//     1:0), so the engine's "cursor behind tip" check reads the replica as
+//     up to date and schedules no catch-up at all.
+//  2. Cursors are monotonic, so nothing can move it back: it is frozen until the
+//     new log happens to grow past its old offset, and RetentionFloor keeps
+//     reporting a segment from a log that no longer exists — which can make the
+//     engine delete freshly flushed segments instead of parking them for
+//     catch-up.
+//  3. Once the new log does grow past that offset, a pass reads from a byte
+//     offset that is mid-entry in a different log. The CRC catches it and the
+//     reader reports a torn tail, which on the newest segment is a clean stop
+//     with no error — so the pass ships nothing, reports no failure, and the
+//     engine concludes the replica is caught up.
+//
+// Note that (3) is a *silent* wrong answer rather than the ErrCursorStale the
+// reader raises for a collected segment: staleness is detected by segment
+// number, and a restore reuses the number.
+//
+// # Why zeroing the cursors is not, by itself, convergence
+//
+// A zero cursor means "no evidence", and the engine reads it as "replay from the
+// oldest surviving segment" — but only when something else triggers a pass; on
+// its own a zero cursor deliberately does not mark a replica behind. More
+// importantly, the restored payload is bulk-loaded into an L0 SSTable and never
+// appended to the WAL, so after a restore there is nothing in the log to replay:
+// a pass over the fresh WAL converges nothing. Zeroing the cursors removes the
+// false state and restores retention sanity; it does not make replicas agree.
+// That is what the latched flag is for.
+//
+// # Ordering
+//
+// The caller invalidates *before* replacing the store. Losing cursors is
+// explicitly recoverable — a node without cursors re-sends from the oldest
+// segment it still has — whereas stale cursors surviving a completed restore is
+// the defect above. So a crash anywhere in the restore leaves the safe state.
+// The consequence is that a restore that then fails still latches the flag: it
+// over-reports a problem rather than under-reporting one, which is the direction
+// this invariant demands.
+func (cs *CursorStore) InvalidateAll(reason string) error {
+	cs.mu.Lock()
+	cs.cursors = make(map[string]storewal.Position)
+	cs.fullSync = true
+	cs.fullSyncReason = reason
+	cs.dirty = true
+	cs.mu.Unlock()
+	return cs.Flush()
+}
+
+// FullSyncRequired reports whether this node has replaced its store from a
+// snapshot without ever full-syncing its replicas, and why.
+//
+// It latches: v1 has no full-sync mechanism, so nothing clears it. That means it
+// keeps reading true even after the affected keys have organically been
+// rewritten and the replicas have in fact converged — it over-reports rather
+// than going quiet while divergence remains, which is the only safe direction
+// for a convergence claim.
+//
+// TODO(full-sync): the missing mechanism is a key-range scan shipped to the
+// replica — walk this node's live keys (the engine can already iterate them for
+// Snapshot), filter to the keys this node is ring-primary for with that replica
+// in the replica set, send them with the ordinary Replicate RPC in bounded
+// batches, and clear this flag per replica once a scan completes without a
+// replication failure. It is deliberately not built here: unlike a WAL pass it
+// is unbounded in the store's size, so it needs its own throttling, resumability
+// and interaction with the write path.
+func (cs *CursorStore) FullSyncRequired() (bool, string) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.fullSync, cs.fullSyncReason
+}
+
 // RetentionFloor returns the lowest WAL segment number any cursor still points
 // into, or 0 when no cursors are recorded. It is what the engine must not
 // garbage-collect below.
@@ -168,6 +270,8 @@ func (cs *CursorStore) Flush() error {
 	for node, pos := range cs.cursors {
 		f.Cursors[node] = pos.String()
 	}
+	f.FullSyncRequired = cs.fullSync
+	f.FullSyncReason = cs.fullSyncReason
 	cs.dirty = false
 	cs.mu.Unlock()
 

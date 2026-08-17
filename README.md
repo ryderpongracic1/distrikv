@@ -383,12 +383,70 @@ oldest surviving segment — which converges every key written since, and leaves
 key whose *only* write fell in the lost range divergent until it is written again.
 A full keyspace scan to repair that is deliberately out of scope for v1.
 
+**Not guaranteed after a snapshot restore: convergence of any kind.**
+`lsm.Restore` bulk-loads the snapshot payload straight into an L0 SSTable and
+performs zero WAL appends (pinned by `TestRestore_BulkLoadPerformsNoWALAppends`),
+because at snapshot scale the write path's per-key fsync costs minutes of write
+unavailability for data that is already durable in the snapshot file. The
+consequence for catch-up is total: the restored keys were never in the log, so
+**no WAL pass can ever ship them**. A replica that was down while its primary
+restored stays divergent on every snapshot key until each is written again.
+
+The node therefore does two things rather than pretending otherwise:
+
+- **It invalidates every replica cursor** (`store.CursorStore.InvalidateAll`,
+  called from `Store.RestoreFromSnapshot` *before* the store is replaced, so a
+  crash mid-restore leaves the safe state — losing cursors is recoverable, stale
+  cursors are not). A cursor that survived a restore is worse than stale, because
+  a restore starts a fresh WAL at segment 1 and **reuses segment numbers the old
+  log had already used**: `wal.ErrCursorStale` is keyed on the segment *number*, so
+  it never fires. The surviving cursor instead (1) orders *after* the new tip, so
+  the "cursor behind tip" check reads the replica as up to date and schedules no
+  catch-up; (2) cannot be moved back, since cursors are monotonic, while
+  `RetentionFloor` keeps naming a segment of a log that no longer exists — which
+  makes the engine delete freshly flushed segments instead of parking them for
+  catch-up; and (3) once the new log grows past the old offset, makes a pass read
+  from a byte offset that is mid-entry in a different log, where the CRC catches
+  it and the reader reports a torn tail — which on the newest segment is a *clean
+  stop with no error*. The pass then ships nothing, reports no failure, and the
+  engine concludes the replica is caught up. That last one is a silently wrong
+  convergence claim, which is the reason this is fixed rather than documented.
+- **It refuses to claim convergence it cannot deliver.** The condition is latched
+  durably in the cursor file and surfaced as the `anti_entropy_full_sync_required`
+  gauge plus a startup warning. While it is set, a pass that finds nothing to ship
+  is reported as *"the replica is NOT known to agree on keys restored from the
+  snapshot"* rather than `replica caught up`. The gauge never clears — v1 has no
+  full-sync mechanism — so it keeps reading 1 even after the affected keys have
+  organically been rewritten. It over-reports a problem rather than going quiet
+  while divergence remains, which is the only safe direction for a convergence
+  claim.
+
+**Reachability, stated plainly: this path is currently unreachable in a running
+cluster.** No Raft snapshot file is ever created — `takeSnapshot` fires only from
+`applyEntryLocked`, and nothing proposes log entries, because the ring (not the
+Raft log) carries the data. So `RestoreFromSnapshot` is reached today only by
+tests calling it directly. This is defensive hardening for whenever snapshots
+become real, plus correctness for direct callers; it fixes no live incident. It is
+recorded here rather than in a commit message because the same reasoning is what
+makes the missing full-sync mechanism a *known* gap rather than an oversight.
+
+*Designed but not built (v1):* full sync is a key-range scan shipped to the
+replica — walk this node's live keys (the engine already iterates them for
+`Snapshot`), filter to the keys this node is ring-primary for with that replica in
+the replica set, send them with the ordinary `Replicate` RPC in bounded batches,
+and clear the flag per replica once a scan completes without a replication
+failure. It is not built here because, unlike a WAL pass, it is unbounded in the
+store's size and so needs its own throttling, resumability, and interaction with
+the write path.
+
 #### Observability
 
 `/metrics` gains `anti_entropy_passes`, `anti_entropy_entries`,
-`anti_entropy_errors` and `anti_entropy_stale`. Node logs carry
-`catch-up scheduled`, `catch-up pass shipped missed writes`, `replica caught up`
-and `replica cursor is older than the retained WAL`.
+`anti_entropy_errors`, `anti_entropy_stale` and
+`anti_entropy_full_sync_required`. Node logs carry `catch-up scheduled`,
+`catch-up pass shipped missed writes`, `replica caught up`,
+`replica cursor is older than the retained WAL`, and — after a snapshot restore —
+`this node cannot converge its replicas from its WAL`.
 
 `GET /keys/{key}?local=true` answers from the node's own store without
 forwarding. It is the only way to ask a *replica* what it holds — a plain GET on a

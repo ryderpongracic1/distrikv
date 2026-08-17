@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 
@@ -27,30 +28,56 @@ var ErrWriteStalled = lsm.ErrWriteStalled
 // Store is a thread-safe key-value store. Create one with New.
 type Store struct {
 	engine *lsm.LSMTree
+	logger *slog.Logger
+
+	// cursors, when attached, is invalidated by RestoreFromSnapshot. It is
+	// optional: a store with no replica cursors (a single node, or a test) has
+	// nothing to invalidate. Attach it with WithCursorStore.
+	cursors *CursorStore
 
 	putCount atomic.Uint64
 	getCount atomic.Uint64
 	delCount atomic.Uint64
 }
 
+// Option configures a Store at construction.
+type Option func(*Store)
+
+// WithCursorStore attaches the node's replica cursors so that
+// RestoreFromSnapshot can invalidate them. A snapshot restore replaces the whole
+// logical store and starts a fresh WAL, which leaves any surviving cursor
+// pointing into a log that no longer exists — see CursorStore.InvalidateAll for
+// what goes wrong when it is left in place.
+func WithCursorStore(cs *CursorStore) Option {
+	return func(s *Store) { s.cursors = cs }
+}
+
 // New opens or creates the LSM-Tree under dataDir/lsm/.
-func New(dataDir string, logger *slog.Logger) (*Store, error) {
+func New(dataDir string, logger *slog.Logger, opts ...Option) (*Store, error) {
 	engine, err := lsm.NewLSMTree(dataDir+"/lsm", logger)
 	if err != nil {
 		return nil, err
 	}
-	return &Store{engine: engine}, nil
+	return newStore(engine, logger, opts), nil
 }
 
 // NewWithMetrics opens or creates the LSM-Tree under dataDir/lsm/ and wires it
 // to the supplied *metrics.Metrics so engine-internal counters (bloom hits,
 // flush/compaction bytes) appear in the node-wide metrics snapshot.
-func NewWithMetrics(dataDir string, logger *slog.Logger, m *metrics.Metrics) (*Store, error) {
+func NewWithMetrics(dataDir string, logger *slog.Logger, m *metrics.Metrics, opts ...Option) (*Store, error) {
 	engine, err := lsm.NewLSMTree(dataDir+"/lsm", logger, lsm.WithMetrics(m))
 	if err != nil {
 		return nil, err
 	}
-	return &Store{engine: engine}, nil
+	return newStore(engine, logger, opts), nil
+}
+
+func newStore(engine *lsm.LSMTree, logger *slog.Logger, opts []Option) *Store {
+	s := &Store{engine: engine, logger: logger}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Get retrieves the value for key. Returns ErrNotFound if absent or deleted.
@@ -107,7 +134,29 @@ func (s *Store) Snapshot(ctx context.Context) (map[string][]byte, error) {
 
 // RestoreFromSnapshot replaces all store contents with the given data.
 // Used by Raft followers receiving an InstallSnapshot RPC.
+//
+// Any attached replica cursors are invalidated first. They describe positions in
+// a WAL this call is about to discard, and a restore starts a fresh log that
+// reuses the old segment numbers — so a surviving cursor silently reads as
+// "replica is up to date" and lets the engine report a convergence it has not
+// performed. CursorStore.InvalidateAll documents the three concrete failures and
+// why invalidating before the restore (rather than after) is the safe ordering.
+//
+// Invalidation failing fails the restore: continuing would leave exactly the
+// stale-cursor state this guards against, and the caller can retry an
+// InstallSnapshot.
 func (s *Store) RestoreFromSnapshot(ctx context.Context, data map[string][]byte) error {
+	if s.cursors != nil {
+		if err := s.cursors.InvalidateAll("store replaced from a snapshot; the WAL no longer describes this node's data"); err != nil {
+			return fmt.Errorf("store: invalidate replica cursors for restore: %w", err)
+		}
+		if s.logger != nil {
+			s.logger.Warn("store: replica cursors invalidated for snapshot restore; "+
+				"anti-entropy cannot converge replicas from this node's WAL until a full "+
+				"sync exists (v1 has none) — see anti_entropy_full_sync_required",
+				"keys", len(data))
+		}
+	}
 	return s.engine.Restore(ctx, data)
 }
 

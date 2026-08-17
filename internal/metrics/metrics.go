@@ -63,6 +63,16 @@ type Metrics struct {
 	// until they are written again — the documented v1 bound.
 	AntiEntropyStaleCursors atomic.Uint64
 
+	// AntiEntropyFullSyncRequired is a 0/1 gauge: 1 means this node has replaced
+	// its store from a snapshot, so its WAL no longer describes the data it
+	// holds and anti-entropy cannot converge its replicas from the log.
+	//
+	// It is a gauge rather than a counter because it describes a standing
+	// condition, and it latches: v1 has no full-sync mechanism, so nothing
+	// clears it. While it reads 1, treat any "replica caught up" signal from
+	// this node as covering only writes made after the restore.
+	AntiEntropyFullSyncRequired atomic.Uint64
+
 	// --- LSM engine counters (Phase 1 benchmark harness) -------------------
 
 	// BloomHits counts SSTable lookups where the Bloom filter returned true
@@ -135,31 +145,32 @@ func (m *Metrics) Snapshot() map[string]uint64 {
 	}
 
 	return map[string]uint64{
-		"put_total":                m.PutTotal.Load(),
-		"get_total":                m.GetTotal.Load(),
-		"delete_total":             m.DeleteTotal.Load(),
-		"get_miss":                 m.GetMiss.Load(),
-		"wal_writes":               m.WALWrites.Load(),
-		"raft_terms":               m.RaftTerms.Load(),
-		"leader_elections":         m.LeaderElections.Load(),
-		"forwarded_requests":       m.ForwardedRequests.Load(),
-		"replication_errors":       m.ReplicationErrors.Load(),
-		"anti_entropy_passes":      m.AntiEntropyPasses.Load(),
-		"anti_entropy_entries":     m.AntiEntropyEntriesSent.Load(),
-		"anti_entropy_errors":      m.AntiEntropyPassErrors.Load(),
-		"anti_entropy_stale":       m.AntiEntropyStaleCursors.Load(),
-		"bloom_hits":               m.BloomHits.Load(),
-		"bloom_misses":             m.BloomMisses.Load(),
-		"bloom_false_positives":    m.BloomFalsePositives.Load(),
-		"flush_bytes":              flush,
-		"compaction_bytes_written": compWritten,
-		"compaction_bytes_read":    m.CompactionBytesRead.Load(),
-		"compactions_total":        m.CompactionsTotal.Load(),
-		"write_amp_factor_milli":   wafMilli,
-		"write_stall_count":        m.WriteStallCount.Load(),
-		"write_stall_micros":       m.WriteStallMicros.Load(),
-		"l0_file_count":            uint64(m.L0FileCount.Load()),
-		"block_cache_hits":         m.BlockCacheHits.Load(),
-		"block_cache_misses":       m.BlockCacheMisses.Load(),
+		"put_total":                       m.PutTotal.Load(),
+		"get_total":                       m.GetTotal.Load(),
+		"delete_total":                    m.DeleteTotal.Load(),
+		"get_miss":                        m.GetMiss.Load(),
+		"wal_writes":                      m.WALWrites.Load(),
+		"raft_terms":                      m.RaftTerms.Load(),
+		"leader_elections":                m.LeaderElections.Load(),
+		"forwarded_requests":              m.ForwardedRequests.Load(),
+		"replication_errors":              m.ReplicationErrors.Load(),
+		"anti_entropy_passes":             m.AntiEntropyPasses.Load(),
+		"anti_entropy_entries":            m.AntiEntropyEntriesSent.Load(),
+		"anti_entropy_errors":             m.AntiEntropyPassErrors.Load(),
+		"anti_entropy_stale":              m.AntiEntropyStaleCursors.Load(),
+		"anti_entropy_full_sync_required": m.AntiEntropyFullSyncRequired.Load(),
+		"bloom_hits":                      m.BloomHits.Load(),
+		"bloom_misses":                    m.BloomMisses.Load(),
+		"bloom_false_positives":           m.BloomFalsePositives.Load(),
+		"flush_bytes":                     flush,
+		"compaction_bytes_written":        compWritten,
+		"compaction_bytes_read":           m.CompactionBytesRead.Load(),
+		"compactions_total":               m.CompactionsTotal.Load(),
+		"write_amp_factor_milli":          wafMilli,
+		"write_stall_count":               m.WriteStallCount.Load(),
+		"write_stall_micros":              m.WriteStallMicros.Load(),
+		"l0_file_count":                   uint64(m.L0FileCount.Load()),
+		"block_cache_hits":                m.BlockCacheHits.Load(),
+		"block_cache_misses":              m.BlockCacheMisses.Load(),
 	}
 }

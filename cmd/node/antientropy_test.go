@@ -86,14 +86,16 @@ func keyOwnedElsewhere(t *testing.T, n *Node) string {
 }
 
 // primaryPut performs the write the HTTP primary path performs: durable locally,
-// then replicated. It returns the replication error so a test can assert the CP
-// refusal, exactly as a client would see it.
+// then replicated carrying the sequence the local write was assigned. It returns
+// the replication error so a test can assert the CP refusal, exactly as a client
+// would see it.
 func primaryPut(t *testing.T, n *Node, key, value string) error {
 	t.Helper()
-	if err := n.store.Put(context.Background(), key, []byte(value)); err != nil {
+	seq, err := n.store.Put(context.Background(), key, []byte(value))
+	if err != nil {
 		t.Fatalf("local put %q: %v", key, err)
 	}
-	return n.ReplicateWrite(context.Background(), server.OpPut, key, []byte(value))
+	return n.ReplicateWrite(context.Background(), server.OpPut, key, []byte(value), seq)
 }
 
 // putsByKey collapses a fake peer's recorded requests into key → last value.
@@ -206,7 +208,7 @@ func TestAntiEntropySkipsKeysThisNodeDoesNotOwn(t *testing.T) {
 
 	foreign := keyOwnedElsewhere(t, n)
 	// Applied the way a replica applies a write it was sent.
-	if err := n.ApplyReplica(context.Background(), server.OpPut, foreign, []byte("not mine")); err != nil {
+	if err := n.ApplyReplica(context.Background(), server.OpPut, foreign, []byte("not mine"), 0); err != nil {
 		t.Fatalf("ApplyReplica: %v", err)
 	}
 

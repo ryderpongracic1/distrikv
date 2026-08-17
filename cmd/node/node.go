@@ -300,17 +300,46 @@ func (n *Node) Run(ctx context.Context) error {
 // mutation directly to the local store, deliberately bypassing the replication
 // fan-out (because this node IS the replica receiving the write). Fanning out
 // from here would make every write replicate forever.
-func (n *Node) ApplyReplica(ctx context.Context, op, key string, value []byte) error {
+//
+// The write is applied only if seq is newer than the version this node already
+// holds for the key. Replication is a fan-out of independent RPCs, so two writes
+// to one key issued microseconds apart can arrive here in either order, and
+// applying them in arrival order would leave this replica holding whichever
+// landed last rather than whichever was written last. Nothing downstream would
+// notice: this node ACKed both writes, so it is not behind, and an anti-entropy
+// pass replays gaps rather than inversions. Comparing sequences is what turns
+// that permanent silent divergence into a discarded RPC.
+//
+// A stale arrival is not an error — the replica is already at or ahead of the
+// state the mutation describes, which is exactly what the primary wanted — so it
+// ACKs. Reporting a failure instead would refuse the client's write on the
+// primary and mark this node behind for a divergence that does not exist.
+func (n *Node) ApplyReplica(ctx context.Context, op, key string, value []byte, seq uint64) error {
 	switch op {
 	case server.OpPut:
-		return n.store.Put(ctx, key, value)
-	case server.OpDelete:
-		// A replicated delete is idempotent: if this replica never received
-		// the original write (an earlier fan-out to it failed), the key is
-		// already absent and the tombstone is satisfied. Reporting ErrNotFound
-		// here would fail the client's delete on the primary forever.
-		if err := n.store.Delete(ctx, key); err != nil && !errors.Is(err, store.ErrNotFound) {
+		applied, err := n.store.PutIfNewer(ctx, key, value, seq)
+		if err != nil {
 			return err
+		}
+		if !applied {
+			n.logger.Debug("ApplyReplica: discarded a write older than the version held",
+				"key", key, "seq", seq)
+		}
+		return nil
+	case server.OpDelete:
+		// A replicated delete is idempotent: if this replica never received the
+		// original write (an earlier fan-out to it failed), the key is already
+		// absent and the tombstone is satisfied. The engine's deletes are blind,
+		// so an absent key is not an error to begin with — but the tombstone is
+		// still written when it is newer, because it must shadow any earlier
+		// value this replica holds.
+		applied, err := n.store.DeleteIfNewer(ctx, key, seq)
+		if err != nil {
+			return err
+		}
+		if !applied {
+			n.logger.Debug("ApplyReplica: discarded a delete older than the version held",
+				"key", key, "seq", seq)
 		}
 		return nil
 	default:
@@ -339,7 +368,11 @@ func (n *Node) ApplyReplica(ctx context.Context, op, key string, value []byte) e
 // A deployment with no other node in the replica set (single node, or R=1)
 // degrades to a local-only write and returns nil: the only member of the
 // replica set is this node, which the caller has already written.
-func (n *Node) ReplicateWrite(ctx context.Context, op, key string, value []byte) error {
+//
+// seq is the sequence number the caller's local write was assigned. Every
+// replica receives the same one, which is what lets them agree on the order of
+// two writes to a key regardless of the order their RPCs arrive in.
+func (n *Node) ReplicateWrite(ctx context.Context, op, key string, value []byte, seq uint64) error {
 	replicas, err := n.ring.GetN(key, n.cfg.ReplicaCount)
 	if err != nil {
 		return fmt.Errorf("node: ring lookup for replication: %w", err)
@@ -376,6 +409,7 @@ func (n *Node) ReplicateWrite(ctx context.Context, op, key string, value []byte)
 			Key:   key,
 			Value: value,
 			Term:  term,
+			Seq:   seq,
 		})
 		if err != nil {
 			n.metrics.ReplicationErrors.Add(1)

@@ -49,7 +49,7 @@ func forceWALSegmentsReleased(t *testing.T, n *Node) uint64 {
 		value[i] = byte('a' + i%26)
 	}
 	for i := 0; i < 8; i++ {
-		if err := n.store.Put(context.Background(), fmt.Sprintf("pad-%d", i), value); err != nil {
+		if _, err := n.store.Put(context.Background(), fmt.Sprintf("pad-%d", i), value); err != nil {
 			t.Fatalf("padding write %d: %v", i, err)
 		}
 	}
@@ -233,10 +233,10 @@ func TestReplicateWriteMarksAReplicaWithNoClientBehind(t *testing.T) {
 	// A ring member with no client entry — the shape this branch exists for.
 	delete(n.peerClients, "node2")
 
-	if err := n.store.Put(context.Background(), key, []byte("kept-locally")); err != nil {
+	if _, err := n.store.Put(context.Background(), key, []byte("kept-locally")); err != nil {
 		t.Fatalf("local put: %v", err)
 	}
-	if err := n.ReplicateWrite(context.Background(), server.OpPut, key, []byte("kept-locally")); err == nil {
+	if err := n.ReplicateWrite(context.Background(), server.OpPut, key, []byte("kept-locally"), 0); err == nil {
 		t.Fatal("replication to a replica with no client returned nil; the client's " +
 			"write would be acknowledged despite the replica never seeing it")
 	}

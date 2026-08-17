@@ -31,10 +31,10 @@ import (
 // what the client sees as a 503.
 func primaryDelete(t *testing.T, n *Node, key string) error {
 	t.Helper()
-	if err := n.store.Delete(context.Background(), key); err != nil {
+	if _, err := n.store.Delete(context.Background(), key); err != nil {
 		t.Fatalf("local delete %q: %v", key, err)
 	}
-	return n.ReplicateWrite(context.Background(), server.OpDelete, key, nil)
+	return n.ReplicateWrite(context.Background(), server.OpDelete, key, nil, 0)
 }
 
 // lastOpByKey collapses a fake peer's recorded requests into key → the last

@@ -80,7 +80,8 @@ optimisation, chaos testing, and operational hardening.
 | P5 | In-process sharded LRU block cache (64 MB default, configurable) | ✅ Done |
 | P6 | Cluster-level LSM read-path measurement (`cmd/bench --prefill`: Bloom, block cache and compaction counters proven under load) | ✅ Done |
 | P7 | WAL-segment anti-entropy — replica catch-up from the primary's log, with a convergence gate in the chaos harness | ✅ Done |
-| P8 | TBD | 🔲 Planned |
+| P8 | Per-key write ordering — primary-assigned sequence on the replication wire and in the log, replicas apply-if-newer | ✅ Done |
+| P9 | TBD | 🔲 Planned |
 
 ---
 
@@ -128,13 +129,16 @@ mid-run, and the next write to the key converges every copy again.
 
 ### Write-Ahead Log (`internal/store/wal`)
 
-Every `Put` and `Delete` is appended to a binary WAL file **before** the MemTable is updated. Each entry is framed as:
+Every `Put` and `Delete` is appended to a binary WAL file **before** the MemTable is updated. There are two record formats, discriminated by the op byte, and they interleave freely within a segment:
 
 ```
-[1B op][4B key-len][key][4B val-len][val][4B CRC32]
+v1 (legacy):  [1B op][4B key-len][key][4B val-len][val][4B CRC32]
+v2 (current): [1B op][8B seq][4B key-len][key][4B val-len][val][4B CRC32]
 ```
 
-`Append` calls `f.Sync()` (not just `bufio.Flush`) before returning. On restart, `Replay` reads entries sequentially and stops cleanly at a CRC mismatch — the expected signature of a crash-at-tail.
+The engine writes v2, because a write's sequence number has to survive recovery with the same meaning it had before — a replica compares the sequence its ring-primary sent against the one it has stored for that key, and a sequence re-derived from the local counter at replay time would be a number from a different counter. See "Per-key write ordering" under Anti-entropy. A v1 record replays with sequence 0 ("this record does not know its ordering"), which applies unconditionally.
+
+`Append` calls `f.Sync()` (not just `bufio.Flush`) before returning. The CRC covers the sequence like every other byte, so a corrupted sequence is rejected as a torn record rather than silently reordering writes. On restart, `Replay` reads entries sequentially and stops cleanly at a CRC mismatch — the expected signature of a crash-at-tail.
 
 ### Raft (`internal/raft`)
 
@@ -468,31 +472,91 @@ pass would close it — at the cost of refusing writes to a replica that has jus
 come back, trading a rare stale key for guaranteed unavailability. That trade was
 declined.
 
-**Not guaranteed: per-key write ordering, and anti-entropy cannot see when it goes
-wrong.** A mutation carries no version or sequence number, so a replica applies
-whatever arrives in the order it arrives. The primary applies locally and *then* fans
-out, and the two steps are not atomic across concurrent requests: two client-
-concurrent writes to one key can be applied in one order on the primary and the
-opposite order at a replica, leaving the replica holding a value the primary does not
-have. Nothing marks that replica behind — it acknowledged both writes — so no
-health signal and no cursor comparison will ever schedule a pass on account of it.
-What does repair it is a pass triggered for any *other* reason: a pass ships the
-primary's newest value for every key in its range, so an inverted key inside that
-range is corrected as a side effect. A key that is never rewritten and never falls
-inside a pass's range stays inverted.
+**Per-key write ordering is now guaranteed by a primary-assigned sequence
+(fixed).** A mutation used to carry no version, so a replica applied whatever
+arrived in the order it arrived. The primary applies locally and *then* fans out,
+and the two steps are not atomic across concurrent requests: two client-concurrent
+writes to one key could be applied in one order on the primary and the opposite
+order at a replica, leaving the replica holding a value the primary does not have.
+Nothing marked that replica behind — it acknowledged both writes — so no health
+signal and no cursor comparison would ever schedule a pass on account of it, and a
+pass repairs gaps rather than inversions. The divergence was reachable with no
+fault at all.
 
-The fix would be a primary-assigned monotonic per-key sequence carried in the
-`Replicate` RPC and in replay entries, with the replica applying only when the
-sequence is at least the one it has stored — which would also make replay idempotent
-and close the live-versus-replay race above. It is **not built here**: it changes the
-wire format, needs the sequence persisted alongside every value in the storage
-engine, and has to be read back on the replica's write path, which is a storage-
-format change rather than a repair-path change. Half-building it — a sequence that
-some paths set and others do not — would be worse than not having one, because it
-would license exactly the convergence claims this section exists to withhold. It is
-recorded here as the known limit, not as future-work decoration: the divergence it
-describes is real, reachable with no fault at all, and not detected by anything the
-repo currently ships.
+Every write now carries the sequence its ring-primary's storage engine assigned it
+(`ReplicateRequest.seq`), and a replica **applies-if-newer**: a mutation whose
+sequence is not above the version the replica already holds for that key is
+discarded, and ACKed, because the replica is already at or past the state the
+primary asked for. Arrival-order inversions are therefore dropped rather than
+stored. A tombstone is ordered exactly like a value, so a delete and a put racing
+on one key resolve identically everywhere. Catch-up replay reads each entry's
+sequence back out of the log rather than assigning one, which makes a pass
+idempotent and safe to race against live replication: a replayed entry that has
+been superseded loses to the newer write's higher sequence instead of reverting it.
+
+The comparison is against what the replica has *stored*, so the sequence has to
+survive a restart with the same meaning — and the WAL did not record it. Recovery
+assigned every replayed entry a fresh number from the local counter, which is
+seeded above every sequence the node has ever stored; the primary's next writes
+would then have looked *older* than what the replica held and been discarded for
+good. So the log now carries the sequence too, as a second record format
+(`AppendSeq`, op codes 3/4) that interleaves freely with the old one: entries
+written before the upgrade replay with sequence 0, meaning "this record does not
+know its ordering", which applies unconditionally exactly as before. The same
+value is what a peer predating the wire field sends, so a mixed-version cluster
+degrades to arrival order rather than to silent discards. Downgrading a binary
+after the upgrade is not supported: an old reader misparses a v2 record as a torn
+write and stops, losing that segment's unflushed tail.
+
+**The narrower limit that remains: the sequence is per-primary, not global.** Each
+node's counter is its own, so two sequences are only comparable when they describe
+the same key — which holds because a key has exactly one ring-primary. A ring
+rebalance that moves ownership breaks that assumption: the new primary's counter is
+unrelated to the old one's, so its first writes for a moved key can carry a
+sequence below the one the replica already stored and be discarded until the
+counter passes it. distrikv has no rebalance today (the ring is fixed at startup
+from configuration), so the case is unreachable rather than merely unlikely — but
+membership changes cannot be added without addressing it, and the honest fix is a
+sequence that is comparable across nodes (an epoch or node-id tiebreak) rather than
+one that is merely monotonic per node.
+
+One second-order effect is worth naming: because a replica stores its primaries'
+sequences, its own counter is carried above them so that its own writes still sort
+above everything it holds — the invariant compaction uses to resolve duplicate
+keys. Counters therefore drift upward across the cluster. That is monotonic and
+per-key comparisons stay coherent, but a node's sequence numbers are not a count of
+its own writes.
+
+#### Regression gate
+
+The unit and integration tests pin the comparison (`cmd/node/h2_ordering_test.go`
+delivers the same two writes in both orders and asserts they settle on the same
+value; `internal/store/lsm/seq_apply_if_newer_test.go` pins it against a flushed
+version and across crash recovery). What they cannot reproduce is a real
+three-node cluster under fault injection, so the gate for this change is the chaos
+run that surfaced the divergence in the first place:
+
+```bash
+go run ./cmd/chaos --target localhost:8001 --peers localhost:8002,localhost:8003 \
+  --duration 60s --warmup 5s --workers 8 --keyspace 20 --put 50 --delete 5 \
+  --nemesis stop-restart --nemesis-services node2,node3 \
+  --nemesis-interval 10s --nemesis-downtime 5s \
+  --check-convergence --convergence-grace 30s
+```
+
+Pass criteria, all four:
+
+- `linearizable: PASS`
+- `converged: true`
+- `anti_entropy_full_sync_required` is `false` on all three nodes
+- repeated **4/4**, because the divergence it replaces was intermittent — a single
+  green run says nothing about a race
+
+Run the `kill-restart` variant afterwards as the control: it was already passing,
+so a regression there is this change's fault rather than the nemesis's. The
+harness itself needs no modification — it already compares each node's local read
+per key (`?local=true`) and reports the divergent ones, which is exactly the
+property this change makes hold.
 
 **Bounded recovery — and the claim is withheld, not just annotated.** If the log no
 longer reaches back far enough to cover what a replica missed, the gap cannot be

@@ -7,9 +7,10 @@ reference point instead of standing alone.
 This is a **ceiling measurement, not a competition**. etcd serialises every write
 through a single Raft leader and answers reads linearizably; distrikv places keys
 on a consistent hash ring and commits a write once its R=2 replicas ACK, refusing
-the write when a replica is unreachable. The repository README's
-*Ceiling — vs etcd* section carries the architecture decomposition, the
-disclosed confounds, and the results table this harness fills in.
+the write when a replica is unreachable.
+[`docs/benchmarks.md`](../../docs/benchmarks.md#ceiling--vs-etcd-sota-cp-key-value-store)
+carries the architecture decomposition, the disclosed confounds, and the results
+table this harness fills in.
 
 ## Why a separate module
 
@@ -38,7 +39,7 @@ running, only installed.
 brew install etcd                      # or apt, or a release tarball on PATH
 CGO_ENABLED=0 go build -o etcd-ceiling .
 
-# The write workload as the repository README's ceiling table was measured:
+# The write workload as docs/benchmarks.md's ceiling table was measured:
 # offered 2000 QPS, 60s after a 5s warmup, harness defaults for distribution
 # (uniform) and worker count (256), left explicit so the run is reproducible.
 ./etcd-ceiling --qps 2000 --duration 60s --warmup 5s \

@@ -381,8 +381,9 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 	// prefers the live directory), and a pass reads from a byte offset that is past
 	// the end of a different log — which is a clean stop with no error, so the pass
 	// ships nothing and the engine concludes the replica is caught up. That is a
-	// silently wrong convergence claim, and it is the same failure the README
-	// documents for snapshot restore, reached by an ordinary restart.
+	// silently wrong convergence claim, and it is the same failure
+	// docs/replication-and-anti-entropy.md documents for snapshot restore, reached
+	// by an ordinary restart.
 	//
 	// Monotonic numbering removes the ambiguity outright: a cursor into a released
 	// segment now names a segment number that no longer exists, which is exactly

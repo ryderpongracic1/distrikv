@@ -76,7 +76,8 @@ type Output struct {
 	// is reported over a mutation that is already durable on the primary, and
 	// there is no rollback. Since reads are served by the primary too, a later
 	// read of that key returning the refused value is correct behaviour. See
-	// the README's "CAP Position" — "a refused write is not an undone write".
+	// "CAP Position" in docs/architecture.md — "a refused write is not an undone
+	// write".
 	Applied bool
 
 	// Deferred marks a return synthesized by Recorder.EndUnknown. It carries no

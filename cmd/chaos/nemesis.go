@@ -259,11 +259,11 @@ func sleep(ctx context.Context, d time.Duration) bool {
 // `docker compose -f <file> {kill|stop} <service>` and
 // `docker compose -f <file> start <service>`.
 //
-// Two decisions worth knowing, argued in full in the README's chaos-runner
-// section: compose *service* names are addressed rather than container names,
-// which are project- and compose-version-dependent; and `start` (not `up`)
-// brings a victim back, so it keeps its named volume and recovers from its own
-// WAL rather than starting empty.
+// Two decisions worth knowing, argued in full in
+// docs/chaos-harness.md: compose *service* names are addressed rather than
+// container names, which are project- and compose-version-dependent; and
+// `start` (not `up`) brings a victim back, so it keeps its named volume and
+// recovers from its own WAL rather than starting empty.
 type composeNemesis struct {
 	mode    string
 	file    string

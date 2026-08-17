@@ -8,7 +8,7 @@
 // keys on a consistent hash ring and commits a write once its R=2 replicas ACK,
 // refusing the write when a replica is unreachable. The interesting output is
 // therefore not "who wins" but the shape of the gap — see the "Ceiling — vs
-// etcd" section of the repository README.
+// etcd" section of docs/benchmarks.md.
 //
 // The harness launches a 3-member etcd cluster on loopback (client ports
 // 2379/2381/2383, peer ports 2380/2382/2384), drives it with the exact workload

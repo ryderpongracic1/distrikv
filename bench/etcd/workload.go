@@ -94,7 +94,8 @@ func newWorkload(keyspace int, keyDist string, mix string, valueSize int) (*work
 	// Printable ASCII, byte-identical to cmd/bench's value generator. etcd
 	// carries the value as opaque bytes over gRPC while distrikv sends it inside
 	// a JSON body, so the payload is the same size but distrikv additionally
-	// pays the JSON framing — noted in the README rather than compensated for.
+	// pays the JSON framing — noted in docs/benchmarks.md rather than compensated
+	// for.
 	value := make([]byte, valueSize)
 	for i := range value {
 		value[i] = 'a' + byte(i%26)

@@ -803,7 +803,7 @@ func (e writeEffect) String() string {
 //
 //	503  the ring-primary applied the mutation to its own store and then failed
 //	     to replicate it. distrikv does not roll that back (see ErrReplication
-//	     in internal/server and the README's "CAP Position"), and reads are
+//	     in internal/server and "CAP Position" in docs/architecture.md), and reads are
 //	     served by the primary, so the write is present and readable. Applied.
 //	     Both client entry points report this identically: a forwarded write
 //	     returns the primary's status verbatim through ForwardKey.

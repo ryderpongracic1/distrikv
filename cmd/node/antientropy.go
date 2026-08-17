@@ -77,7 +77,7 @@ import (
 // The alternative — holding replication to a replica still while a pass ran —
 // would close the race at the cost of refusing writes to a replica that has just
 // come back, which trades a rare stale key for guaranteed unavailability. See
-// the README for the full reasoning.
+// docs/replication-and-anti-entropy.md for the full reasoning.
 
 // antiEntropyConfig tunes the engine. Zero values take the defaults below.
 type antiEntropyConfig struct {

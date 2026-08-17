@@ -48,7 +48,7 @@ var (
 // different effects on the store. A 503 means the ring-primary applied the
 // mutation to its own store and then failed to replicate it — the write is
 // present and there is no rollback (see internal/server's ErrReplication and
-// the README's "CAP Position"). A 502 means the request failed on its way to
+// "CAP Position" in docs/architecture.md). A 502 means the request failed on its way to
 // the primary, so it may never have been applied at all. Both render as
 // "server error: …", so nothing but the code separates them.
 //

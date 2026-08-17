@@ -26,7 +26,7 @@ const (
 // the replicas that did not ACK, until the next successful write for that key
 // converges them. The client is told the write was refused (HTTP 503) so it
 // does not assume the configured replication factor was achieved. See the
-// "CAP Position" section of the README.
+// "CAP Position" section of docs/architecture.md.
 var ErrReplication = errors.New("replication to replicas failed")
 
 // primaryWriter executes a mutation for which this node is the ring-primary.

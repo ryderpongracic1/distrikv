@@ -333,8 +333,8 @@ func (n *Node) ApplyReplica(ctx context.Context, op, key string, value []byte) e
 // Returns an error unless every replica ACKs — with R=2 that means any single
 // replica failure fails the client's write. The local write is NOT rolled back
 // (no rollback mechanism exists), so a failed fan-out leaves this node ahead of
-// its replicas until the next successful write for the key. See the README's
-// "CAP Position" section.
+// its replicas until the next successful write for the key. See the
+// "CAP Position" section of docs/architecture.md.
 //
 // A deployment with no other node in the replica set (single node, or R=1)
 // degrades to a local-only write and returns nil: the only member of the

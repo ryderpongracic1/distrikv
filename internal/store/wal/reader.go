@@ -18,8 +18,8 @@ import (
 // The v1 answer is to log it, count it, and resume from the oldest segment that
 // does survive — which converges every key written since then, and leaves any
 // key whose only write fell in the lost range divergent until it is written
-// again. See the README's "Anti-entropy" section for why full-keyspace repair is
-// deliberately out of scope for v1.
+// again. See docs/replication-and-anti-entropy.md for why full-keyspace repair
+// is deliberately out of scope for v1.
 var ErrCursorStale = errors.New("wal: cursor points into a garbage-collected segment")
 
 // Entry is one decoded WAL record together with its address in the log.

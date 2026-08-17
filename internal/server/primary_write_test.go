@@ -240,7 +240,7 @@ func TestHandleGetDoesNotReplicate(t *testing.T) {
 // TestHandlePutReplicationFailureRefusesWrite pins the CP failure semantics:
 // the client is told the write was refused, and — because no rollback exists —
 // the value is still present on the primary. Both halves of that are the
-// documented contract in the README's CAP Position section.
+// documented contract in the CAP Position section of docs/architecture.md.
 func TestHandlePutReplicationFailureRefusesWrite(t *testing.T) {
 	h := newHarness(t)
 	h.repl.writeErr = errors.New("replicate to node2: connection refused")

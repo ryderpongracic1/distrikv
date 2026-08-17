@@ -164,6 +164,17 @@ type replicaState struct {
 	candidateFail uint64
 	candidateAt   time.Time
 	hasCandidate  bool
+
+	// logGap latches that this node's WAL can no longer account for everything
+	// this replica is owed, so no pass over it may be reported as the replica
+	// being caught up. Set by noteLogGap when a pass discovers the gap; never
+	// cleared, because dropped segments do not come back and the keys they held
+	// stay divergent until they are written again. Like the
+	// anti_entropy_full_sync_required gauge it therefore over-reports — it keeps
+	// suppressing the claim after the affected keys have organically been
+	// rewritten — which is the only safe direction for a convergence claim.
+	logGap       bool
+	logGapReason string
 }
 
 // antiEntropy converges this node's replicas with its own WAL. One instance per
@@ -185,10 +196,13 @@ type antiEntropy struct {
 	mu      sync.Mutex
 	replica map[string]*replicaState
 
-	// fullSync records that this node's WAL cannot converge its replicas at all,
-	// because the store was replaced from a snapshot whose payload was never
-	// appended to the log. Read once at construction from the durable cursor
-	// state; it gates the convergence claims this engine is allowed to make.
+	// fullSync records that this node's WAL cannot converge its replicas, because
+	// it is not a complete record of the data this node holds: the store was
+	// replaced from a snapshot whose payload was never appended to the log, or a
+	// pass found retention had dropped segments a replica was owed. Read at
+	// construction from the durable cursor state and latched by noteLogGap
+	// thereafter; guarded by mu, and read through convergenceClaimBlocked. It
+	// gates the convergence claims this engine is allowed to make.
 	fullSync       bool
 	fullSyncReason string
 }
@@ -226,18 +240,19 @@ func newAntiEntropy(
 	fullSync, fullSyncReason := cursors.FullSyncRequired()
 	ae.fullSync, ae.fullSyncReason = fullSync, fullSyncReason
 	if fullSync {
-		// A restore replaced the store from a snapshot that never passed through
-		// the WAL, so there is no log to replay these keys from. Say so once,
-		// loudly, and hold the gauge up for as long as the condition stands —
-		// this engine must not let a pass over the post-restore log be read as
-		// evidence that the replicas agree.
+		// The durable latch says this node's WAL is not a complete record of the
+		// data it holds — a restore replaced the store from a snapshot that never
+		// passed through the log, or a previous process found retention had dropped
+		// segments a replica was owed. Say so once, loudly, and hold the gauge up
+		// for as long as the condition stands — this engine must not let a pass over
+		// an incomplete log be read as evidence that the replicas agree.
 		if m != nil {
 			m.AntiEntropyFullSyncRequired.Store(1)
 		}
 		ae.logger.Warn("this node cannot converge its replicas from its WAL: "+
-			"the store was replaced from a snapshot whose keys were never appended to the log. "+
-			"Catch-up passes cover only writes made after the restore; keys restored from the "+
-			"snapshot stay divergent on any replica that missed them until they are rewritten. "+
+			"the log is not a complete record of the data this node holds. "+
+			"Catch-up passes cover only the writes still in the log; keys outside it stay "+
+			"divergent on any replica that missed them until they are rewritten. "+
 			"A full key-scan sync would close this and does not exist in v1",
 			"reason", fullSyncReason, "wal_tip", tip)
 	}
@@ -266,11 +281,25 @@ func newAntiEntropy(
 // the write path, so it must stay cheap and non-blocking.
 func (ae *antiEntropy) NoteReplicationFailure(nodeID string) {
 	ae.mu.Lock()
+	newlyBehind := false
 	if st := ae.replica[nodeID]; st != nil {
 		st.failures++
+		newlyBehind = !st.behind
 		st.behind = true
 	}
 	ae.mu.Unlock()
+
+	// A replica that has just gone behind may be one with no cursor, in which case
+	// the WAL must be pinned before the next memtable flush releases segments it is
+	// owed. Waiting for the flush ticker would leave a window of up to
+	// FlushInterval in which that happens — and the window opens at exactly the
+	// moment a fault starts, which is when flushes are most likely. This runs only
+	// on the not-behind → behind transition, so a fault window costs one floor
+	// recomputation and not one per refused write.
+	if newlyBehind {
+		ae.publishRetentionFloor()
+	}
+
 	if ae.health != nil {
 		ae.health.ObserveReplication(nodeID, false)
 	}
@@ -384,13 +413,69 @@ func (ae *antiEntropy) behindReplicas() []string {
 	return out
 }
 
-// publishRetentionFloor tells the engine which WAL segments it must keep: the
-// oldest any cursor still points into.
+// retainAllWALSegments is the retention floor that keeps every segment still on
+// disk. Segment numbers start at 1, so a floor of 1 excludes nothing.
+const retainAllWALSegments uint64 = 1
+
+// publishRetentionFloor tells the engine which WAL segments it must keep.
+//
+// The obvious answer — the oldest segment any *recorded* cursor points into — is
+// wrong for the replica that needs retention most. A replica that has been behind
+// since before its first cursor was ever persisted has no recorded cursor at all,
+// so it contributes nothing to that minimum; and advanceQuietCursors will not give
+// it one, because it deliberately only adopts a tip for a replica that is *not*
+// behind. Meanwhile the healthy replicas keep adopting tips, so the floor derived
+// from cursors alone marches forward and the engine deletes exactly the segments
+// the down replica is owed. Worse, with no cursors recorded at all the floor is
+// "none", which the engine reads as retention being switched off — so every
+// flushed segment is deleted outright, which is the state a freshly started node
+// is in for its first few seconds.
+//
+// A zero cursor means "no evidence about what this replica has" (see
+// newAntiEntropy), and the retention that matches that meaning is to keep
+// everything still on disk. So: if any replica is known to be behind and has no
+// cursor, pin the floor at the oldest segment. That is bounded already —
+// lsm.maxRetainedWALSegments caps the parked segments, and when the cap bites,
+// runPass detects the resulting gap and withholds the convergence claim rather
+// than letting the cap turn into a silent false "caught up".
+//
+// The pin lifts on its own: the first pass that completes records a real cursor
+// for that replica, and the floor goes back to being derived from cursors.
 func (ae *antiEntropy) publishRetentionFloor() {
-	floor := ae.cursors.RetentionFloor()
+	floor, ok := ae.cursors.RetentionFloor()
+
+	if ae.anyBehindWithoutCursor() {
+		if !ok || floor > retainAllWALSegments {
+			floor, ok = retainAllWALSegments, true
+		}
+	}
+	if !ok {
+		floor = 0 // no replica is owed anything: retention off
+	}
 	if floor != ae.store.WALRetentionFloor() {
 		ae.store.RetainWALFrom(floor)
 	}
+}
+
+// anyBehindWithoutCursor reports whether some replica this node believes it is
+// ahead of has no recorded cursor — the state in which the log is the only thing
+// that can converge it and nothing says how far back it needs.
+func (ae *antiEntropy) anyBehindWithoutCursor() bool {
+	ae.mu.Lock()
+	behind := make([]string, 0, len(ae.replica))
+	for id, st := range ae.replica {
+		if st.behind {
+			behind = append(behind, id)
+		}
+	}
+	ae.mu.Unlock()
+
+	for _, id := range behind {
+		if ae.cursors.Get(id).IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 // advanceQuietCursors moves cursors forward on a cluster that is simply working.
@@ -472,19 +557,22 @@ func (ae *antiEntropy) repair(ctx context.Context, nodeID string) {
 			// Nothing was left to ship over a range that ends at a tip read after
 			// the previous pass finished. For a quiet cluster that is the
 			// definition of converged for every key this replica owns with us —
-			// but only when the log is actually the record of this node's data.
+			// but only when the log is actually a complete record of this node's
+			// data.
 			ae.markCaughtUp(nodeID, failuresAtStart)
-			if ae.fullSync {
-				// After a snapshot restore it is not. An empty pass here means
-				// "the log had nothing", not "the replica agrees", and the keys
-				// the snapshot brought in were never in the log to begin with.
-				// Reporting this as caught up is precisely the convergence claim
-				// this node cannot deliver.
+			if blocked, reason := ae.convergenceClaimBlocked(nodeID); blocked {
+				// It is not. Either a snapshot restore replaced the store with a
+				// payload that never passed through the log, or retention dropped
+				// segments this replica was owed. Either way an empty pass means
+				// "the log had nothing left", not "the replica agrees", and the
+				// keys the log cannot account for were never shipped. Reporting
+				// this as caught up is precisely the convergence claim this node
+				// cannot deliver.
 				ae.logger.Warn("catch-up pass found nothing to ship, but this node "+
-					"cannot converge from its WAL after a snapshot restore; the replica is "+
-					"NOT known to agree on keys restored from the snapshot",
+					"cannot converge this replica from its WAL; the replica is "+
+					"NOT known to agree on the keys the log cannot account for",
 					"replica", nodeID, "passes", pass, "entries_sent", totalSent,
-					"reason", ae.fullSyncReason)
+					"reason", reason)
 			} else {
 				ae.logger.Info("replica caught up",
 					"replica", nodeID, "passes", pass, "entries_sent", totalSent,
@@ -512,6 +600,79 @@ func (ae *antiEntropy) repair(ctx context.Context, nodeID string) {
 
 	ae.logger.Info("catch-up cycle hit its pass limit; the log is still moving",
 		"replica", nodeID, "passes", ae.cfg.MaxPasses, "entries_sent", totalSent)
+}
+
+// noteLogGap records that this node's WAL cannot account for everything nodeID is
+// owed, so nothing this engine observes about nodeID may be reported as
+// convergence.
+//
+// It surfaces the condition on two signals, because they answer different
+// questions and only one of them is already wired up:
+//
+//   - anti_entropy_stale is a counter of events: "a pass could not cover a
+//     replica's gap from the log", bumped every time a pass rediscovers it. It
+//     says something happened, and it distinguishes this cause from a snapshot
+//     restore. It cannot say whether the divergence still stands.
+//
+//   - anti_entropy_full_sync_required is the latched gauge whose documented
+//     meaning is exactly the standing condition here — this node's WAL is not a
+//     complete record of the data it holds, so it cannot converge its replicas
+//     from the log — and whose remedy is exactly the same missing mechanism, the
+//     key-range scan in CursorStore.FullSyncRequired's TODO. Latching it is
+//     therefore the honest reading rather than a reuse of a nearby flag.
+//
+// The gauge is node-wide while the gap is per-replica, so latching it
+// over-reports: a claim about a different replica that the log *can* still prove
+// is suppressed too. That is the same direction the gauge already errs in by never
+// clearing, and it is why the precise per-replica reason is carried in the log
+// line and in replicaState.logGapReason.
+//
+// It is persisted for the same reason the restore case is: dropped segments are
+// gone permanently, so a restart must not forget that the log has a hole in it.
+func (ae *antiEntropy) noteLogGap(nodeID, reason string) {
+	ae.mu.Lock()
+	if st := ae.replica[nodeID]; st != nil && !st.logGap {
+		st.logGap, st.logGapReason = true, reason
+	}
+	alreadyLatched := ae.fullSync
+	if !alreadyLatched {
+		ae.fullSync, ae.fullSyncReason = true, reason
+	}
+	ae.mu.Unlock()
+
+	if ae.metrics != nil {
+		ae.metrics.AntiEntropyStaleCursors.Add(1)
+		ae.metrics.AntiEntropyFullSyncRequired.Store(1)
+	}
+	if alreadyLatched {
+		return // MarkFullSyncRequired would be a no-op; skip the flush entirely
+	}
+	if err := ae.cursors.MarkFullSyncRequired(reason); err != nil {
+		ae.logger.Warn("persist full-sync-required latch", "err", err)
+	}
+}
+
+// convergenceClaimBlocked reports whether this node is allowed to say that
+// nodeID is caught up, and if not, why. The per-replica reason wins over the
+// node-wide one because it is the more specific account of the same fact.
+func (ae *antiEntropy) convergenceClaimBlocked(nodeID string) (bool, string) {
+	ae.mu.Lock()
+	defer ae.mu.Unlock()
+	if st := ae.replica[nodeID]; st != nil && st.logGap {
+		return true, st.logGapReason
+	}
+	if ae.fullSync {
+		return true, ae.fullSyncReason
+	}
+	return false, ""
+}
+
+// isBehind reports whether this node believes it is ahead of nodeID.
+func (ae *antiEntropy) isBehind(nodeID string) bool {
+	ae.mu.Lock()
+	defer ae.mu.Unlock()
+	st := ae.replica[nodeID]
+	return st != nil && st.behind
 }
 
 // markCaughtUp clears the behind flag unless a replication failed during the
@@ -545,6 +706,32 @@ func (ae *antiEntropy) runPass(ctx context.Context, nodeID string, from, limit s
 		return 0, fmt.Errorf("list WAL segments: %w", err)
 	}
 
+	// A zero cursor means "no evidence about what this replica has", so the pass
+	// starts at the oldest segment on disk. That covers the replica's whole gap
+	// only if nothing has ever been released — if segment 1 is still here, the
+	// pass reads this node's entire history. Once an earlier segment is gone there
+	// is a gap of unknown size, and nothing else will report it: NewReader returns
+	// on from.IsZero() *before* it looks for the cursor's segment, so ErrCursorStale
+	// is structurally unreachable on this path. Without this check the pass ships
+	// whatever survives, reports no error, and the next pass's empty result is read
+	// as convergence.
+	//
+	// Gated on the replica being known behind, which is the only evidence this node
+	// has that the replica missed anything at all. A replica that merely failed a
+	// health probe and recovered has a zero cursor too, and treating that as a gap
+	// would latch the full-sync gauge on a health flap.
+	if from.IsZero() && ae.isBehind(nodeID) &&
+		len(segments) > 0 && segments[0].Seq > retainAllWALSegments {
+		ae.noteLogGap(nodeID, fmt.Sprintf(
+			"replica %s has no recorded cursor and WAL segments below %d have been released",
+			nodeID, segments[0].Seq))
+		ae.logger.Warn("replica has no recorded cursor and the retained WAL no longer "+
+			"starts at its first segment; catching up from the oldest surviving segment. "+
+			"Keys whose only write fell in the released range stay divergent until "+
+			"rewritten (v1 limitation)",
+			"replica", nodeID, "oldest_segment", segments[0].Seq)
+	}
+
 	reader, err := storewal.NewReader(segments, from)
 	if err != nil {
 		if !errors.Is(err, storewal.ErrCursorStale) {
@@ -554,9 +741,8 @@ func (ae *antiEntropy) runPass(ctx context.Context, nodeID string, from, limit s
 		// surviving segment: that converges every key written since, which is
 		// strictly better than converging nothing, and record it loudly because
 		// the keys in the lost range stay divergent until they are written again.
-		if ae.metrics != nil {
-			ae.metrics.AntiEntropyStaleCursors.Add(1)
-		}
+		ae.noteLogGap(nodeID, fmt.Sprintf(
+			"replica %s cursor %s points into a released WAL segment", nodeID, from))
 		ae.logger.Warn("replica cursor is older than the retained WAL; "+
 			"catching up from the oldest surviving segment. Keys whose only write "+
 			"fell in the lost range stay divergent until rewritten (v1 limitation)",

@@ -37,7 +37,8 @@ type CursorStore struct {
 	dirty   bool
 
 	// fullSync latches the "this node's WAL cannot converge its replicas"
-	// condition set by InvalidateAll. See CursorStore.FullSyncRequired.
+	// condition set by InvalidateAll or MarkFullSyncRequired. See
+	// CursorStore.FullSyncRequired.
 	fullSync       bool
 	fullSyncReason string
 }
@@ -49,10 +50,12 @@ type cursorFile struct {
 	Version int               `json:"version"`
 	Cursors map[string]string `json:"cursors"`
 
-	// FullSyncRequired records that this node replaced its store from a snapshot,
-	// so its WAL no longer describes the data it holds. It is persisted because
-	// the condition outlives the process that discovered it: a restart must not
-	// forget that the log cannot converge this node's replicas.
+	// FullSyncRequired records that this node's WAL is not a complete record of
+	// the data it holds — either the store was replaced from a snapshot, or WAL
+	// retention dropped segments a replica still needed — so the log cannot
+	// converge its replicas. It is persisted because the condition outlives the
+	// process that discovered it: a restart must not forget that the log cannot
+	// converge this node's replicas.
 	//
 	// Both fields are additive and omitted when unset, which is why the file
 	// version is NOT bumped for them. A version bump would be a hard failure for
@@ -215,8 +218,40 @@ func (cs *CursorStore) InvalidateAll(reason string) error {
 	return cs.Flush()
 }
 
+// MarkFullSyncRequired latches the full-sync-required condition and persists it,
+// leaving the cursors alone. It is the entry point for the *other* way this node
+// can lose the ability to converge a replica from its log: WAL retention dropped
+// segments the replica still needed, so the keys whose only write fell in the
+// dropped range exist nowhere in the log.
+//
+// Two things distinguish it from InvalidateAll. It must not drop the cursors —
+// they are the only record of how far each replica did get, and re-sending from
+// the oldest surviving segment on every pass afterwards would be pure waste. And
+// it is idempotent: the first reason wins and a repeat call does not even mark the
+// file dirty, because a pass can rediscover the same permanent gap on every cycle
+// and must not turn that into a flush per pass.
+func (cs *CursorStore) MarkFullSyncRequired(reason string) error {
+	cs.mu.Lock()
+	if cs.fullSync {
+		cs.mu.Unlock()
+		return nil
+	}
+	cs.fullSync = true
+	cs.fullSyncReason = reason
+	cs.dirty = true
+	cs.mu.Unlock()
+	return cs.Flush()
+}
+
 // FullSyncRequired reports whether this node has replaced its store from a
 // snapshot without ever full-syncing its replicas, and why.
+//
+// It also covers the second cause, latched by MarkFullSyncRequired: a catch-up
+// pass that found the log no longer reaches back far enough to cover a replica's
+// gap. Both mean the same thing to a reader — this node's WAL is not a complete
+// record of the data it holds, so no pass over it can be read as evidence that a
+// replica agrees — and both have the same remedy, the full key-scan sync below.
+// The reason string is what tells them apart.
 //
 // It latches: v1 has no full-sync mechanism, so nothing clears it. That means it
 // keeps reading true even after the affected keys have organically been
@@ -239,18 +274,26 @@ func (cs *CursorStore) FullSyncRequired() (bool, string) {
 }
 
 // RetentionFloor returns the lowest WAL segment number any cursor still points
-// into, or 0 when no cursors are recorded. It is what the engine must not
-// garbage-collect below.
-func (cs *CursorStore) RetentionFloor() uint64 {
+// into: the segment the engine must not garbage-collect below. ok is false when
+// no cursor has ever been recorded, in which case floor is 0 and carries no
+// meaning.
+//
+// The two results are separate because segment 0 is not a legal segment number
+// but does look like one. A single-return version overloaded it as both "no
+// cursors have been recorded" and a floor value, and the engine's retention
+// check reads 0 as "retention is off" — so "we know nothing about what any
+// replica has" and "no replica needs any segment kept" were the same value.
+// Those demand opposite behaviour: the first must keep everything, the second may
+// delete everything. Forcing the caller to look at ok is what keeps them apart.
+func (cs *CursorStore) RetentionFloor() (floor uint64, ok bool) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	var floor uint64
 	for _, pos := range cs.cursors {
-		if floor == 0 || pos.Segment < floor {
-			floor = pos.Segment
+		if !ok || pos.Segment < floor {
+			floor, ok = pos.Segment, true
 		}
 	}
-	return floor
+	return floor, ok
 }
 
 // Flush persists the cursors if any have changed since the last flush. It is a

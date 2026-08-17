@@ -57,20 +57,24 @@ type Metrics struct {
 	// stopped accepting entries — the replica died mid-sync, or went away again.
 	AntiEntropyPassErrors atomic.Uint64
 
-	// AntiEntropyStaleCursors counts times a replica's cursor pointed into a WAL
-	// segment that had already been garbage-collected, so the catch-up could not
-	// cover the whole gap. A non-zero value means some keys may stay divergent
-	// until they are written again — the documented v1 bound.
+	// AntiEntropyStaleCursors counts times a catch-up pass could not cover a
+	// replica's gap from the log, because the segments it needed had already been
+	// garbage-collected — either a recorded cursor pointed into one of them, or the
+	// replica had no cursor at all and the log no longer starts at segment 1. A
+	// non-zero value means some keys may stay divergent until they are written
+	// again — the documented v1 bound.
 	AntiEntropyStaleCursors atomic.Uint64
 
-	// AntiEntropyFullSyncRequired is a 0/1 gauge: 1 means this node has replaced
-	// its store from a snapshot, so its WAL no longer describes the data it
-	// holds and anti-entropy cannot converge its replicas from the log.
+	// AntiEntropyFullSyncRequired is a 0/1 gauge: 1 means this node's WAL is not a
+	// complete record of the data it holds, so anti-entropy cannot converge its
+	// replicas from the log. Two causes set it — the store was replaced from a
+	// snapshot whose payload was never appended to the log, or WAL retention
+	// dropped segments a replica still needed. The node's logs carry which.
 	//
 	// It is a gauge rather than a counter because it describes a standing
 	// condition, and it latches: v1 has no full-sync mechanism, so nothing
 	// clears it. While it reads 1, treat any "replica caught up" signal from
-	// this node as covering only writes made after the restore.
+	// this node as covering only the writes its log can still account for.
 	AntiEntropyFullSyncRequired atomic.Uint64
 
 	// --- LSM engine counters (Phase 1 benchmark harness) -------------------

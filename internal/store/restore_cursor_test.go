@@ -78,7 +78,7 @@ func TestRestoreInvalidatesReplicaCursors(t *testing.T) {
 	if preRestore.IsZero() {
 		t.Fatal("precondition: no cursor recorded before the restore")
 	}
-	if cs.RetentionFloor() == 0 {
+	if _, ok := cs.RetentionFloor(); !ok {
 		t.Fatal("precondition: no WAL retention floor before the restore")
 	}
 
@@ -96,10 +96,10 @@ func TestRestoreInvalidatesReplicaCursors(t *testing.T) {
 	if all := cs.All(); len(all) != 0 {
 		t.Errorf("cursors still recorded after the restore: %v", all)
 	}
-	if floor := cs.RetentionFloor(); floor != 0 {
-		t.Errorf("WAL retention floor is %d after the restore, want 0: it names a "+
-			"segment of the discarded log, which makes the engine drop freshly "+
-			"flushed segments instead of retaining them for catch-up", floor)
+	if floor, ok := cs.RetentionFloor(); ok {
+		t.Errorf("WAL retention floor is (%d, true) after the restore, want ok=false: a "+
+			"floor from the discarded log makes the engine drop freshly flushed "+
+			"segments instead of retaining them for catch-up", floor)
 	}
 
 	// The specific silent failure this guards: a surviving cursor does not order

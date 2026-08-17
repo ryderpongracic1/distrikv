@@ -121,6 +121,14 @@ func checkConvergence(ctx context.Context, cfg convergenceConfig, keys []string,
 	deadline := time.Now().Add(cfg.Grace)
 	for {
 		res.Attempts++
+		// Each attempt reports its own reachability. Without this reset a transient
+		// read error on an early attempt survives into a later attempt that read
+		// every replica cleanly, so the report prints "converged: true" and then
+		// lists unreachable nodes underneath it — a summary contradicted by its own
+		// detail lines. Clearing here is safe because the pre-loop node-discovery
+		// failures return before the loop is ever entered, so anything in this list
+		// at this point came from a previous attempt.
+		res.Unreachable = nil
 		divergent, reads, examples, err := compareReplicas(ctx, hc, ring, addrByNode, keys, cfg.Replicas)
 		res.KeysChecked = len(keys)
 		res.NodeReads = reads

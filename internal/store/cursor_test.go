@@ -79,23 +79,34 @@ func TestCursorRetentionFloorIsTheOldest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenCursorStore: %v", err)
 	}
-	if got := cs.RetentionFloor(); got != 0 {
-		t.Errorf("floor with no cursors = %d, want 0 (retain nothing)", got)
+	if got, ok := cs.RetentionFloor(); ok {
+		t.Errorf("floor with no cursors = (%d, true), want ok=false: "+
+			"\"nothing is recorded\" must not be reported as a floor value", got)
 	}
 
 	cs.Advance("node2", storewal.Position{Segment: 9})
 	cs.Advance("node3", storewal.Position{Segment: 4, Offset: 12})
-	if got := cs.RetentionFloor(); got != 4 {
-		t.Errorf("floor = %d, want 4 — the segment the furthest-behind replica still needs", got)
+	got, ok := cs.RetentionFloor()
+	if !ok || got != 4 {
+		t.Errorf("floor = (%d, %t), want (4, true) — the segment the furthest-behind replica still needs", got, ok)
 	}
 
 	// A node that leaves the ring must stop pinning segments.
 	cs.Forget("node3")
-	if got := cs.RetentionFloor(); got != 9 {
-		t.Errorf("floor after forgetting the lagging replica = %d, want 9", got)
+	got, ok = cs.RetentionFloor()
+	if !ok || got != 9 {
+		t.Errorf("floor after forgetting the lagging replica = (%d, %t), want (9, true)", got, ok)
 	}
 	if got := cs.Get("node3"); !got.IsZero() {
 		t.Errorf("a forgotten node still has cursor %s", got)
+	}
+
+	// Segment 1 is a legal floor and must be distinguishable from "no cursors",
+	// which is the ambiguity the second result exists to remove.
+	cs.Forget("node2")
+	cs.Advance("node4", storewal.Position{Segment: 1})
+	if got, ok := cs.RetentionFloor(); !ok || got != 1 {
+		t.Errorf("floor with a cursor in segment 1 = (%d, %t), want (1, true)", got, ok)
 	}
 }
 
@@ -163,5 +174,57 @@ func TestCursorStoreRefusesACorruptFile(t *testing.T) {
 	}
 	if _, err := OpenCursorStore(dir); err == nil {
 		t.Error("OpenCursorStore accepted a malformed position")
+	}
+}
+
+// TestMarkFullSyncRequiredLatchesWithoutDroppingCursors covers the second way a
+// node loses the ability to converge a replica from its log: retention dropped
+// segments the replica still needed. Unlike a snapshot restore this must NOT
+// discard the cursors — they are the only record of how far each replica did get,
+// and losing them makes every later pass restart from the oldest surviving
+// segment.
+func TestMarkFullSyncRequiredLatchesWithoutDroppingCursors(t *testing.T) {
+	dir := t.TempDir()
+	cs, err := OpenCursorStore(dir)
+	if err != nil {
+		t.Fatalf("OpenCursorStore: %v", err)
+	}
+	cs.Advance("node2", storewal.Position{Segment: 7, Offset: 24})
+	if required, _ := cs.FullSyncRequired(); required {
+		t.Fatal("precondition: full sync required before anything asked for it")
+	}
+
+	const reason = "replica node2 cursor 3:0 points into a released WAL segment"
+	if err := cs.MarkFullSyncRequired(reason); err != nil {
+		t.Fatalf("MarkFullSyncRequired: %v", err)
+	}
+
+	required, got := cs.FullSyncRequired()
+	if !required || got != reason {
+		t.Errorf("FullSyncRequired() = (%t, %q), want (true, %q)", required, got, reason)
+	}
+	if pos := cs.Get("node2"); pos != (storewal.Position{Segment: 7, Offset: 24}) {
+		t.Errorf("cursor for node2 = %s after latching, want it untouched at 7:24", pos)
+	}
+
+	// A permanent gap is rediscovered on every pass, so a repeat call must be a
+	// no-op rather than a flush per pass — and the first reason must survive it.
+	if err := cs.MarkFullSyncRequired("a later, less specific reason"); err != nil {
+		t.Fatalf("second MarkFullSyncRequired: %v", err)
+	}
+	if _, got := cs.FullSyncRequired(); got != reason {
+		t.Errorf("reason after a repeat call = %q, want the first one %q", got, reason)
+	}
+
+	// The segments are gone permanently, so the latch has to outlive the process.
+	reopened, err := OpenCursorStore(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if required, got := reopened.FullSyncRequired(); !required || got != reason {
+		t.Errorf("after reopen FullSyncRequired() = (%t, %q), want (true, %q)", required, got, reason)
+	}
+	if pos := reopened.Get("node2"); pos != (storewal.Position{Segment: 7, Offset: 24}) {
+		t.Errorf("cursor for node2 = %s after reopen, want 7:24", pos)
 	}
 }

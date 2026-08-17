@@ -37,7 +37,7 @@ func TestRestore_BulkLoadPerformsNoWALAppends(t *testing.T) {
 	defer src.Close()
 
 	for i := 0; i < keys; i++ {
-		if err := src.Put(ctx, fmt.Sprintf("snap-%05d", i), []byte(fmt.Sprintf("value-%05d", i))); err != nil {
+		if _, err := src.Put(ctx, fmt.Sprintf("snap-%05d", i), []byte(fmt.Sprintf("value-%05d", i))); err != nil {
 			t.Fatalf("source Put %d: %v", i, err)
 		}
 	}
@@ -58,7 +58,7 @@ func TestRestore_BulkLoadPerformsNoWALAppends(t *testing.T) {
 
 	// A write of our own first, so the counter is provably live rather than
 	// stuck at zero for an unrelated reason.
-	if err := dst.Put(ctx, "pre-restore", []byte("x")); err != nil {
+	if _, err := dst.Put(ctx, "pre-restore", []byte("x")); err != nil {
 		t.Fatalf("dest Put: %v", err)
 	}
 	before := dst.WALAppends()
@@ -116,7 +116,7 @@ func TestRestore_SurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLSMTree: %v", err)
 	}
-	if err := tree.Put(ctx, "doomed", []byte("should not survive")); err != nil {
+	if _, err := tree.Put(ctx, "doomed", []byte("should not survive")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if err := tree.Restore(ctx, payload); err != nil {
@@ -167,7 +167,7 @@ func TestRestore_EmptySnapshotEmptiesStore(t *testing.T) {
 	}
 	defer tree.Close()
 
-	if err := tree.Put(ctx, "before", []byte("v")); err != nil {
+	if _, err := tree.Put(ctx, "before", []byte("v")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if err := tree.Restore(ctx, map[string][]byte{}); err != nil {
@@ -186,7 +186,7 @@ func TestRestore_EmptySnapshotEmptiesStore(t *testing.T) {
 
 	// The store must still be usable afterwards — the background goroutines
 	// Restore stops have to come back.
-	if err := tree.Put(ctx, "after", []byte("v")); err != nil {
+	if _, err := tree.Put(ctx, "after", []byte("v")); err != nil {
 		t.Fatalf("Put after empty restore: %v", err)
 	}
 	if _, err := tree.Get(ctx, "after"); err != nil {

@@ -58,7 +58,7 @@ func TestLinearizability_ConcurrentOps(t *testing.T) {
 				case 0: // put
 					val := fmt.Sprintf("g%d-i%d", id, i)
 					cid := rec.Begin(linearizability.Input{Op: "put", Key: key, Value: val})
-					err := tree.Put(ctx, key, []byte(val))
+					_, err := tree.Put(ctx, key, []byte(val))
 					out := linearizability.Output{}
 					if err != nil {
 						out.Err = true
@@ -80,7 +80,7 @@ func TestLinearizability_ConcurrentOps(t *testing.T) {
 
 				case 2: // delete
 					cid := rec.Begin(linearizability.Input{Op: "delete", Key: key})
-					err := tree.Delete(ctx, key)
+					_, err := tree.Delete(ctx, key)
 					out := linearizability.Output{}
 					if err != nil {
 						out.Err = true
@@ -141,7 +141,7 @@ func TestLinearizability_WithLevels(t *testing.T) {
 	setupVal := make([]byte, 10)
 	for i := 0; i < setupKeys; i++ {
 		k := fmt.Sprintf("setup-%06d", i)
-		if err := tree.Put(ctx, k, setupVal); err != nil {
+		if _, err := tree.Put(ctx, k, setupVal); err != nil {
 			t.Fatalf("setup Put %d: %v", i, err)
 		}
 	}
@@ -175,7 +175,7 @@ func TestLinearizability_WithLevels(t *testing.T) {
 				case 0: // put
 					val := fmt.Sprintf("g%d-i%d", id, i)
 					cid := rec.Begin(linearizability.Input{Op: "put", Key: key, Value: val})
-					err := tree.Put(ctx, key, []byte(val))
+					_, err := tree.Put(ctx, key, []byte(val))
 					out := linearizability.Output{}
 					if err != nil {
 						out.Err = true
@@ -195,7 +195,7 @@ func TestLinearizability_WithLevels(t *testing.T) {
 					rec.End(cid, out)
 				case 2: // delete
 					cid := rec.Begin(linearizability.Input{Op: "delete", Key: key})
-					err := tree.Delete(ctx, key)
+					_, err := tree.Delete(ctx, key)
 					out := linearizability.Output{}
 					if err != nil {
 						out.Err = true

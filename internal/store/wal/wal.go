@@ -49,21 +49,54 @@ import (
 )
 
 // OpType is the single-byte discriminant identifying the kind of WAL entry.
+//
+// It doubles as the record-format discriminant: OpPut/OpDelete introduce a v1
+// record, and the unexported opPutSeq/opDeleteSeq introduce a v2 record that
+// additionally carries the write's LSM sequence number. Callers only ever name
+// OpPut/OpDelete — the seq-carrying codes are an encoding detail that Replay and
+// Reader normalise away, so an entry read back from either format reports the
+// logical op it was written with.
 type OpType uint8
 
 const (
 	OpPut    OpType = 1
 	OpDelete OpType = 2
+
+	// opPutSeq and opDeleteSeq introduce a v2 record: identical to v1 but with
+	// an 8-byte sequence number between the op byte and the key length.
+	//
+	// A new op code rather than a segment-header version field, because there is
+	// no segment header to put one in and adding one would invalidate every WAL
+	// on disk. Per-record discrimination costs one byte of switch and makes the
+	// two formats freely interleavable within a segment, which is exactly what a
+	// binary upgrade produces: the tail of an existing segment is v1 and
+	// everything appended after the upgrade is v2.
+	opPutSeq    OpType = 3
+	opDeleteSeq OpType = 4
 )
 
 // WAL is an append-only Write-Ahead Log for crash recovery.
 //
-// Wire format per entry:
+// Wire format per entry — v1 (Append):
 //
 //	[1 byte op][4 byte key-len][key bytes][4 byte val-len][val bytes][4 byte CRC32]
 //
-// CRC32 covers every byte preceding it in the entry. A CRC mismatch during
-// replay signals a torn write from a prior crash; replay stops cleanly.
+// v2 (AppendSeq), written by the LSM engine since per-key sequence numbers
+// became load-bearing for replica convergence:
+//
+//	[1 byte op][8 byte seq][4 byte key-len][key bytes][4 byte val-len][val bytes][4 byte CRC32]
+//
+// CRC32 covers every byte preceding it in the entry, seq included. A CRC
+// mismatch during replay signals a torn write from a prior crash; replay stops
+// cleanly.
+//
+// Compatibility runs one way: a current binary reads both formats, and a v1
+// record replays with seq 0 ("this record does not know its sequence number").
+// A binary predating v2 reading a v2 record misparses the seq bytes as a key
+// length, which its own implausible-length and CRC checks turn into a clean
+// torn-write stop — so a downgrade loses the v2 tail of a segment rather than
+// corrupting it. Downgrading a node whose WAL has v2 records therefore drops
+// unflushed writes, and is not supported.
 type WAL struct {
 	f  *os.File
 	bw *bufio.Writer // persistent; allocated once at Open, reused across Append calls
@@ -127,7 +160,7 @@ func (w *WAL) Size() int64 { return w.size.Load() }
 // On any write error the bufio.Writer is reset so the next Append starts
 // from a clean state and does not emit a partial entry.
 func (w *WAL) Append(op OpType, key string, value []byte) error {
-	if err := w.appendEntry(op, key, value); err != nil {
+	if err := w.appendEntry(op, key, value, 0, false); err != nil {
 		// Discard any partial entry left in the write buffer.  The next
 		// Append call will start cleanly from the last-fsynced position.
 		w.bw.Reset(w.f)
@@ -136,16 +169,67 @@ func (w *WAL) Append(op OpType, key string, value []byte) error {
 	return nil
 }
 
-func (w *WAL) appendEntry(op OpType, key string, value []byte) error {
+// AppendSeq writes one log entry that carries seq, and fsyncs before returning.
+// It is the v2 record described on WAL; Append writes the v1 record that omits
+// the sequence number.
+//
+// The engine uses this for every write, because a sequence number that only
+// exists in memory cannot survive the restart it is needed across: a replica
+// compares the sequence the primary sent against the sequence it has stored for
+// that key, and if replay had to invent a fresh local sequence for every
+// recovered entry, that comparison would be against a number from a different
+// counter after every restart. See Memtable.ReplayWAL.
+//
+// op must be OpPut or OpDelete; the seq-carrying wire code is chosen here.
+func (w *WAL) AppendSeq(op OpType, key string, value []byte, seq uint64) error {
+	if err := w.appendEntry(op, key, value, seq, true); err != nil {
+		w.bw.Reset(w.f)
+		return err
+	}
+	return nil
+}
+
+// seqWireOp maps a logical op onto the v2 wire code that carries a sequence
+// number.
+func seqWireOp(op OpType) (OpType, error) {
+	switch op {
+	case OpPut:
+		return opPutSeq, nil
+	case OpDelete:
+		return opDeleteSeq, nil
+	default:
+		return 0, fmt.Errorf("wal: cannot write sequence number for op %d", op)
+	}
+}
+
+func (w *WAL) appendEntry(op OpType, key string, value []byte, seq uint64, withSeq bool) error {
+	wireOp := op
+	if withSeq {
+		var err error
+		if wireOp, err = seqWireOp(op); err != nil {
+			return err
+		}
+	}
+
 	var lenBuf [4]byte
 	var crc uint32
 
 	// ── op byte ────────────────────────────────────────────────────────────
-	if err := w.bw.WriteByte(byte(op)); err != nil {
+	if err := w.bw.WriteByte(byte(wireOp)); err != nil {
 		return fmt.Errorf("wal: write op: %w", err)
 	}
-	opBuf := [1]byte{byte(op)}
+	opBuf := [1]byte{byte(wireOp)}
 	crc = crc32.Update(crc, crc32Table, opBuf[:])
+
+	// ── seq (v2 only) ──────────────────────────────────────────────────────
+	if withSeq {
+		var seqBuf [8]byte
+		binary.BigEndian.PutUint64(seqBuf[:], seq)
+		if _, err := w.bw.Write(seqBuf[:]); err != nil {
+			return fmt.Errorf("wal: write seq: %w", err)
+		}
+		crc = crc32.Update(crc, crc32Table, seqBuf[:])
+	}
 
 	// ── key-len ────────────────────────────────────────────────────────────
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(key)))
@@ -192,11 +276,19 @@ func (w *WAL) appendEntry(op OpType, key string, value []byte) error {
 	// The entry is now durable, so the log's end has moved. Advancing here
 	// rather than before the fsync keeps Size() a statement about what a reader
 	// can actually find on disk.
-	w.size.Add(EntryWireSize(key, value))
+	if withSeq {
+		w.size.Add(EntrySeqWireSize(key, value))
+	} else {
+		w.size.Add(EntryWireSize(key, value))
+	}
 	return nil
 }
 
 // Replay reads the WAL from the beginning and calls fn for each valid entry.
+//
+// seq is the sequence number the entry was written with, or 0 for a v1 record
+// that predates the format carrying one. Callers must treat 0 as "unknown"
+// rather than as an ordering below every other write.
 //
 // Torn-write handling (see package doc for the full contract):
 //   - Returns nil and stops at any EOF / io.ErrUnexpectedEOF (torn write).
@@ -205,7 +297,7 @@ func (w *WAL) appendEntry(op OpType, key string, value []byte) error {
 //
 // The fn callback receives an owned copy of the value slice and an owned
 // string copy of the key; it may retain them after fn returns.
-func (w *WAL) Replay(fn func(op OpType, key string, value []byte)) error {
+func (w *WAL) Replay(fn func(op OpType, key string, value []byte, seq uint64)) error {
 	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("wal: seek: %w", err)
 	}
@@ -230,6 +322,20 @@ func (w *WAL) Replay(fn func(op OpType, key string, value []byte)) error {
 				return nil // clean end of log
 			}
 			return fmt.Errorf("wal: read op: %w", err)
+		}
+
+		// ── seq (v2 records only) ──────────────────────────────────────────
+		logicalOp, hasSeq := decodeWireOp(OpType(opByte))
+		var seq uint64
+		var seqBuf [8]byte
+		if hasSeq {
+			if _, err := io.ReadFull(br, seqBuf[:]); err != nil {
+				if isTornWrite(err) {
+					return nil
+				}
+				return fmt.Errorf("wal: read seq: %w", err)
+			}
+			seq = binary.BigEndian.Uint64(seqBuf[:])
 		}
 
 		// ── key-len ────────────────────────────────────────────────────────
@@ -284,6 +390,9 @@ func (w *WAL) Replay(fn func(op OpType, key string, value []byte)) error {
 		// buffers; crc32.Update traverses them once with no extra allocation.
 		var computed uint32
 		computed = crc32.Update(computed, crc32Table, []byte{opByte})
+		if hasSeq {
+			computed = crc32.Update(computed, crc32Table, seqBuf[:])
+		}
 		binary.BigEndian.PutUint32(lenBuf[:], keyLen)
 		computed = crc32.Update(computed, crc32Table, lenBuf[:])
 		computed = crc32.Update(computed, crc32Table, keyBuf)
@@ -306,7 +415,25 @@ func (w *WAL) Replay(fn func(op OpType, key string, value []byte)) error {
 			valCopy = make([]byte, valLen)
 			copy(valCopy, valBuf)
 		}
-		fn(OpType(opByte), string(keyBuf), valCopy)
+		fn(logicalOp, string(keyBuf), valCopy, seq)
+	}
+}
+
+// decodeWireOp maps a wire op byte onto the logical op it represents and
+// reports whether the record carries a sequence number.
+//
+// An unrecognised code is returned unchanged with hasSeq false, which leaves it
+// to the CRC check to reject: a byte that is neither a known op nor a valid
+// framing start is the signature of a torn write, and the existing torn-write
+// path already handles it cleanly.
+func decodeWireOp(op OpType) (logical OpType, hasSeq bool) {
+	switch op {
+	case opPutSeq:
+		return OpPut, true
+	case opDeleteSeq:
+		return OpDelete, true
+	default:
+		return op, false
 	}
 }
 

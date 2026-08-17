@@ -134,11 +134,19 @@ func (x *ForwardKeyResponse) GetBody() []byte {
 }
 
 type ReplicateRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Op            string                 `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"` // "put" or "delete"
-	Key           string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
-	Value         []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"` // empty for delete
-	Term          uint64                 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`  // Raft term at the time of the write
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Op    string                 `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"` // "put" or "delete"
+	Key   string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+	Value []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"` // empty for delete
+	Term  uint64                 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`  // Raft term at the time of the write
+	// seq is the write sequence the ring-primary's storage engine assigned to
+	// this mutation. The replica applies it only if it does not already hold a
+	// version of the key at this sequence or above, so two writes to one key that
+	// arrive out of order resolve to the later write on every replica.
+	//
+	// 0 means "not supplied" (a peer predating this field) and applies
+	// unconditionally, which is the pre-sequence arrival-order behaviour.
+	Seq           uint64 `protobuf:"varint,5,opt,name=seq,proto3" json:"seq,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -197,6 +205,13 @@ func (x *ReplicateRequest) GetValue() []byte {
 func (x *ReplicateRequest) GetTerm() uint64 {
 	if x != nil {
 		return x.Term
+	}
+	return 0
+}
+
+func (x *ReplicateRequest) GetSeq() uint64 {
+	if x != nil {
+		return x.Seq
 	}
 	return 0
 }
@@ -846,12 +861,13 @@ const file_kv_proto_rawDesc = "" +
 	"\x12ForwardKeyResponse\x12\x1f\n" +
 	"\vstatus_code\x18\x01 \x01(\x05R\n" +
 	"statusCode\x12\x12\n" +
-	"\x04body\x18\x02 \x01(\fR\x04body\"^\n" +
+	"\x04body\x18\x02 \x01(\fR\x04body\"p\n" +
 	"\x10ReplicateRequest\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x12\x12\n" +
-	"\x04term\x18\x04 \x01(\x04R\x04term\"F\n" +
+	"\x04term\x18\x04 \x01(\x04R\x04term\x12\x10\n" +
+	"\x03seq\x18\x05 \x01(\x04R\x03seq\"F\n" +
 	"\x11ReplicateResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\"\x95\x01\n" +

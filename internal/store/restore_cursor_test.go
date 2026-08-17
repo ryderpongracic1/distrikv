@@ -46,7 +46,7 @@ func advanceCursorToTip(t *testing.T, s *Store, cs *CursorStore, replica string)
 	t.Helper()
 	ctx := context.Background()
 	for i := 0; i < 50; i++ {
-		if err := s.Put(ctx, fmt.Sprintf("pre-restore-%d", i), []byte("v")); err != nil {
+		if _, err := s.Put(ctx, fmt.Sprintf("pre-restore-%d", i), []byte("v")); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 	}

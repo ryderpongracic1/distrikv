@@ -86,13 +86,30 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	return s.engine.Get(ctx, key)
 }
 
-// Put writes key=value durably.
-func (s *Store) Put(ctx context.Context, key string, value []byte) error {
+// Put writes key=value durably and returns the sequence number the storage
+// engine assigned to the write. The caller replicates that number alongside the
+// mutation so replicas can order it against what they already hold — see
+// PutIfNewer.
+func (s *Store) Put(ctx context.Context, key string, value []byte) (uint64, error) {
 	s.putCount.Add(1)
 	return s.engine.Put(ctx, key, value)
 }
 
-// Delete removes key by writing a tombstone.
+// PutIfNewer applies a replicated write only if this node does not already hold
+// a version of key at seq or above, reporting whether it was applied.
+//
+// It is the replica-side apply for a mutation a ring-primary assigned seq to.
+// Discarding a write whose sequence is not newer is what keeps two replicas of a
+// key from disagreeing when concurrent writes reach them in different orders;
+// see lsm.LSMTree.PutIfNewer for why arrival order is not enough and why a seq
+// of 0 applies unconditionally.
+func (s *Store) PutIfNewer(ctx context.Context, key string, value []byte, seq uint64) (bool, error) {
+	s.putCount.Add(1)
+	return s.engine.PutIfNewer(ctx, key, value, seq)
+}
+
+// Delete removes key by writing a tombstone, and returns the sequence number
+// assigned to that tombstone.
 //
 // Deletes are unconditional (blind) and therefore idempotent: deleting a key
 // that does not exist succeeds. The previous implementation did a Get before the
@@ -104,9 +121,16 @@ func (s *Store) Put(ctx context.Context, key string, value []byte) error {
 // reads, which is worse. Blind deletes match RocksDB, Cassandra and DynamoDB
 // DeleteItem. Callers that must distinguish absence should Get first and accept
 // that the result is advisory.
-func (s *Store) Delete(ctx context.Context, key string) error {
+func (s *Store) Delete(ctx context.Context, key string) (uint64, error) {
 	s.delCount.Add(1)
 	return s.engine.Delete(ctx, key)
+}
+
+// DeleteIfNewer applies a replicated tombstone only if this node does not
+// already hold a version of key at seq or above. See PutIfNewer.
+func (s *Store) DeleteIfNewer(ctx context.Context, key string, seq uint64) (bool, error) {
+	s.delCount.Add(1)
+	return s.engine.DeleteIfNewer(ctx, key, seq)
 }
 
 // KeyCount returns the approximate number of live keys.

@@ -40,8 +40,8 @@ func newTestNode(t *testing.T) *RaftNode {
 // noopStore satisfies StoreInterface without doing anything.
 type noopStore struct{}
 
-func (n *noopStore) Put(_ context.Context, _ string, _ []byte) error { return nil }
-func (n *noopStore) Delete(_ context.Context, _ string) error        { return nil }
+func (n *noopStore) Put(_ context.Context, _ string, _ []byte) (uint64, error) { return 0, nil }
+func (n *noopStore) Delete(_ context.Context, _ string) (uint64, error)        { return 0, nil }
 func (n *noopStore) Snapshot(_ context.Context) (map[string][]byte, error) {
 	return map[string][]byte{}, nil
 }

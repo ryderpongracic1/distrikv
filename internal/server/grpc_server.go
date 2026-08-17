@@ -45,16 +45,23 @@ type RaftInterface interface {
 // The two methods are deliberately asymmetric, and that asymmetry is what
 // prevents an infinite replication loop: a primary fans out via
 // ReplicateWrite, while a replica applies via ApplyReplica and stops there.
+//
+// Both carry seq, the sequence number the ring-primary's storage engine assigned
+// to the mutation. It is what lets a replica tell a stale arrival from a fresh
+// one when concurrent writes to one key reach it out of order; a seq of 0 means
+// the sender did not supply one and applies unconditionally.
 type ReplicationManager interface {
 	// ApplyReplica writes a replicated mutation directly to the local store,
 	// bypassing the replication fan-out — this node IS the replica receiving
-	// the write, so re-fanning-out would replicate forever.
-	ApplyReplica(ctx context.Context, op, key string, value []byte) error
+	// the write, so re-fanning-out would replicate forever. The mutation is
+	// applied only if seq is newer than the version already held for the key.
+	ApplyReplica(ctx context.Context, op, key string, value []byte, seq uint64) error
 
 	// ReplicateWrite fans a mutation this node has already applied locally out
 	// to the other replicas for the key, and reports an error unless every one
-	// of them acknowledges it. op is OpPut or OpDelete.
-	ReplicateWrite(ctx context.Context, op, key string, value []byte) error
+	// of them acknowledges it. op is OpPut or OpDelete, and seq is the sequence
+	// the local write was assigned.
+	ReplicateWrite(ctx context.Context, op, key string, value []byte, seq uint64) error
 }
 
 // GRPCServer wraps a gRPC server and implements kvpb.KVServiceServer. It
@@ -173,11 +180,15 @@ func forwardError(code int, msg string) *kvpb.ForwardKeyResponse {
 // It writes the mutation directly to the local store via ApplyReplica and
 // deliberately does NOT fan out again — this node is the replica, and a
 // second fan-out from here would replicate in a loop forever.
+//
+// req.Seq is the primary's write sequence, which ApplyReplica uses to discard a
+// mutation that is older than the version this node already holds. A peer
+// predating the field sends 0, which applies unconditionally.
 func (g *GRPCServer) Replicate(ctx context.Context, req *kvpb.ReplicateRequest) (*kvpb.ReplicateResponse, error) {
-	g.logger.Debug("Replicate RPC received", "op", req.Op, "key", req.Key)
+	g.logger.Debug("Replicate RPC received", "op", req.Op, "key", req.Key, "seq", req.Seq)
 
-	if err := g.repMgr.ApplyReplica(ctx, req.Op, req.Key, req.Value); err != nil {
-		g.logger.Warn("Replicate failed", "op", req.Op, "key", req.Key, "error", err)
+	if err := g.repMgr.ApplyReplica(ctx, req.Op, req.Key, req.Value, req.Seq); err != nil {
+		g.logger.Warn("Replicate failed", "op", req.Op, "key", req.Key, "seq", req.Seq, "error", err)
 		return &kvpb.ReplicateResponse{Success: false, NodeId: g.raft.ID()}, nil
 	}
 	return &kvpb.ReplicateResponse{Success: true, NodeId: g.raft.ID()}, nil

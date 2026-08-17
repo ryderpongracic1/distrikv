@@ -56,6 +56,15 @@ message ReplicateRequest {
   string key   = 2;
   bytes  value = 3; // empty for delete
   uint64 term  = 4; // Raft term at the time of the write
+
+  // seq is the write sequence the ring-primary's storage engine assigned to
+  // this mutation. The replica applies it only if it does not already hold a
+  // version of the key at this sequence or above, so two writes to one key that
+  // arrive out of order resolve to the later write on every replica.
+  //
+  // 0 means "not supplied" (a peer predating this field) and applies
+  // unconditionally, which is the pre-sequence arrival-order behaviour.
+  uint64 seq   = 5;
 }
 
 message ReplicateResponse {

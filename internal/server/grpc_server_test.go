@@ -48,7 +48,7 @@ func TestForwardKeyPutReplicates(t *testing.T) {
 func TestForwardKeyDeleteReplicates(t *testing.T) {
 	h := newHarness(t)
 
-	if err := h.store.Put(context.Background(), "alpha", []byte("one")); err != nil {
+	if _, err := h.store.Put(context.Background(), "alpha", []byte("one")); err != nil {
 		t.Fatalf("seed store: %v", err)
 	}
 
@@ -84,7 +84,7 @@ func TestForwardKeyDeleteMissingKeyIsIdempotentAndReplicates(t *testing.T) {
 func TestForwardKeyGetDoesNotReplicate(t *testing.T) {
 	h := newHarness(t)
 
-	if err := h.store.Put(context.Background(), "alpha", []byte("one")); err != nil {
+	if _, err := h.store.Put(context.Background(), "alpha", []byte("one")); err != nil {
 		t.Fatalf("seed store: %v", err)
 	}
 

@@ -52,7 +52,7 @@ func TestCompaction_RetainsL0FlushedDuringMerge(t *testing.T) {
 	}
 
 	for i := 0; i < keys; i++ {
-		if err := tree.Put(ctx, fmt.Sprintf("rk-%04d", i), value); err != nil {
+		if _, err := tree.Put(ctx, fmt.Sprintf("rk-%04d", i), value); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
@@ -107,7 +107,7 @@ func TestInstallCompactionResult_KeepsUnmergedL0(t *testing.T) {
 
 	// Build up L0 without letting a real compaction interfere.
 	for i := 0; i < 6; i++ {
-		if err := tree.Put(ctx, fmt.Sprintf("merged-%d", i), value); err != nil {
+		if _, err := tree.Put(ctx, fmt.Sprintf("merged-%d", i), value); err != nil {
 			t.Fatalf("Put merged-%d: %v", i, err)
 		}
 	}
@@ -116,7 +116,7 @@ func TestInstallCompactionResult_KeepsUnmergedL0(t *testing.T) {
 	// A flush landing mid-merge: publish one more L0 table that is NOT among
 	// l0Inputs, exactly as runFlush would while the merge was running.
 	for i := 0; i < 2; i++ {
-		if err := tree.Put(ctx, fmt.Sprintf("late-%d", i), value); err != nil {
+		if _, err := tree.Put(ctx, fmt.Sprintf("late-%d", i), value); err != nil {
 			t.Fatalf("Put late-%d: %v", i, err)
 		}
 	}

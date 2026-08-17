@@ -27,6 +27,7 @@ type replCall struct {
 	Op    string
 	Key   string
 	Value []byte
+	Seq   uint64
 }
 
 // fakeReplicator stands in for cmd/node.Node as the ReplicationManager. It
@@ -39,16 +40,16 @@ type fakeReplicator struct {
 	writeErr error
 }
 
-func (f *fakeReplicator) ReplicateWrite(_ context.Context, op, key string, value []byte) error {
+func (f *fakeReplicator) ReplicateWrite(_ context.Context, op, key string, value []byte, seq uint64) error {
 	f.mu.Lock()
-	f.writes = append(f.writes, replCall{Op: op, Key: key, Value: value})
+	f.writes = append(f.writes, replCall{Op: op, Key: key, Value: value, Seq: seq})
 	f.mu.Unlock()
 	return f.writeErr
 }
 
-func (f *fakeReplicator) ApplyReplica(_ context.Context, op, key string, value []byte) error {
+func (f *fakeReplicator) ApplyReplica(_ context.Context, op, key string, value []byte, seq uint64) error {
 	f.mu.Lock()
-	f.applies = append(f.applies, replCall{Op: op, Key: key, Value: value})
+	f.applies = append(f.applies, replCall{Op: op, Key: key, Value: value, Seq: seq})
 	f.mu.Unlock()
 	return nil
 }

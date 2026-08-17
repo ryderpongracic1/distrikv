@@ -78,7 +78,18 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 
 	// 2. Store (LSM-Tree engine) — wired to node-wide metrics so bloom/WAF
 	//    counters surface in /metrics.
-	s, err := store.NewWithMetrics(cfg.DataDir, logger, n.metrics)
+	//
+	//    The replica catch-up cursors are opened first and handed to the store:
+	//    the engine's snapshot-restore path discards the WAL those cursors
+	//    address, and a cursor that outlives it makes anti-entropy report a
+	//    convergence it never performed (see store.CursorStore.InvalidateAll).
+	cursors, err := store.OpenCursorStore(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("node: open replica cursors: %w", err)
+	}
+	n.cursors = cursors
+
+	s, err := store.NewWithMetrics(cfg.DataDir, logger, n.metrics, store.WithCursorStore(cursors))
 	if err != nil {
 		return nil, fmt.Errorf("node: open store: %w", err)
 	}
@@ -164,13 +175,9 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 	//    replication outcomes (this node's own writes), and a transport probe
 	//    over the peer channels, which is the only one that tells a non-leader
 	//    that a peer has come back. See cluster.PeerHealth.
-	cursors, err := store.OpenCursorStore(cfg.DataDir)
-	if err != nil {
-		_ = s.Close()
-		return nil, fmt.Errorf("node: open replica cursors: %w", err)
-	}
-	n.cursors = cursors
-
+	//
+	//    The cursor store itself was opened in step 2, so the store could take
+	//    ownership of invalidating it across a snapshot restore.
 	peerIDs := make([]string, 0, len(cfg.Peers))
 	for _, p := range cfg.Peers {
 		peerIDs = append(peerIDs, p.ID)

@@ -184,6 +184,13 @@ type antiEntropy struct {
 
 	mu      sync.Mutex
 	replica map[string]*replicaState
+
+	// fullSync records that this node's WAL cannot converge its replicas at all,
+	// because the store was replaced from a snapshot whose payload was never
+	// appended to the log. Read once at construction from the durable cursor
+	// state; it gates the convergence claims this engine is allowed to make.
+	fullSync       bool
+	fullSyncReason string
 }
 
 // newAntiEntropy builds the engine for the given peer node IDs.
@@ -216,6 +223,24 @@ func newAntiEntropy(
 		replica:      make(map[string]*replicaState, len(peerIDs)),
 	}
 	tip := s.WALTip()
+	fullSync, fullSyncReason := cursors.FullSyncRequired()
+	ae.fullSync, ae.fullSyncReason = fullSync, fullSyncReason
+	if fullSync {
+		// A restore replaced the store from a snapshot that never passed through
+		// the WAL, so there is no log to replay these keys from. Say so once,
+		// loudly, and hold the gauge up for as long as the condition stands —
+		// this engine must not let a pass over the post-restore log be read as
+		// evidence that the replicas agree.
+		if m != nil {
+			m.AntiEntropyFullSyncRequired.Store(1)
+		}
+		ae.logger.Warn("this node cannot converge its replicas from its WAL: "+
+			"the store was replaced from a snapshot whose keys were never appended to the log. "+
+			"Catch-up passes cover only writes made after the restore; keys restored from the "+
+			"snapshot stay divergent on any replica that missed them until they are rewritten. "+
+			"A full key-scan sync would close this and does not exist in v1",
+			"reason", fullSyncReason, "wal_tip", tip)
+	}
 	for _, id := range peerIDs {
 		st := &replicaState{}
 		// A persisted cursor behind the tip means this node stopped — crashed, or
@@ -446,12 +471,26 @@ func (ae *antiEntropy) repair(ctx context.Context, nodeID string) {
 		if sent == 0 {
 			// Nothing was left to ship over a range that ends at a tip read after
 			// the previous pass finished. For a quiet cluster that is the
-			// definition of converged for every key this replica owns with us.
+			// definition of converged for every key this replica owns with us —
+			// but only when the log is actually the record of this node's data.
 			ae.markCaughtUp(nodeID, failuresAtStart)
-			ae.logger.Info("replica caught up",
-				"replica", nodeID, "passes", pass, "entries_sent", totalSent,
-				"took", time.Since(start).Round(time.Millisecond),
-				"cursor", ae.cursors.Get(nodeID))
+			if ae.fullSync {
+				// After a snapshot restore it is not. An empty pass here means
+				// "the log had nothing", not "the replica agrees", and the keys
+				// the snapshot brought in were never in the log to begin with.
+				// Reporting this as caught up is precisely the convergence claim
+				// this node cannot deliver.
+				ae.logger.Warn("catch-up pass found nothing to ship, but this node "+
+					"cannot converge from its WAL after a snapshot restore; the replica is "+
+					"NOT known to agree on keys restored from the snapshot",
+					"replica", nodeID, "passes", pass, "entries_sent", totalSent,
+					"reason", ae.fullSyncReason)
+			} else {
+				ae.logger.Info("replica caught up",
+					"replica", nodeID, "passes", pass, "entries_sent", totalSent,
+					"took", time.Since(start).Round(time.Millisecond),
+					"cursor", ae.cursors.Get(nodeID))
+			}
 			if err := ae.cursors.Flush(); err != nil {
 				ae.logger.Warn("persist replica cursors after catch-up", "err", err)
 			}

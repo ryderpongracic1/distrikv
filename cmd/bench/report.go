@@ -31,6 +31,37 @@ type report struct {
 	EngineMetricsDelta map[string]int64 `json:"engine_metrics_delta"`
 	WriteAmpFactor     float64          `json:"write_amp_factor"`
 	BloomFPRate        float64          `json:"bloom_fp_rate"`
+
+	// Prefill is nil unless --prefill ran. Recording it in the report is what
+	// makes a read-path measurement auditable: the engine counters below only
+	// mean something if the keyspace they were measured over was fully written.
+	Prefill *prefillSummary `json:"prefill,omitempty"`
+}
+
+// prefillSummary is the report-facing view of a prefill phase.
+type prefillSummary struct {
+	KeysWritten uint64  `json:"keys_written"`
+	Retries     uint64  `json:"retries"`
+	Failed      uint64  `json:"failed"`
+	Seconds     float64 `json:"seconds"`
+	KeysPerSec  float64 `json:"keys_per_sec"`
+
+	// EngineDelta is the target node's /metrics movement across the prefill
+	// phase — where flush_bytes and compactions_total are earned. See
+	// prefillResult.engineDelta.
+	EngineDelta map[string]int64 `json:"engine_delta,omitempty"`
+}
+
+// metricsDelta subtracts two /metrics snapshots. Counters are monotonic within a
+// process lifetime, but a node restarted mid-run resets them, so the result is
+// signed rather than clamped: a negative value is evidence of a restart and
+// should be visible rather than silently floored at zero.
+func metricsDelta(start, end map[string]uint64) map[string]int64 {
+	delta := make(map[string]int64, len(end))
+	for k, v := range end {
+		delta[k] = int64(v) - int64(start[k])
+	}
+	return delta
 }
 
 type percentiles struct {
@@ -43,16 +74,25 @@ type percentiles struct {
 
 // buildReport assembles a report from one phase's runResult plus the engine
 // metrics deltas captured by main.
-func buildReport(cfg runConfig, phase *runResult, startMetrics, endMetrics map[string]uint64, target string, valueSize int, mix string) *report {
+func buildReport(cfg runConfig, phase *runResult, startMetrics, endMetrics map[string]uint64, target string, valueSize int, mix string, pf *prefillResult) *report {
 	wall := phase.endedAt.Sub(phase.startedAt).Seconds()
 	if wall <= 0 {
 		wall = 1
 	}
 
-	delta := make(map[string]int64, len(endMetrics))
-	for k, v := range endMetrics {
-		delta[k] = int64(v) - int64(startMetrics[k])
+	var pfSummary *prefillSummary
+	if pf != nil {
+		pfSummary = &prefillSummary{
+			KeysWritten: pf.keysWritten,
+			Retries:     pf.retries,
+			Failed:      pf.failed,
+			Seconds:     pf.elapsed.Seconds(),
+			KeysPerSec:  pf.keysPerSec(),
+			EngineDelta: pf.engineDelta,
+		}
 	}
+
+	delta := metricsDelta(startMetrics, endMetrics)
 
 	bloomHits := delta["bloom_hits"]
 	bloomFP := delta["bloom_false_positives"]
@@ -93,6 +133,7 @@ func buildReport(cfg runConfig, phase *runResult, startMetrics, endMetrics map[s
 		EngineMetricsDelta: delta,
 		WriteAmpFactor:     waf,
 		BloomFPRate:        fpRate,
+		Prefill:            pfSummary,
 	}
 }
 
@@ -106,6 +147,17 @@ func (r *report) writeTable(w io.Writer) {
 	fmt.Fprintf(w, "== distrikv bench: %s @ target %.0f qps, mix=%s, keyspace=%d %s ==\n",
 		r.Duration, r.QPSRequested, r.Mix, r.Keyspace, r.KeyDist)
 	fmt.Fprintf(w, "target:        %s\n", r.Target)
+	if r.Prefill != nil {
+		fmt.Fprintf(w, "prefill:       %d keys in %.1fs (%.0f keys/s)  retries=%d  failed=%d\n",
+			r.Prefill.KeysWritten, r.Prefill.Seconds, r.Prefill.KeysPerSec,
+			r.Prefill.Retries, r.Prefill.Failed)
+		if pd := r.Prefill.EngineDelta; pd != nil {
+			// Write-path work belongs to the prefill, not the read window.
+			fmt.Fprintf(w, "  during prefill:  flush_bytes=%s  compactions=%d  compaction_bytes_written=%s  write_stalls=%d\n",
+				humanBytes(pd["flush_bytes"]), pd["compactions_total"],
+				humanBytes(pd["compaction_bytes_written"]), pd["write_stall_count"])
+		}
+	}
 	fmt.Fprintf(w, "ops:           %-10d achieved_qps: %.1f    errors: %d\n",
 		r.Ops, r.QPSAchieved, r.Errors)
 	fmt.Fprintf(w, "latency (us):  p50=%-7d p90=%-7d p99=%-7d p999=%-7d max=%d\n",

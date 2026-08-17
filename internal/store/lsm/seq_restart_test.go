@@ -73,11 +73,11 @@ func TestCompactionKeepsTheNewerWriteAcrossARestart(t *testing.T) {
 	// must lose.
 	e1 := openForEpoch(t, dir)
 	for i := 0; i < 32; i++ {
-		if err := e1.Put(ctx, fmt.Sprintf("filler-%03d", i), []byte("x")); err != nil {
+		if _, err := e1.Put(ctx, fmt.Sprintf("filler-%03d", i), []byte("x")); err != nil {
 			t.Fatalf("epoch 1 filler put: %v", err)
 		}
 	}
-	if err := e1.Put(ctx, "hot", []byte("epoch1")); err != nil {
+	if _, err := e1.Put(ctx, "hot", []byte("epoch1")); err != nil {
 		t.Fatalf("epoch 1 put: %v", err)
 	}
 	if err := e1.Close(); err != nil {
@@ -87,7 +87,7 @@ func TestCompactionKeepsTheNewerWriteAcrossARestart(t *testing.T) {
 	// Epoch 2: one acknowledged write to the same key, then a clean close. This
 	// is the write a client was told succeeded.
 	e2 := openForEpoch(t, dir)
-	if err := e2.Put(ctx, "hot", []byte("epoch2")); err != nil {
+	if _, err := e2.Put(ctx, "hot", []byte("epoch2")); err != nil {
 		t.Fatalf("epoch 2 put: %v", err)
 	}
 	if v, err := e2.Get(ctx, "hot"); err != nil || string(v) != "epoch2" {
@@ -123,11 +123,11 @@ func TestCompactionKeepsATombstoneAcrossARestart(t *testing.T) {
 
 	e1 := openForEpoch(t, dir)
 	for i := 0; i < 32; i++ {
-		if err := e1.Put(ctx, fmt.Sprintf("filler-%03d", i), []byte("x")); err != nil {
+		if _, err := e1.Put(ctx, fmt.Sprintf("filler-%03d", i), []byte("x")); err != nil {
 			t.Fatalf("epoch 1 filler put: %v", err)
 		}
 	}
-	if err := e1.Put(ctx, "doomed", []byte("epoch1")); err != nil {
+	if _, err := e1.Put(ctx, "doomed", []byte("epoch1")); err != nil {
 		t.Fatalf("epoch 1 put: %v", err)
 	}
 	if err := e1.Close(); err != nil {
@@ -135,7 +135,7 @@ func TestCompactionKeepsATombstoneAcrossARestart(t *testing.T) {
 	}
 
 	e2 := openForEpoch(t, dir)
-	if err := e2.Delete(ctx, "doomed"); err != nil {
+	if _, err := e2.Delete(ctx, "doomed"); err != nil {
 		t.Fatalf("epoch 2 delete: %v", err)
 	}
 	if _, err := e2.Get(ctx, "doomed"); err != ErrNotFound {
@@ -200,11 +200,11 @@ func TestLegacyManifestRecoversTheWriteOrderByScanning(t *testing.T) {
 
 	e1 := openForEpoch(t, dir)
 	for i := 0; i < 32; i++ {
-		if err := e1.Put(ctx, fmt.Sprintf("filler-%03d", i), []byte("x")); err != nil {
+		if _, err := e1.Put(ctx, fmt.Sprintf("filler-%03d", i), []byte("x")); err != nil {
 			t.Fatalf("epoch 1 filler put: %v", err)
 		}
 	}
-	if err := e1.Put(ctx, "hot", []byte("epoch1")); err != nil {
+	if _, err := e1.Put(ctx, "hot", []byte("epoch1")); err != nil {
 		t.Fatalf("epoch 1 put: %v", err)
 	}
 	wrote := e1.seqNum.Load()
@@ -228,7 +228,7 @@ func TestLegacyManifestRecoversTheWriteOrderByScanning(t *testing.T) {
 	if got := e2.seqNum.Load(); got < wrote {
 		t.Errorf("counter seeded at %d after scanning, below the %d on disk", got, wrote)
 	}
-	if err := e2.Put(ctx, "hot", []byte("epoch2")); err != nil {
+	if _, err := e2.Put(ctx, "hot", []byte("epoch2")); err != nil {
 		t.Fatalf("epoch 2 put: %v", err)
 	}
 	if err := e2.Close(); err != nil {
@@ -256,7 +256,7 @@ func TestSequenceNumbersAreMonotonicAcrossARestart(t *testing.T) {
 
 	e1 := openForEpoch(t, dir)
 	for i := 0; i < 10; i++ {
-		if err := e1.Put(ctx, fmt.Sprintf("k-%02d", i), []byte("v")); err != nil {
+		if _, err := e1.Put(ctx, fmt.Sprintf("k-%02d", i), []byte("v")); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 	}

@@ -42,7 +42,7 @@ func TestMemtable_PutGetDelete(t *testing.T) {
 	mem := NewMemtable(w, walPath, &seq, 4<<20)
 
 	for _, kv := range []struct{ k, v string }{{"b", "B"}, {"a", "A"}, {"c", "C"}} {
-		delta, err := mem.Put(kv.k, []byte(kv.v))
+		_, delta, err := mem.Put(kv.k, []byte(kv.v))
 		if err != nil {
 			t.Fatalf("Put %s: %v", kv.k, err)
 		}
@@ -56,7 +56,7 @@ func TestMemtable_PutGetDelete(t *testing.T) {
 		t.Fatalf("Get a: got %v ok=%v", e, ok)
 	}
 
-	if delta, err := mem.Delete("b"); err != nil {
+	if _, delta, err := mem.Delete("b"); err != nil {
 		t.Fatalf("Delete b: %v", err)
 	} else if delta != -1 {
 		t.Fatalf("Delete b: live delta = %d, want -1 (live key removed)", delta)
@@ -86,7 +86,7 @@ func TestMemtable_IsFull(t *testing.T) {
 		t.Fatal("should not be full initially")
 	}
 	for i := 0; i < 20; i++ {
-		_, _ = mem.Put(fmt.Sprintf("key-%02d", i), []byte("value"))
+		_, _, _ = mem.Put(fmt.Sprintf("key-%02d", i), []byte("value"))
 	}
 	if !mem.IsFull() {
 		t.Fatal("should be full after exceeding maxSize")
@@ -208,7 +208,7 @@ func TestLSM_FlushAndRecover(t *testing.T) {
 		}
 		for i := 0; i < 500; i++ {
 			k := fmt.Sprintf("k-%04d", i)
-			if err := tree.Put(ctx, k, []byte(fmt.Sprintf("v-%d", i))); err != nil {
+			if _, err := tree.Put(ctx, k, []byte(fmt.Sprintf("v-%d", i))); err != nil {
 				t.Fatalf("Put %s: %v", k, err)
 			}
 		}
@@ -256,7 +256,7 @@ func TestLSM_ImmRace(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < ops; i++ {
 				k := fmt.Sprintf("w%d-k%d", id, i)
-				_ = tree.Put(ctx, k, []byte("value"))
+				_, _ = tree.Put(ctx, k, []byte("value"))
 			}
 		}(w)
 	}
@@ -292,7 +292,7 @@ func TestLSM_CompactionMerges(t *testing.T) {
 		for i := 0; i < keysPerRound; i++ {
 			k := fmt.Sprintf("key-%03d", i)
 			v := []byte(fmt.Sprintf("round-%d-val-%d", round, i))
-			if err := tree.Put(ctx, k, v); err != nil {
+			if _, err := tree.Put(ctx, k, v); err != nil {
 				t.Fatalf("Put round %d key %d: %v", round, i, err)
 			}
 		}
@@ -330,7 +330,7 @@ func TestLSM_SnapshotRestore(t *testing.T) {
 
 	for i := 0; i < 50; i++ {
 		k := fmt.Sprintf("snap-key-%d", i)
-		if err := tree.Put(ctx, k, []byte(fmt.Sprintf("v%d", i))); err != nil {
+		if _, err := tree.Put(ctx, k, []byte(fmt.Sprintf("v%d", i))); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -394,7 +394,7 @@ func TestLCS_ReadCorrectness(t *testing.T) {
 		for i := 0; i < keys; i++ {
 			k := fmt.Sprintf("lcs-key-%04d", i)
 			v := []byte(fmt.Sprintf("round-%d", round))
-			if err := tree.Put(ctx, k, v); err != nil {
+			if _, err := tree.Put(ctx, k, v); err != nil {
 				t.Fatalf("Put round=%d i=%d: %v", round, i, err)
 			}
 		}
@@ -449,21 +449,21 @@ func TestLCS_TombstoneDroppedAfterCompaction(t *testing.T) {
 	// Write all keys.
 	for i := 0; i < total; i++ {
 		k := fmt.Sprintf("tomb-key-%04d", i)
-		if err := tree.Put(ctx, k, []byte("alive")); err != nil {
+		if _, err := tree.Put(ctx, k, []byte("alive")); err != nil {
 			t.Fatalf("Put %s: %v", k, err)
 		}
 	}
 	// Delete even-indexed keys (write tombstones into subsequent L0 files).
 	for i := 0; i < total; i += 2 {
 		k := fmt.Sprintf("tomb-key-%04d", i)
-		if err := tree.Delete(ctx, k); err != nil {
+		if _, err := tree.Delete(ctx, k); err != nil {
 			t.Fatalf("Delete %s: %v", k, err)
 		}
 	}
 	// Write filler to push total flushes past compaction threshold.
 	for i := total; i < total*5; i++ {
 		k := fmt.Sprintf("tomb-fill-%04d", i)
-		if err := tree.Put(ctx, k, []byte("filler")); err != nil {
+		if _, err := tree.Put(ctx, k, []byte("filler")); err != nil {
 			t.Fatalf("Put filler %s: %v", k, err)
 		}
 	}
@@ -582,7 +582,7 @@ func TestLCS_L0CountTracking(t *testing.T) {
 	// 30 writes → ~2 flushes; nCompact=4 so no compaction yet.
 	for i := 0; i < 30; i++ {
 		k := fmt.Sprintf("l0cnt-%04d", i)
-		if err := tree.Put(ctx, k, make([]byte, 64)); err != nil {
+		if _, err := tree.Put(ctx, k, make([]byte, 64)); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
@@ -617,7 +617,7 @@ func TestLCS_L0CountTracking(t *testing.T) {
 	// Write enough to trigger multiple compactions.
 	for i := 30; i < 300; i++ {
 		k := fmt.Sprintf("l0cnt-%04d", i)
-		if err := tree.Put(ctx, k, make([]byte, 64)); err != nil {
+		if _, err := tree.Put(ctx, k, make([]byte, 64)); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
@@ -685,7 +685,7 @@ func TestLSM_MetricsBloomAndWAF(t *testing.T) {
 	}
 	for i := 0; i < totalKeys; i++ {
 		k := fmt.Sprintf("metrics-key-%06d", i)
-		if err := tree.Put(ctx, k, val); err != nil {
+		if _, err := tree.Put(ctx, k, val); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
@@ -782,7 +782,7 @@ func TestBlockCache_HitRateAfterWarmup(t *testing.T) {
 
 	// Write unique keys so each one grows the memtable monotonically.
 	for i := 0; i < keys; i++ {
-		if err := tree.Put(ctx, fmt.Sprintf("bc-key-%04d", i), []byte(fmt.Sprintf("val-%04d", i))); err != nil {
+		if _, err := tree.Put(ctx, fmt.Sprintf("bc-key-%04d", i), []byte(fmt.Sprintf("val-%04d", i))); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
@@ -860,7 +860,7 @@ func TestBlockCache_NilSafe(t *testing.T) {
 
 	const keys = 50
 	for i := 0; i < keys; i++ {
-		if err := tree.Put(ctx, fmt.Sprintf("nc-key-%03d", i), []byte(fmt.Sprintf("v%d", i))); err != nil {
+		if _, err := tree.Put(ctx, fmt.Sprintf("nc-key-%03d", i), []byte(fmt.Sprintf("v%d", i))); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
@@ -895,7 +895,7 @@ func TestBlockCache_EvictOnCompaction(t *testing.T) {
 
 	// Write unique keys to force ≥1 flush.
 	for i := 0; i < 200; i++ {
-		if err := tree.Put(ctx, fmt.Sprintf("evict-key-%04d", i), []byte(fmt.Sprintf("v%d", i))); err != nil {
+		if _, err := tree.Put(ctx, fmt.Sprintf("evict-key-%04d", i), []byte(fmt.Sprintf("v%d", i))); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
@@ -951,7 +951,7 @@ func BenchmarkBlockCache_ColdVsWarm(b *testing.B) {
 
 		// Write unique keys so the memtable flushes to disk.
 		for i := 0; i < writeKeys; i++ {
-			if err := tree.Put(ctx, fmt.Sprintf("bkey-%06d", i), []byte(fmt.Sprintf("val-%06d", i))); err != nil {
+			if _, err := tree.Put(ctx, fmt.Sprintf("bkey-%06d", i), []byte(fmt.Sprintf("val-%06d", i))); err != nil {
 				b.Fatalf("Put %d: %v", i, err)
 			}
 		}

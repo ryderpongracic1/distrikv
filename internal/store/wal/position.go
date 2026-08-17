@@ -153,13 +153,23 @@ func ParsePosition(s string) (Position, error) {
 	return Position{Segment: segment, Offset: offset}, nil
 }
 
-// EntryWireSize returns the number of bytes one entry occupies on disk. It is
+// EntryWireSize returns the number of bytes one v1 entry occupies on disk. It is
 // the sum of the fixed framing (op byte, two length prefixes, CRC trailer) and
 // the payload, and is what advances a Position past an entry.
 func EntryWireSize(key string, value []byte) int64 {
 	return int64(entryHeaderBytes + len(key) + len(value))
 }
 
-// entryHeaderBytes is the fixed framing overhead of one WAL entry:
+// EntrySeqWireSize returns the number of bytes one v2 entry occupies on disk —
+// EntryWireSize plus the 8-byte sequence number. See WAL for both formats.
+func EntrySeqWireSize(key string, value []byte) int64 {
+	return EntryWireSize(key, value) + seqFieldBytes
+}
+
+// entryHeaderBytes is the fixed framing overhead of one v1 WAL entry:
 // 1 op byte + 4 key-len + 4 val-len + 4 CRC.
 const entryHeaderBytes = 13
+
+// seqFieldBytes is the width of the sequence number a v2 entry carries between
+// its op byte and its key length.
+const seqFieldBytes = 8

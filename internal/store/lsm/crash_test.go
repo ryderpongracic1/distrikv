@@ -47,7 +47,7 @@ func TestCrash_WalReplayDurability(t *testing.T) {
 		}
 		for i := 0; i < n; i++ {
 			k := fmt.Sprintf("dur-key-%04d", i)
-			if err := tree.Put(ctx, k, []byte(fmt.Sprintf("v%d", i))); err != nil {
+			if _, err := tree.Put(ctx, k, []byte(fmt.Sprintf("v%d", i))); err != nil {
 				t.Fatalf("Put %d: %v", i, err)
 			}
 		}
@@ -104,7 +104,7 @@ func TestCrash_TornWALEntry(t *testing.T) {
 
 		for i := 0; i < goodKeys; i++ {
 			k := fmt.Sprintf("torn-key-%04d", i)
-			if err := tree.Put(ctx, k, []byte("good-value")); err != nil {
+			if _, err := tree.Put(ctx, k, []byte("good-value")); err != nil {
 				t.Fatalf("Put %d: %v", i, err)
 			}
 		}
@@ -116,7 +116,7 @@ func TestCrash_TornWALEntry(t *testing.T) {
 		}
 
 		// Write the entry we will tear away.
-		if err := tree.Put(ctx, "torn-key-EXTRA", []byte("should-vanish")); err != nil {
+		if _, err := tree.Put(ctx, "torn-key-EXTRA", []byte("should-vanish")); err != nil {
 			t.Fatalf("Put extra: %v", err)
 		}
 
@@ -193,7 +193,7 @@ func TestCrash_FlushedDataSurvivesTruncation(t *testing.T) {
 	val := make([]byte, 80)
 	for i := 0; i < writes; i++ {
 		k := fmt.Sprintf("flush-key-%04d", i)
-		if err := tree.Put(ctx, k, val); err != nil {
+		if _, err := tree.Put(ctx, k, val); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
@@ -272,7 +272,7 @@ func TestCrash_ConcurrentWriteDurability(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < writesPerGoroutine; i++ {
 				k := fmt.Sprintf("concurrent-g%d-k%d", id, i)
-				if err := tree.Put(ctx, k, []byte(fmt.Sprintf("gval-%d-%d", id, i))); err == nil {
+				if _, err := tree.Put(ctx, k, []byte(fmt.Sprintf("gval-%d-%d", id, i))); err == nil {
 					mu.Lock()
 					durable = append(durable, k)
 					mu.Unlock()
@@ -374,7 +374,7 @@ func TestCrash_NoDataLossUnderFlushedAndUnflushed(t *testing.T) {
 	const batch1 = 20
 	for i := 0; i < batch1; i++ {
 		k := fmt.Sprintf("mixed-b1-%04d", i)
-		if err := tree.Put(ctx, k, val); err != nil {
+		if _, err := tree.Put(ctx, k, val); err != nil {
 			t.Fatalf("Put b1 %d: %v", i, err)
 		}
 	}
@@ -392,7 +392,7 @@ func TestCrash_NoDataLossUnderFlushedAndUnflushed(t *testing.T) {
 	const batch2 = 5
 	for i := 0; i < batch2; i++ {
 		k := fmt.Sprintf("mixed-b2-%04d", i)
-		if err := tree.Put(ctx, k, val); err != nil {
+		if _, err := tree.Put(ctx, k, val); err != nil {
 			t.Fatalf("Put b2 %d: %v", i, err)
 		}
 	}

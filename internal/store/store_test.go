@@ -29,7 +29,7 @@ func TestStorePutGet(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	require.NoError(t, s.Put(ctx, "a", []byte("alpha")))
+	require.NoError(t, discardSeq(s.Put(ctx, "a", []byte("alpha"))))
 
 	v, err := s.Get(ctx, "a")
 	require.NoError(t, err)
@@ -49,10 +49,10 @@ func TestStoreGetMissing(t *testing.T) {
 func TestStoreDeleteMissing(t *testing.T) {
 	s := newTestStore(t)
 
-	require.NoError(t, s.Delete(context.Background(), "no-such-key"))
+	require.NoError(t, discardSeq(s.Delete(context.Background(), "no-such-key")))
 
 	// Idempotent: repeating the delete is still not an error.
-	require.NoError(t, s.Delete(context.Background(), "no-such-key"))
+	require.NoError(t, discardSeq(s.Delete(context.Background(), "no-such-key")))
 
 	// The key is still absent afterwards.
 	_, err := s.Get(context.Background(), "no-such-key")
@@ -63,8 +63,8 @@ func TestStoreOverwrite(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	require.NoError(t, s.Put(ctx, "k", []byte("v1")))
-	require.NoError(t, s.Put(ctx, "k", []byte("v2")))
+	require.NoError(t, discardSeq(s.Put(ctx, "k", []byte("v1"))))
+	require.NoError(t, discardSeq(s.Put(ctx, "k", []byte("v2"))))
 
 	v, err := s.Get(ctx, "k")
 	require.NoError(t, err)
@@ -75,8 +75,8 @@ func TestStoreDelete(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	require.NoError(t, s.Put(ctx, "del", []byte("gone")))
-	require.NoError(t, s.Delete(ctx, "del"))
+	require.NoError(t, discardSeq(s.Put(ctx, "del", []byte("gone"))))
+	require.NoError(t, discardSeq(s.Delete(ctx, "del")))
 
 	_, err := s.Get(ctx, "del")
 	assert.ErrorIs(t, err, ErrNotFound)
@@ -93,10 +93,10 @@ func TestStorePersistence(t *testing.T) {
 	func() {
 		s, err := New(dir, nil)
 		require.NoError(t, err)
-		require.NoError(t, s.Put(ctx, "a", []byte("alpha")))
-		require.NoError(t, s.Put(ctx, "b", []byte("bravo")))
-		require.NoError(t, s.Put(ctx, "c", []byte("charlie")))
-		require.NoError(t, s.Delete(ctx, "b"))
+		require.NoError(t, discardSeq(s.Put(ctx, "a", []byte("alpha"))))
+		require.NoError(t, discardSeq(s.Put(ctx, "b", []byte("bravo"))))
+		require.NoError(t, discardSeq(s.Put(ctx, "c", []byte("charlie"))))
+		require.NoError(t, discardSeq(s.Delete(ctx, "b")))
 		require.NoError(t, s.Close())
 	}()
 
@@ -134,7 +134,7 @@ func TestStoreConcurrentPuts(t *testing.T) {
 			defer wg.Done()
 			key := fmt.Sprintf("key-%d", i)
 			val := fmt.Sprintf("val-%d", i)
-			require.NoError(t, s.Put(ctx, key, []byte(val)))
+			require.NoError(t, discardSeq(s.Put(ctx, key, []byte(val))))
 		}()
 	}
 	wg.Wait()
@@ -158,7 +158,7 @@ func TestStoreSnapshotRestore(t *testing.T) {
 
 	for i := 0; i < 20; i++ {
 		k := fmt.Sprintf("k%d", i)
-		require.NoError(t, src.Put(ctx, k, []byte(fmt.Sprintf("v%d", i))))
+		require.NoError(t, discardSeq(src.Put(ctx, k, []byte(fmt.Sprintf("v%d", i)))))
 	}
 
 	snap, err := src.Snapshot(ctx)
@@ -187,11 +187,11 @@ func TestStoreCounts(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	require.NoError(t, s.Put(ctx, "a", []byte("1")))
-	require.NoError(t, s.Put(ctx, "b", []byte("2")))
+	require.NoError(t, discardSeq(s.Put(ctx, "a", []byte("1"))))
+	require.NoError(t, discardSeq(s.Put(ctx, "b", []byte("2"))))
 	_, _ = s.Get(ctx, "a")
 	_, _ = s.Get(ctx, "missing")
-	_ = s.Delete(ctx, "b")
+	_, _ = s.Delete(ctx, "b")
 
 	puts, gets, dels, _ := s.Counts()
 	assert.Equal(t, uint64(2), puts)
@@ -213,16 +213,16 @@ func TestStoreWALWrites(t *testing.T) {
 	_, _, _, walWrites := s.Counts()
 	require.Zero(t, walWrites, "no writes yet")
 
-	require.NoError(t, s.Put(ctx, "a", []byte("1")))
+	require.NoError(t, discardSeq(s.Put(ctx, "a", []byte("1"))))
 	_, _, _, walWrites = s.Counts()
 	assert.Equal(t, uint64(1), walWrites, "Put appends to the WAL")
 
-	require.NoError(t, s.Delete(ctx, "a"))
+	require.NoError(t, discardSeq(s.Delete(ctx, "a")))
 	_, _, _, walWrites = s.Counts()
 	assert.Equal(t, uint64(2), walWrites, "Delete appends a tombstone to the WAL")
 
 	// Deletes are blind, so even a delete of an absent key is a real append.
-	require.NoError(t, s.Delete(ctx, "never-existed"))
+	require.NoError(t, discardSeq(s.Delete(ctx, "never-existed")))
 	_, _, _, walWrites = s.Counts()
 	assert.Equal(t, uint64(3), walWrites)
 
@@ -243,8 +243,8 @@ func TestStoreWALWritesMirroredToMetrics(t *testing.T) {
 	t.Cleanup(func() { _ = s.Close() })
 	ctx := context.Background()
 
-	require.NoError(t, s.Put(ctx, "a", []byte("1")))
-	require.NoError(t, s.Delete(ctx, "a"))
+	require.NoError(t, discardSeq(s.Put(ctx, "a", []byte("1"))))
+	require.NoError(t, discardSeq(s.Delete(ctx, "a")))
 
 	_, _, _, walWrites := s.Counts()
 	assert.Equal(t, uint64(2), walWrites)
@@ -262,25 +262,25 @@ func TestStoreKeyCount(t *testing.T) {
 	assert.Equal(t, 0, s.KeyCount(), "empty store")
 
 	// Put of new keys: +1 each.
-	require.NoError(t, s.Put(ctx, "a", []byte("1")))
-	require.NoError(t, s.Put(ctx, "b", []byte("2")))
-	require.NoError(t, s.Put(ctx, "c", []byte("3")))
+	require.NoError(t, discardSeq(s.Put(ctx, "a", []byte("1"))))
+	require.NoError(t, discardSeq(s.Put(ctx, "b", []byte("2"))))
+	require.NoError(t, discardSeq(s.Put(ctx, "c", []byte("3"))))
 	assert.Equal(t, 3, s.KeyCount())
 
 	// Overwrite of a resident key: neutral.
-	require.NoError(t, s.Put(ctx, "b", []byte("2b")))
+	require.NoError(t, discardSeq(s.Put(ctx, "b", []byte("2b"))))
 	assert.Equal(t, 3, s.KeyCount(), "overwrite must not inflate the count")
 
 	// Delete of a live key: -1.
-	require.NoError(t, s.Delete(ctx, "c"))
+	require.NoError(t, discardSeq(s.Delete(ctx, "c")))
 	assert.Equal(t, 2, s.KeyCount())
 
 	// Re-deleting an already-tombstoned resident key: neutral.
-	require.NoError(t, s.Delete(ctx, "c"))
+	require.NoError(t, discardSeq(s.Delete(ctx, "c")))
 	assert.Equal(t, 2, s.KeyCount(), "repeat delete must not double-decrement")
 
 	// Re-creating a tombstoned key: +1 again.
-	require.NoError(t, s.Put(ctx, "c", []byte("3b")))
+	require.NoError(t, discardSeq(s.Put(ctx, "c", []byte("3b"))))
 	assert.Equal(t, 3, s.KeyCount())
 }
 
@@ -292,17 +292,17 @@ func TestStoreKeyCountDeleteNonexistentDrifts(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	require.NoError(t, s.Put(ctx, "a", []byte("1")))
-	require.NoError(t, s.Put(ctx, "b", []byte("2")))
+	require.NoError(t, discardSeq(s.Put(ctx, "a", []byte("1"))))
+	require.NoError(t, discardSeq(s.Put(ctx, "b", []byte("2"))))
 	require.Equal(t, 2, s.KeyCount())
 
-	require.NoError(t, s.Delete(ctx, "never-existed"))
+	require.NoError(t, discardSeq(s.Delete(ctx, "never-existed")))
 	assert.Equal(t, 1, s.KeyCount(),
 		"documented drift: delete of an absent key decrements the approximation")
 
 	// Drive the counter well past zero; the exposed value must clamp, not wrap.
 	for i := 0; i < 10; i++ {
-		require.NoError(t, s.Delete(ctx, fmt.Sprintf("ghost-%d", i)))
+		require.NoError(t, discardSeq(s.Delete(ctx, fmt.Sprintf("ghost-%d", i))))
 	}
 	assert.Equal(t, 0, s.KeyCount(), "count is clamped at zero")
 }
@@ -319,11 +319,11 @@ func TestStoreKeyCountSurvivesReopen(t *testing.T) {
 	func() {
 		s, err := New(dir, nil)
 		require.NoError(t, err)
-		require.NoError(t, s.Put(ctx, "a", []byte("alpha")))
-		require.NoError(t, s.Put(ctx, "b", []byte("bravo")))
-		require.NoError(t, s.Put(ctx, "c", []byte("charlie")))
-		require.NoError(t, s.Put(ctx, "a", []byte("alpha2"))) // overwrite: neutral
-		require.NoError(t, s.Delete(ctx, "b"))                // -1
+		require.NoError(t, discardSeq(s.Put(ctx, "a", []byte("alpha"))))
+		require.NoError(t, discardSeq(s.Put(ctx, "b", []byte("bravo"))))
+		require.NoError(t, discardSeq(s.Put(ctx, "c", []byte("charlie"))))
+		require.NoError(t, discardSeq(s.Put(ctx, "a", []byte("alpha2")))) // overwrite: neutral
+		require.NoError(t, discardSeq(s.Delete(ctx, "b")))                // -1
 		require.Equal(t, 2, s.KeyCount())
 		require.NoError(t, s.Close()) // Close flushes and records the count
 	}()
@@ -333,8 +333,8 @@ func TestStoreKeyCountSurvivesReopen(t *testing.T) {
 	assert.Equal(t, 2, s2.KeyCount(), "count rebuilt after reopen")
 
 	// Round 2: keep writing on top of the recovered count, then reopen again.
-	require.NoError(t, s2.Put(ctx, "d", []byte("delta")))
-	require.NoError(t, s2.Delete(ctx, "a"))
+	require.NoError(t, discardSeq(s2.Put(ctx, "d", []byte("delta"))))
+	require.NoError(t, discardSeq(s2.Delete(ctx, "a")))
 	require.Equal(t, 2, s2.KeyCount())
 	require.NoError(t, s2.Close())
 
@@ -355,8 +355,8 @@ func TestStoreKeyCountAfterRestore(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	require.NoError(t, s.Put(ctx, "stale-1", []byte("x")))
-	require.NoError(t, s.Put(ctx, "stale-2", []byte("y")))
+	require.NoError(t, discardSeq(s.Put(ctx, "stale-1", []byte("x"))))
+	require.NoError(t, discardSeq(s.Put(ctx, "stale-2", []byte("y"))))
 	require.Equal(t, 2, s.KeyCount())
 
 	require.NoError(t, s.RestoreFromSnapshot(ctx, map[string][]byte{

@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/ryderpongracic1/distrikv/actions/workflows/ci.yml/badge.svg)](https://github.com/ryderpongracic1/distrikv/actions/workflows/ci.yml)
 
-A distributed key-value store written in Go from scratch, hardened through seven
-phases of measured bug-hunting (P1–P7 under [Status](docs/architecture.md#status))
+A distributed key-value store written in Go from scratch, hardened through eight
+phases of measured bug-hunting (P1–P8 under [Status](docs/architecture.md#status))
 on top of the seven developmental phases that built it. The defects those phases
 found — including a compaction path that dropped acknowledged writes, and a leader
 that had never sent a heartbeat — are documented where they happened rather than

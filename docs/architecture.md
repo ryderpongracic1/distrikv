@@ -180,7 +180,8 @@ optimisation, chaos testing, and operational hardening.
 | P5 | In-process sharded LRU block cache (64 MB default, configurable) | ✅ Done |
 | P6 | Cluster-level LSM read-path measurement (`cmd/bench --prefill`: Bloom, block cache and compaction counters proven under load) | ✅ Done |
 | P7 | WAL-segment anti-entropy — replica catch-up from the primary's log, with a convergence gate in the chaos harness | ✅ Done |
-| P8 | TBD | 🔲 Planned |
+| P8 | Per-key write ordering — primary-assigned sequence on the replication wire and in the log, replicas apply-if-newer | ✅ Done |
+| P9 | TBD | 🔲 Planned |
 
 ---
 

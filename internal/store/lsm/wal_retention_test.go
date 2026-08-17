@@ -32,7 +32,7 @@ func writeUntilSegments(t *testing.T, l *LSMTree, n int, prefix string) {
 	t.Helper()
 	ctx := context.Background()
 	for i := 0; i < 500; i++ {
-		if err := l.Put(ctx, prefix+string(rune('a'+i%26))+string(rune('0'+i/26)), []byte("value-padding-to-fill-the-memtable")); err != nil {
+		if _, err := l.Put(ctx, prefix+string(rune('a'+i%26))+string(rune('0'+i/26)), []byte("value-padding-to-fill-the-memtable")); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 		if l.walSeq.Load() >= uint64(n) {
@@ -51,14 +51,17 @@ func TestWALTipAdvancesWithWrites(t *testing.T) {
 	if start.Segment == 0 {
 		t.Fatalf("tip = %s before any write; the active segment must be numbered", start)
 	}
-	if err := l.Put(context.Background(), "k", []byte("v")); err != nil {
+	if _, err := l.Put(context.Background(), "k", []byte("v")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	after := l.WALTip()
 	if !start.Before(after) {
 		t.Fatalf("tip did not advance across a write: %s → %s", start, after)
 	}
-	if want := start.Offset + storewal.EntryWireSize("k", []byte("v")); after.Offset != want {
+	// Engine writes carry their sequence number, so one entry advances the tip by
+	// the v2 wire size. Asserting the v1 size here would pass only while the log
+	// was losing the sequence it now persists.
+	if want := start.Offset + storewal.EntrySeqWireSize("k", []byte("v")); after.Offset != want {
 		t.Errorf("tip offset = %d, want %d (one entry's wire size)", after.Offset, want)
 	}
 }

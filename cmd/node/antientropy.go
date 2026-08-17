@@ -876,6 +876,20 @@ func (ae *antiEntropy) runPass(ctx context.Context, nodeID string, from, limit s
 			Key:   e.Key,
 			Value: e.Value,
 			Term:  term,
+			// The sequence the entry was written with, read back out of the log
+			// rather than assigned here. That is what makes a pass idempotent and
+			// safe to race against live replication: an entry the replica already
+			// has arrives with a sequence it already holds and is discarded, and
+			// an entry superseded by a write that landed after this range was
+			// pinned loses to that write's higher sequence instead of reverting
+			// it. Assigning a fresh sequence at replay time would invert exactly
+			// that case — the replay would look newer than the newer write.
+			//
+			// Entries from a WAL record written before the log carried sequences
+			// report 0, which the replica applies unconditionally; that is the
+			// arrival-order behaviour this replaces, and it only affects segments
+			// already on disk at upgrade time.
+			Seq: e.Seq,
 		})
 		cancel()
 		if err != nil {

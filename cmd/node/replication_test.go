@@ -108,9 +108,16 @@ func (f *fakePeer) requests() []*kvpb.ReplicateRequest {
 // self plus the named peers, and a fakePeer client per peer.
 func testNode(t *testing.T, replicaCount int, peerIDs ...string) (*Node, map[string]*fakePeer) {
 	t.Helper()
+	return testNodeInDir(t, t.TempDir(), replicaCount, peerIDs...)
+}
+
+// testNodeInDir is testNode over a caller-supplied data directory, so a test can
+// close the node and open a second one over the same on-disk state — the only
+// way to exercise what a node remembers across a restart.
+func testNodeInDir(t *testing.T, dir string, replicaCount int, peerIDs ...string) (*Node, map[string]*fakePeer) {
+	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	dir := t.TempDir()
 
 	st, err := store.New(dir, logger)
 	if err != nil {
@@ -191,7 +198,7 @@ func TestReplicateWriteFansOutToRingReplicas(t *testing.T) {
 		t.Fatalf("precondition: R=2 should select 1 peer replica for %q, got %v", key, want)
 	}
 
-	if err := n.ReplicateWrite(context.Background(), server.OpPut, key, []byte("one")); err != nil {
+	if err := n.ReplicateWrite(context.Background(), server.OpPut, key, []byte("one"), 0); err != nil {
 		t.Fatalf("ReplicateWrite: %v", err)
 	}
 
@@ -223,7 +230,7 @@ func TestReplicateWriteFansOutToRingReplicas(t *testing.T) {
 func TestReplicateWriteFansOutToAllReplicasAtR3(t *testing.T) {
 	n, peers := testNode(t, 3, "node2", "node3")
 
-	if err := n.ReplicateWrite(context.Background(), server.OpPut, "alpha", []byte("one")); err != nil {
+	if err := n.ReplicateWrite(context.Background(), server.OpPut, "alpha", []byte("one"), 0); err != nil {
 		t.Fatalf("ReplicateWrite: %v", err)
 	}
 
@@ -237,7 +244,7 @@ func TestReplicateWriteFansOutToAllReplicasAtR3(t *testing.T) {
 func TestReplicateWriteFansOutDeletes(t *testing.T) {
 	n, peers := testNode(t, 3, "node2", "node3")
 
-	if err := n.ReplicateWrite(context.Background(), server.OpDelete, "alpha", nil); err != nil {
+	if err := n.ReplicateWrite(context.Background(), server.OpDelete, "alpha", nil, 0); err != nil {
 		t.Fatalf("ReplicateWrite: %v", err)
 	}
 
@@ -261,7 +268,7 @@ func TestReplicateWriteSingleNodeDegradesToLocal(t *testing.T) {
 		t.Fatalf("precondition: expected no peers, got %d", len(peers))
 	}
 
-	if err := n.ReplicateWrite(context.Background(), server.OpPut, "alpha", []byte("one")); err != nil {
+	if err := n.ReplicateWrite(context.Background(), server.OpPut, "alpha", []byte("one"), 0); err != nil {
 		t.Fatalf("single-node ReplicateWrite = %v, want nil (degrade to local-only)", err)
 	}
 	if got := n.metrics.ReplicationErrors.Load(); got != 0 {
@@ -274,7 +281,7 @@ func TestReplicateWriteSingleNodeDegradesToLocal(t *testing.T) {
 func TestReplicateWriteReplicaCountOneNeverReplicates(t *testing.T) {
 	n, peers := testNode(t, 1, "node2", "node3")
 
-	if err := n.ReplicateWrite(context.Background(), server.OpPut, "alpha", []byte("one")); err != nil {
+	if err := n.ReplicateWrite(context.Background(), server.OpPut, "alpha", []byte("one"), 0); err != nil {
 		t.Fatalf("ReplicateWrite: %v", err)
 	}
 	for id, p := range peers {
@@ -292,7 +299,7 @@ func TestReplicateWriteTransportFailure(t *testing.T) {
 		p.err = errors.New("connection refused")
 	}
 
-	err := n.ReplicateWrite(context.Background(), server.OpPut, "alpha", []byte("one"))
+	err := n.ReplicateWrite(context.Background(), server.OpPut, "alpha", []byte("one"), 0)
 	if err == nil {
 		t.Fatal("ReplicateWrite = nil, want an error when replicas are unreachable")
 	}
@@ -309,7 +316,7 @@ func TestReplicateWriteReplicaRejects(t *testing.T) {
 		p.refuse = true
 	}
 
-	if err := n.ReplicateWrite(context.Background(), server.OpPut, "alpha", []byte("one")); err == nil {
+	if err := n.ReplicateWrite(context.Background(), server.OpPut, "alpha", []byte("one"), 0); err == nil {
 		t.Fatal("ReplicateWrite = nil, want an error when a replica rejects the write")
 	}
 	if got := n.metrics.ReplicationErrors.Load(); got != 2 {
@@ -335,7 +342,7 @@ func TestReplicateWriteMissingPeerClient(t *testing.T) {
 		t.Skip("no candidate key maps node2 into the replica set on this ring")
 	}
 
-	if err := n.ReplicateWrite(context.Background(), server.OpPut, key, []byte("one")); err == nil {
+	if err := n.ReplicateWrite(context.Background(), server.OpPut, key, []byte("one"), 0); err == nil {
 		t.Fatal("ReplicateWrite = nil, want an error when a replica has no gRPC client")
 	}
 	if got := n.metrics.ReplicationErrors.Load(); got != 1 {
@@ -366,7 +373,7 @@ func TestReplicateWriteDeadlineIsIndependentOfHeartbeatInterval(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := n.ReplicateWrite(context.Background(), server.OpPut, key, []byte("v")); err != nil {
+	if err := n.ReplicateWrite(context.Background(), server.OpPut, key, []byte("v"), 0); err != nil {
 		t.Fatalf("ReplicateWrite with a 120ms replica and a 5ms heartbeat: %v "+
 			"(the deadline is still coupled to HeartbeatInterval)", err)
 	}
@@ -393,7 +400,7 @@ func TestReplicateWriteBoundsASilentReplica(t *testing.T) {
 	}
 
 	start := time.Now()
-	err := n.ReplicateWrite(context.Background(), server.OpPut, key, []byte("v"))
+	err := n.ReplicateWrite(context.Background(), server.OpPut, key, []byte("v"), 0)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -416,7 +423,7 @@ func TestApplyReplicaWritesLocallyWithoutFanOut(t *testing.T) {
 	n, peers := testNode(t, 3, "node2", "node3")
 	ctx := context.Background()
 
-	if err := n.ApplyReplica(ctx, server.OpPut, "alpha", []byte("one")); err != nil {
+	if err := n.ApplyReplica(ctx, server.OpPut, "alpha", []byte("one"), 0); err != nil {
 		t.Fatalf("ApplyReplica put: %v", err)
 	}
 	got, err := n.store.Get(ctx, "alpha")
@@ -424,7 +431,7 @@ func TestApplyReplicaWritesLocallyWithoutFanOut(t *testing.T) {
 		t.Fatalf("store after ApplyReplica put = (%q, %v), want (\"one\", nil)", got, err)
 	}
 
-	if err := n.ApplyReplica(ctx, server.OpDelete, "alpha", nil); err != nil {
+	if err := n.ApplyReplica(ctx, server.OpDelete, "alpha", nil, 0); err != nil {
 		t.Fatalf("ApplyReplica delete: %v", err)
 	}
 	if _, err := n.store.Get(ctx, "alpha"); !errors.Is(err, store.ErrNotFound) {
@@ -444,7 +451,7 @@ func TestApplyReplicaWritesLocallyWithoutFanOut(t *testing.T) {
 func TestApplyReplicaDeleteIsIdempotent(t *testing.T) {
 	n, _ := testNode(t, 2)
 
-	if err := n.ApplyReplica(context.Background(), server.OpDelete, "never-written", nil); err != nil {
+	if err := n.ApplyReplica(context.Background(), server.OpDelete, "never-written", nil, 0); err != nil {
 		t.Fatalf("ApplyReplica delete of absent key = %v, want nil", err)
 	}
 }
@@ -452,7 +459,7 @@ func TestApplyReplicaDeleteIsIdempotent(t *testing.T) {
 func TestApplyReplicaUnknownOp(t *testing.T) {
 	n, _ := testNode(t, 2)
 
-	if err := n.ApplyReplica(context.Background(), "upsert", "alpha", []byte("one")); err == nil {
+	if err := n.ApplyReplica(context.Background(), "upsert", "alpha", []byte("one"), 0); err == nil {
 		t.Fatal("ApplyReplica with unknown op = nil, want an error")
 	}
 }

@@ -51,7 +51,7 @@ func TestLocalReadAnswersFromThisNodeWithoutForwarding(t *testing.T) {
 
 	// The value is present locally but this node is not the key's primary — the
 	// exact position a replica is in.
-	if err := st.Put(context.Background(), foreignKey, []byte("replica-copy")); err != nil {
+	if _, err := st.Put(context.Background(), foreignKey, []byte("replica-copy")); err != nil {
 		t.Fatalf("local put: %v", err)
 	}
 
@@ -88,7 +88,7 @@ func TestLocalReadReportsAbsenceRatherThanForwarding(t *testing.T) {
 
 func TestLocalReadFlagSpellings(t *testing.T) {
 	h, st, foreignKey := localReadHarness(t)
-	if err := st.Put(context.Background(), foreignKey, []byte("v")); err != nil {
+	if _, err := st.Put(context.Background(), foreignKey, []byte("v")); err != nil {
 		t.Fatalf("local put: %v", err)
 	}
 
@@ -110,7 +110,7 @@ func TestLocalReadOnAnOwnedKeyIsUnchanged(t *testing.T) {
 	h, st, _ := localReadHarness(t)
 	owned := keyOwnedBy(t, h.ring, testNodeID)
 
-	if err := st.Put(context.Background(), owned, []byte("mine")); err != nil {
+	if _, err := st.Put(context.Background(), owned, []byte("mine")); err != nil {
 		t.Fatalf("local put: %v", err)
 	}
 	for _, target := range []string{"/keys/" + owned, "/keys/" + owned + "?local=true"} {

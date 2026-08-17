@@ -557,34 +557,85 @@ func (l *LSMTree) Get(_ context.Context, key string) ([]byte, error) {
 	return nil, ErrNotFound
 }
 
-// Put writes key=value.
-func (l *LSMTree) Put(ctx context.Context, key string, value []byte) error {
+// Put writes key=value and returns the sequence number assigned to the write.
+// Higher sequence numbers are newer; the number is what a ring-primary sends to
+// its replicas so they can order the write against what they already hold.
+func (l *LSMTree) Put(ctx context.Context, key string, value []byte) (uint64, error) {
 	if err := l.maybeStallWrite(ctx); err != nil {
-		return err
+		return 0, err
 	}
 	return l.putInternal(ctx, key, value)
 }
 
 // putInternal is the lock-holding write path, shared by Put and Restore.
 // Stall check is NOT applied here; callers are responsible.
-func (l *LSMTree) putInternal(_ context.Context, key string, value []byte) error {
+func (l *LSMTree) putInternal(_ context.Context, key string, value []byte) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delta, err := l.mem.Put(key, value)
+	seq, delta, err := l.mem.Put(key, value)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	l.recordWrite(delta)
 	if l.mem.IsFull() {
-		return l.rotateMemtable()
+		return seq, l.rotateMemtable()
 	}
-	return nil
+	return seq, nil
 }
 
-// Delete writes a tombstone for key.
-func (l *LSMTree) Delete(ctx context.Context, key string) error {
+// PutIfNewer writes key=value stamped with seq, but only if this engine does not
+// already hold a version of key at seq or above. applied reports whether the
+// write was taken.
+//
+// This is the replica side of per-key ordering. Replication is a fan-out of
+// independent RPCs, so two writes to the same key issued microseconds apart can
+// arrive at a replica in either order; applying them blindly in arrival order
+// leaves the replica holding whichever landed last rather than whichever was
+// written last, and nothing afterwards notices — the replica ACKed both writes,
+// so it is not "behind", and an anti-entropy pass repairs gaps rather than
+// inversions, so it has nothing to replay. Comparing sequences discards the
+// inversion instead.
+//
+// A seq of 0 means "the sender did not supply one" (a peer predating the wire
+// field, or a WAL record written before the log carried sequence numbers) and
+// applies unconditionally, which is the pre-sequence behaviour.
+//
+// Cost: deciding needs the stored sequence, so a key that is not resident in a
+// memtable is looked up through the SSTables — bloom-filtered, so the common
+// absent-key case costs no disk read. That is paid on the replica apply path,
+// which already serialises on the engine write lock behind a WAL fsync, so the
+// lookup is not what bounds it. The alternative — applying unconditionally when
+// the key is not in memory — would silently reinstate the inversion for any key
+// that has been flushed.
+func (l *LSMTree) PutIfNewer(ctx context.Context, key string, value []byte, seq uint64) (applied bool, err error) {
 	if err := l.maybeStallWrite(ctx); err != nil {
-		return err
+		return false, err
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	newer, err := l.isNewerLocked(key, seq)
+	if err != nil || !newer {
+		return false, err
+	}
+
+	delta, err := l.mem.PutWithSeq(key, value, seq)
+	if err != nil {
+		return false, err
+	}
+	l.recordWrite(delta)
+	if l.mem.IsFull() {
+		return true, l.rotateMemtable()
+	}
+	return true, nil
+}
+
+// Delete writes a tombstone for key and returns the sequence number assigned to
+// it. See Put for what the sequence number is for.
+func (l *LSMTree) Delete(ctx context.Context, key string) (uint64, error) {
+	if err := l.maybeStallWrite(ctx); err != nil {
+		return 0, err
 	}
 	return l.deleteInternal(ctx, key)
 }
@@ -596,18 +647,108 @@ func (l *LSMTree) Delete(ctx context.Context, key string) error {
 // immutable memtable → every L0 file → L1) per delete, and doing it atomically
 // would mean holding the write lock across those disk reads. Callers that need
 // existence semantics must Get first and accept the race.
-func (l *LSMTree) deleteInternal(_ context.Context, key string) error {
+func (l *LSMTree) deleteInternal(_ context.Context, key string) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delta, err := l.mem.Delete(key)
+	seq, delta, err := l.mem.Delete(key)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	l.recordWrite(delta)
 	if l.mem.IsFull() {
-		return l.rotateMemtable()
+		return seq, l.rotateMemtable()
 	}
-	return nil
+	return seq, nil
+}
+
+// DeleteIfNewer writes a tombstone for key stamped with seq, but only if this
+// engine does not already hold a version of key at seq or above. See PutIfNewer
+// for why the comparison exists and what a seq of 0 means.
+//
+// A tombstone is ordered exactly like a value, which is what makes a delete and
+// a put racing on one key resolve the same way on every replica: the higher
+// sequence wins regardless of which arrived last.
+func (l *LSMTree) DeleteIfNewer(ctx context.Context, key string, seq uint64) (applied bool, err error) {
+	if err := l.maybeStallWrite(ctx); err != nil {
+		return false, err
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	newer, err := l.isNewerLocked(key, seq)
+	if err != nil || !newer {
+		return false, err
+	}
+
+	delta, err := l.mem.DeleteWithSeq(key, seq)
+	if err != nil {
+		return false, err
+	}
+	l.recordWrite(delta)
+	if l.mem.IsFull() {
+		return true, l.rotateMemtable()
+	}
+	return true, nil
+}
+
+// isNewerLocked reports whether a write stamped seq is newer than every version
+// of key this engine holds. It must be called with l.mu held for writing, which
+// is what makes the comparison and the write that follows it atomic with respect
+// to other writers: two inverted arrivals for one key serialise here, so the
+// older one always sees the newer one's entry.
+//
+// seq 0 is "unknown", and is reported as newer so the caller applies
+// unconditionally.
+func (l *LSMTree) isNewerLocked(key string, seq uint64) (bool, error) {
+	if seq == 0 {
+		return true, nil
+	}
+	stored, found, err := l.storedSeqLocked(key)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return true, nil
+	}
+	return seq > stored, nil
+}
+
+// storedSeqLocked returns the sequence number of the newest version of key this
+// engine holds, tombstones included, searching the same order Get does:
+// mem → imm → L0 (newest first) → L1 (newest first).
+//
+// The caller holds l.mu for writing, which is also what makes it safe to read
+// the SSTable readers without taking a reference: installCompactionResult takes
+// the same lock, so no reader can be released underneath this traversal.
+func (l *LSMTree) storedSeqLocked(key string) (uint64, bool, error) {
+	if e, ok := l.mem.Get(key); ok {
+		return e.SeqNum, true, nil
+	}
+	if l.imm != nil {
+		if e, ok := l.imm.Get(key); ok {
+			return e.SeqNum, true, nil
+		}
+	}
+	for _, r := range l.l0 {
+		e, found, err := r.Get(key)
+		if err != nil {
+			return 0, false, fmt.Errorf("lsm: read sequence from L0 SSTable: %w", err)
+		}
+		if found {
+			return e.SeqNum, true, nil
+		}
+	}
+	for _, r := range l.l1 {
+		e, found, err := r.Get(key)
+		if err != nil {
+			return 0, false, fmt.Errorf("lsm: read sequence from L1 SSTable: %w", err)
+		}
+		if found {
+			return e.SeqNum, true, nil
+		}
+	}
+	return 0, false, nil
 }
 
 // recordWrite folds one successful memtable write into the engine-wide

@@ -43,7 +43,7 @@ func TestGracefulRestartDoesNotReuseWALSegmentNumbers(t *testing.T) {
 	// asked to keep that segment past its flush — the state anti-entropy puts the
 	// engine in during every fault window.
 	l.RetainWALFrom(1)
-	if err := l.Put(context.Background(), "before-restart", []byte("v")); err != nil {
+	if _, err := l.Put(context.Background(), "before-restart", []byte("v")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	firstSeq := l.WALTip().Segment
@@ -105,7 +105,7 @@ func TestCrashRestartKeepsWALSegmentNumbersMonotonic(t *testing.T) {
 	dir := t.TempDir()
 
 	l := openTreeAt(t, dir)
-	if err := l.Put(context.Background(), "before-crash", []byte("v")); err != nil {
+	if _, err := l.Put(context.Background(), "before-crash", []byte("v")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	crashSeq := l.WALTip().Segment

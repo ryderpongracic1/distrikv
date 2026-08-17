@@ -47,13 +47,16 @@ mid-run, and the next write to the key converges every copy again.
 
 ## Write-Ahead Log (`internal/store/wal`)
 
-Every `Put` and `Delete` is appended to a binary WAL file **before** the MemTable is updated. Each entry is framed as:
+Every `Put` and `Delete` is appended to a binary WAL file **before** the MemTable is updated. There are two record formats, discriminated by the op byte, and they interleave freely within a segment:
 
 ```
-[1B op][4B key-len][key][4B val-len][val][4B CRC32]
+v1 (legacy):  [1B op][4B key-len][key][4B val-len][val][4B CRC32]
+v2 (current): [1B op][8B seq][4B key-len][key][4B val-len][val][4B CRC32]
 ```
 
-`Append` calls `f.Sync()` (not just `bufio.Flush`) before returning. On restart, `Replay` reads entries sequentially and stops cleanly at a CRC mismatch — the expected signature of a crash-at-tail.
+The engine writes v2, because a write's sequence number has to survive recovery with the same meaning it had before — a replica compares the sequence its ring-primary sent against the one it has stored for that key, and a sequence re-derived from the local counter at replay time would be a number from a different counter. See [Per-key write ordering](replication-and-anti-entropy.md#what-is-guaranteed-and-what-is-not). A v1 record replays with sequence 0 ("this record does not know its ordering"), which applies unconditionally.
+
+`Append` calls `f.Sync()` (not just `bufio.Flush`) before returning. The CRC covers the sequence like every other byte, so a corrupted sequence is rejected as a torn record rather than silently reordering writes. On restart, `Replay` reads entries sequentially and stops cleanly at a CRC mismatch — the expected signature of a crash-at-tail.
 
 ## Phase 2 WAL allocation profile (2026-05-21, Apple M1 Max)
 

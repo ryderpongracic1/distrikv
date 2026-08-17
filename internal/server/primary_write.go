@@ -52,11 +52,16 @@ func newPrimaryWriter(s *store.Store, repMgr ReplicationManager, logger *slog.Lo
 
 // Put writes key locally and then replicates it. On replication failure the
 // local write is retained and ErrReplication is returned (see its docs).
+//
+// The sequence number the local write was assigned travels with the fan-out, so
+// every replica can order this mutation against the others for the same key
+// rather than trusting the order its RPCs happened to arrive in.
 func (p *primaryWriter) Put(ctx context.Context, key string, value []byte) error {
-	if err := p.store.Put(ctx, key, value); err != nil {
+	seq, err := p.store.Put(ctx, key, value)
+	if err != nil {
 		return fmt.Errorf("primary put %q: %w", key, err)
 	}
-	return p.replicate(ctx, OpPut, key, value)
+	return p.replicate(ctx, OpPut, key, value, seq)
 }
 
 // Delete writes a tombstone locally and then replicates it.
@@ -64,23 +69,26 @@ func (p *primaryWriter) Put(ctx context.Context, key string, value []byte) error
 // Deletes are blind tombstone writes: deleting an absent key succeeds and is
 // still replicated, because the tombstone itself is a durable local write that
 // replicas must also apply (it must shadow any earlier value a replica holds).
+// The tombstone carries its own sequence number, so a delete and a put racing on
+// one key resolve identically on every replica.
 func (p *primaryWriter) Delete(ctx context.Context, key string) error {
-	if err := p.store.Delete(ctx, key); err != nil {
+	seq, err := p.store.Delete(ctx, key)
+	if err != nil {
 		return fmt.Errorf("primary delete %q: %w", key, err)
 	}
-	return p.replicate(ctx, OpDelete, key, nil)
+	return p.replicate(ctx, OpDelete, key, nil, seq)
 }
 
 // replicate fans the mutation out to the replica set. Reads never call this —
 // only the primary's PUT and DELETE paths do.
-func (p *primaryWriter) replicate(ctx context.Context, op, key string, value []byte) error {
+func (p *primaryWriter) replicate(ctx context.Context, op, key string, value []byte, seq uint64) error {
 	if p.repMgr == nil {
 		return fmt.Errorf("%w: no replication manager configured", ErrReplication)
 	}
 
-	if err := p.repMgr.ReplicateWrite(ctx, op, key, value); err != nil {
+	if err := p.repMgr.ReplicateWrite(ctx, op, key, value, seq); err != nil {
 		p.logger.Warn("write refused: replica did not ACK; primary is now ahead of its replicas for this key",
-			"op", op, "key", key, "error", err)
+			"op", op, "key", key, "seq", seq, "error", err)
 		return fmt.Errorf("%w: %w", ErrReplication, err)
 	}
 	return nil

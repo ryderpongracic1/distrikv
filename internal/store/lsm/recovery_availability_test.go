@@ -71,7 +71,7 @@ func buildL0Backlog(t *testing.T, dir string, wantFiles int) {
 			tree.Close()
 			t.Fatalf("build: only %d L0 files after 30s; want %d", tree.l0Count.Load(), wantFiles)
 		}
-		if err := tree.Put(ctx, fmt.Sprintf("backlog-%06d", i), val); err != nil {
+		if _, err := tree.Put(ctx, fmt.Sprintf("backlog-%06d", i), val); err != nil {
 			tree.Close()
 			t.Fatalf("build: Put %d: %v", i, err)
 		}
@@ -133,7 +133,7 @@ func TestRecovery_ReopenWithL0Backlog_AcceptsWrites(t *testing.T) {
 	start := time.Now()
 	done := make(chan error, 1)
 	go func() {
-		done <- tree.Put(context.Background(), "post-recovery-key", []byte("v"))
+		done <- discardSeq(tree.Put(context.Background(), "post-recovery-key", []byte("v")))
 	}()
 
 	select {
@@ -223,7 +223,7 @@ func TestRecovery_HardStopReturnsStallError(t *testing.T) {
 
 	done := make(chan error, 1)
 	start := time.Now()
-	go func() { done <- tree.Put(context.Background(), "stalled-key", []byte("v")) }()
+	go func() { done <- discardSeq(tree.Put(context.Background(), "stalled-key", []byte("v"))) }()
 
 	select {
 	case err := <-done:
@@ -298,7 +298,7 @@ func TestRecovery_BenchScaleReopen(t *testing.T) {
 
 	buildStart := time.Now()
 	for i := 0; i < keys; i++ {
-		if err := tree.Put(ctx, fmt.Sprintf("bench-%08d", i), val); err != nil {
+		if _, err := tree.Put(ctx, fmt.Sprintf("bench-%08d", i), val); err != nil {
 			tree.Close()
 			t.Fatalf("build: Put %d: %v", i, err)
 		}
@@ -336,7 +336,7 @@ func TestRecovery_BenchScaleReopen(t *testing.T) {
 	// (a) Time until the store accepts a write.
 	firstStart := time.Now()
 	firstDone := make(chan error, 1)
-	go func() { firstDone <- tree2.Put(ctx, "recovery-probe", val) }()
+	go func() { firstDone <- discardSeq(tree2.Put(ctx, "recovery-probe", val)) }()
 
 	select {
 	case err := <-firstDone:
@@ -357,7 +357,7 @@ func TestRecovery_BenchScaleReopen(t *testing.T) {
 	probeStart := time.Now()
 	for i := 0; i < probeWrites; i++ {
 		w := time.Now()
-		if err := tree2.Put(ctx, fmt.Sprintf("recovery-%06d", i), val); err != nil {
+		if _, err := tree2.Put(ctx, fmt.Sprintf("recovery-%06d", i), val); err != nil {
 			t.Fatalf("reopen: probe write %d failed: %v", i, err)
 		}
 		lat = append(lat, time.Since(w))

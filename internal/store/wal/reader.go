@@ -28,10 +28,16 @@ var ErrCursorStale = errors.New("wal: cursor points into a garbage-collected seg
 // last byte, which is the cursor value to persist once the entry has been
 // applied elsewhere. Both are absolute positions (segment + offset), so they
 // remain meaningful after segment rotation.
+//
+// Seq is the sequence number the write was assigned by the node that accepted
+// it, or 0 for a v1 record written before the log carried one. It is what lets
+// an anti-entropy pass replay an entry with its original ordering instead of
+// its arrival ordering — see WAL for the two record formats.
 type Entry struct {
 	Op    OpType
 	Key   string
 	Value []byte
+	Seq   uint64
 	Pos   Position
 	End   Position
 }
@@ -251,6 +257,18 @@ func (r *Reader) readEntry(pos Position) (Entry, int64, error) {
 		return Entry{}, 0, fmt.Errorf("wal: read op at %s: %w", pos, err)
 	}
 
+	// A v2 record carries its sequence number between the op byte and the key
+	// length; a v1 record reports seq 0, meaning "this record does not know".
+	logicalOp, hasSeq := decodeWireOp(OpType(opByte))
+	var seq uint64
+	var seqBuf [8]byte
+	if hasSeq {
+		if err := r.readFull(seqBuf[:], pos, "seq"); err != nil {
+			return Entry{}, 0, err
+		}
+		seq = binary.BigEndian.Uint64(seqBuf[:])
+	}
+
 	var lenBuf [4]byte
 	if err := r.readFull(lenBuf[:], pos, "key-len"); err != nil {
 		return Entry{}, 0, err
@@ -286,6 +304,9 @@ func (r *Reader) readEntry(pos Position) (Entry, int64, error) {
 
 	var computed uint32
 	computed = crc32.Update(computed, crc32Table, []byte{opByte})
+	if hasSeq {
+		computed = crc32.Update(computed, crc32Table, seqBuf[:])
+	}
 	binary.BigEndian.PutUint32(lenBuf[:], keyLen)
 	computed = crc32.Update(computed, crc32Table, lenBuf[:])
 	computed = crc32.Update(computed, crc32Table, keyBuf)
@@ -297,12 +318,18 @@ func (r *Reader) readEntry(pos Position) (Entry, int64, error) {
 		return Entry{}, 0, fmt.Errorf("%w: CRC mismatch at %s", errTornEntry, pos)
 	}
 
+	size := int64(entryHeaderBytes) + int64(keyLen) + int64(valLen)
+	if hasSeq {
+		size += seqFieldBytes
+	}
+
 	return Entry{
-		Op:    OpType(opByte),
+		Op:    logicalOp,
 		Key:   string(keyBuf),
 		Value: valBuf,
+		Seq:   seq,
 		Pos:   pos,
-	}, int64(entryHeaderBytes) + int64(keyLen) + int64(valLen), nil
+	}, size, nil
 }
 
 // readFull reads len(buf) bytes, mapping a short read onto errTornEntry.

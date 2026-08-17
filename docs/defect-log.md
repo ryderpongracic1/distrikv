@@ -444,23 +444,27 @@ leaving them out would make the list look tidier than the work was:
 
 ---
 
+## Recently closed
+
+- **Per-key write ordering** was listed here as a known limit rather than a defect:
+  a mutation carried no version, so two client-concurrent writes to one key could
+  be applied in one order on the primary and the opposite order at a replica, and
+  nothing marked that replica behind — it had acknowledged both writes. Closed by
+  P8: every write now carries the sequence its ring-primary assigned, replicas
+  apply-if-newer against their full read path, and the WAL persists the sequence so
+  the comparison survives a restart. The narrower limit that replaces it — the
+  sequence is per-primary, so a ring rebalance would need an epoch or node-id
+  tiebreak — is unreachable today and is written up in
+  [replication-and-anti-entropy.md → What is guaranteed, and what is not](replication-and-anti-entropy.md#what-is-guaranteed-and-what-is-not).
+
+---
+
 ## Still open
 
-Recorded here so that a known gap is not mistaken for an oversight. Both have
-their full reasoning in
+Recorded here so that a known gap is not mistaken for an oversight. Its full
+reasoning is in
 [replication-and-anti-entropy.md](replication-and-anti-entropy.md#what-is-guaranteed-and-what-is-not).
 
-- **Per-key write ordering is not guaranteed, and anti-entropy cannot see when it
-  goes wrong.** A mutation carries no version or sequence number, so two
-  client-concurrent writes to one key can be applied in one order on the primary
-  and the opposite order at a replica. Nothing marks that replica behind — it
-  acknowledged both writes — so no health signal or cursor comparison will ever
-  schedule a pass on account of it. The divergence is real, reachable **with no
-  fault at all**, and not detected by anything the repo currently ships. The fix
-  is a primary-assigned monotonic per-key sequence carried in the `Replicate` RPC
-  and in replay entries; it is a storage-format change rather than a repair-path
-  change, and half-building it would be worse than not having one, because it
-  would license exactly the convergence claims that section exists to withhold.
 - **`anti_entropy_full_sync_required` has no remedy in v1.** The gauge's documented
   meaning is that this node's WAL is not a complete record of the data it holds.
   Full sync — a key-range scan shipped to the replica — is designed and not built:

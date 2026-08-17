@@ -27,7 +27,7 @@ func TestLiveKeys_MemtableDeltas(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		if err := tree.Put(ctx, fmt.Sprintf("k%d", i), []byte("v")); err != nil {
+		if _, err := tree.Put(ctx, fmt.Sprintf("k%d", i), []byte("v")); err != nil {
 			t.Fatalf("Put k%d: %v", i, err)
 		}
 	}
@@ -37,7 +37,7 @@ func TestLiveKeys_MemtableDeltas(t *testing.T) {
 
 	// Overwrites of resident keys are neutral.
 	for i := 0; i < 5; i++ {
-		if err := tree.Put(ctx, fmt.Sprintf("k%d", i), []byte("v2")); err != nil {
+		if _, err := tree.Put(ctx, fmt.Sprintf("k%d", i), []byte("v2")); err != nil {
 			t.Fatalf("overwrite k%d: %v", i, err)
 		}
 	}
@@ -46,10 +46,10 @@ func TestLiveKeys_MemtableDeltas(t *testing.T) {
 	}
 
 	// Delete of a live key removes it; repeating is neutral.
-	if err := tree.Delete(ctx, "k0"); err != nil {
+	if _, err := tree.Delete(ctx, "k0"); err != nil {
 		t.Fatalf("Delete k0: %v", err)
 	}
-	if err := tree.Delete(ctx, "k0"); err != nil {
+	if _, err := tree.Delete(ctx, "k0"); err != nil {
 		t.Fatalf("Delete k0 again: %v", err)
 	}
 	if got := tree.LiveKeys(); got != 4 {
@@ -57,7 +57,7 @@ func TestLiveKeys_MemtableDeltas(t *testing.T) {
 	}
 
 	// Re-creating a tombstoned key counts again.
-	if err := tree.Put(ctx, "k0", []byte("back")); err != nil {
+	if _, err := tree.Put(ctx, "k0", []byte("back")); err != nil {
 		t.Fatalf("re-Put k0: %v", err)
 	}
 	if got := tree.LiveKeys(); got != 5 {
@@ -72,11 +72,11 @@ func TestLiveKeys_ClampedAtZero(t *testing.T) {
 	tree := testLSM(t)
 	ctx := context.Background()
 
-	if err := tree.Put(ctx, "real", []byte("v")); err != nil {
+	if _, err := tree.Put(ctx, "real", []byte("v")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	for i := 0; i < 5; i++ {
-		if err := tree.Delete(ctx, fmt.Sprintf("ghost-%d", i)); err != nil {
+		if _, err := tree.Delete(ctx, fmt.Sprintf("ghost-%d", i)); err != nil {
 			t.Fatalf("Delete ghost-%d: %v", i, err)
 		}
 	}
@@ -88,7 +88,7 @@ func TestLiveKeys_ClampedAtZero(t *testing.T) {
 	// zero because the ghost deletes over-decremented past it. (Only the clamped
 	// output is observable here, which is the point — nothing outside the engine
 	// can see the counter go negative.)
-	if err := tree.Put(ctx, "another", []byte("v")); err != nil {
+	if _, err := tree.Put(ctx, "another", []byte("v")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if got := tree.LiveKeys(); got != 0 {
@@ -112,7 +112,7 @@ func TestLiveKeys_SurvivesFlushAndReopen(t *testing.T) {
 			t.Fatalf("NewLSMTree (phase 1): %v", err)
 		}
 		for i := 0; i < keys; i++ {
-			if err := tree.Put(ctx, fmt.Sprintf("k-%04d", i), []byte("value")); err != nil {
+			if _, err := tree.Put(ctx, fmt.Sprintf("k-%04d", i), []byte("value")); err != nil {
 				t.Fatalf("Put k-%04d: %v", i, err)
 			}
 		}
@@ -162,7 +162,7 @@ func TestLiveKeys_SeededFromManifestNotWALOnly(t *testing.T) {
 	}
 	const keys = 100
 	for i := 0; i < keys; i++ {
-		if err := tree.Put(ctx, fmt.Sprintf("k-%04d", i), []byte("value")); err != nil {
+		if _, err := tree.Put(ctx, fmt.Sprintf("k-%04d", i), []byte("value")); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -292,11 +292,11 @@ func TestWALAppends_CountsWritesOnly(t *testing.T) {
 	}
 
 	for i := 0; i < 10; i++ {
-		if err := tree.Put(ctx, fmt.Sprintf("k%d", i), []byte("v")); err != nil {
+		if _, err := tree.Put(ctx, fmt.Sprintf("k%d", i), []byte("v")); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
-	if err := tree.Delete(ctx, "k0"); err != nil {
+	if _, err := tree.Delete(ctx, "k0"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if _, err := tree.Get(ctx, "k1"); err != nil {

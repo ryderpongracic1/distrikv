@@ -35,7 +35,7 @@ func replayAll(t *testing.T, w *WAL) []struct {
 		key   string
 		value []byte
 	}
-	err := w.Replay(func(op OpType, key string, value []byte) {
+	err := w.Replay(func(op OpType, key string, value []byte, _ uint64) {
 		out = append(out, struct {
 			op    OpType
 			key   string
@@ -157,7 +157,7 @@ func TestWAL_ReplaySeesFreshCopies(t *testing.T) {
 	require.NoError(t, w.Append(OpPut, "b", []byte("BBBB")))
 
 	var vals [][]byte
-	err := w.Replay(func(_ OpType, _ string, value []byte) {
+	err := w.Replay(func(_ OpType, _ string, value []byte, _ uint64) {
 		vals = append(vals, value) // retain the slice
 	})
 	require.NoError(t, err)
@@ -284,7 +284,7 @@ func TestWAL_MultipleEntries_AllValid(t *testing.T) {
 	}
 
 	var count int
-	err := w.Replay(func(_ OpType, _ string, _ []byte) { count++ })
+	err := w.Replay(func(_ OpType, _ string, _ []byte, _ uint64) { count++ })
 	require.NoError(t, err)
 	assert.Equal(t, n, count)
 }
@@ -307,7 +307,7 @@ func TestWAL_PoolBufferGrowth(t *testing.T) {
 	}
 
 	var got [][]byte
-	err := w.Replay(func(_ OpType, _ string, value []byte) {
+	err := w.Replay(func(_ OpType, _ string, value []byte, _ uint64) {
 		got = append(got, value)
 	})
 	require.NoError(t, err)
@@ -406,7 +406,7 @@ func BenchmarkWAL_Replay(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if err := rw.Replay(func(_ OpType, _ string, _ []byte) {}); err != nil {
+		if err := rw.Replay(func(_ OpType, _ string, _ []byte, _ uint64) {}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -537,7 +537,7 @@ func TestWAL_ReplayDoesNotReturnErrorForTornWrite(t *testing.T) {
 	w := writeRaw(t, data)
 
 	var called int
-	err := w.Replay(func(_ OpType, _ string, _ []byte) { called++ })
+	err := w.Replay(func(_ OpType, _ string, _ []byte, _ uint64) { called++ })
 	assert.NoError(t, err, "torn write must not produce a non-nil error")
 	assert.Equal(t, 1, called, "only the complete entry must be delivered")
 }
@@ -555,7 +555,7 @@ func TestWAL_IOError_NotTreatedAsTornWrite(t *testing.T) {
 	// (not EOF) when it tries to Seek.
 	require.NoError(t, w.f.Close())
 
-	err = w.Replay(func(_ OpType, _ string, _ []byte) {})
+	err = w.Replay(func(_ OpType, _ string, _ []byte, _ uint64) {})
 	assert.Error(t, err, "genuine I/O error (closed fd) must be returned, not silently swallowed")
 }
 

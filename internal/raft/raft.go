@@ -63,9 +63,14 @@ type PeerClient struct {
 
 // StoreInterface is the subset of store.Store that RaftNode uses.
 // Extends the original Put/Delete with Snapshot/RestoreFromSnapshot for §7.
+//
+// Put and Delete return the sequence number the storage engine assigned to the
+// write. Raft has no use for it — a log entry carries its own index and term as
+// its ordering — so this path discards it; it exists for the replication fan-out
+// (see server.ReplicationManager).
 type StoreInterface interface {
-	Put(ctx context.Context, key string, value []byte) error
-	Delete(ctx context.Context, key string) error
+	Put(ctx context.Context, key string, value []byte) (uint64, error)
+	Delete(ctx context.Context, key string) (uint64, error)
 	Snapshot(ctx context.Context) (map[string][]byte, error)
 	RestoreFromSnapshot(ctx context.Context, data map[string][]byte) error
 }
@@ -791,9 +796,11 @@ func (r *RaftNode) applyEntryLocked(ctx context.Context, entry *kvpb.LogEntry) {
 	var err error
 	switch entry.Op {
 	case "put":
-		err = r.store.Put(ctx, entry.Key, entry.Value)
+		// The assigned sequence is discarded: a Raft-applied entry is already
+		// ordered by its log index, and this path does not replicate.
+		_, err = r.store.Put(ctx, entry.Key, entry.Value)
 	case "delete":
-		err = r.store.Delete(ctx, entry.Key)
+		_, err = r.store.Delete(ctx, entry.Key)
 	}
 	if err != nil {
 		r.logger.Error("failed to apply log entry", "op", entry.Op, "key", entry.Key, "error", err)

@@ -753,23 +753,41 @@ worker count. It launches its own 3-member etcd cluster on loopback and reports
 exact latency percentiles per operation type. Keeping it in its own module keeps
 etcd's dependency tree out of distrikv's `go.mod`.
 
-#### Results
+#### Results (2026-08-17, Apple M4 Pro, etcd 3.7.1 native vs distrikv 3-node Colima)
 
-> **Not yet measured.** The harness is committed and reproducible; the etcd
-> column is filled in from the runbook below. distrikv's column is the
-> validated 2026-08-16 baseline reproduced from the table above. Placeholders
-> are marked `—` so a half-filled table cannot be mistaken for a finding.
+etcd: 3-member cluster on loopback, native APFS, uniform 100k-key distribution,
+256 B values, 60 s runs, 128 workers, 0 errors across all three workloads.
+distrikv: 3-node docker-compose inside Colima VM (8 CPU / 8 GB), Zipfian α=1.1,
+same value size and duration — reproduced from the validated baseline above.
 
-| Workload (60s, 256 B values, 100k-key Zipf α=1.1, 128 workers) | distrikv achieved | etcd achieved | distrikv p99 | etcd p99 |
+| Workload (60s, 256 B values, 128 workers) | distrikv achieved | etcd achieved | distrikv p99 | etcd p99 |
 | --- | ---: | ---: | ---: | ---: |
-| 100% writes (PUT), target 1,200 QPS | **1,199 /s** | — | 4.6 ms | — |
-| 100% reads (GET), target 6,000 QPS | **6,017 /s** | — | 1.7 ms | — |
-| 20% write / 80% read, target 3,000 QPS | **3,000 /s** | — | 2.5 ms | — |
+| 100% writes (PUT) | **1,199 /s** | **1,995 /s** | 4.6 ms | 73.7 ms |
+| 100% reads (GET) | **6,017 /s** | **6,009 /s** | 1.7 ms | 0.79 ms |
+| 20% write / 80% read | **3,000 /s** | **2,993 /s** | 2.5 ms | 80.9 ms† |
 
-| Per-op latency, mixed workload | distrikv p50 | etcd p50 | distrikv p99 | etcd p99 |
+† Mixed p99 is the worse of the two op types; etcd's gets queue behind puts.
+
+| Per-op latency, mixed workload (20:80) | distrikv p50 | etcd p50 | distrikv p99 | etcd p99 |
 | --- | ---: | ---: | ---: | ---: |
-| PUT | — | — | — | — |
-| GET | — | — | — | — |
+| PUT | 0.70 ms | 34.1 ms | 2.5 ms | 70.3 ms |
+| GET | 0.70 ms | 36.2 ms | 2.5 ms | 80.9 ms |
+
+**The honest headline is the read comparison, not the write comparison.** At
+matched throughput (~6,000 reads/s), etcd's p99 is **0.79 ms vs distrikv's
+1.7 ms** — etcd reads are ~2× faster at the tail despite paying a linearizable
+quorum round-trip. distrikv's extra latency is consistent with the HTTP hop plus
+the 2/3-probability internal gRPC forward that a non-primary node pays. The
+read path has no fsync on either side, so this comparison is clean.
+
+The write comparison is **not clean** — see the durability confound below.
+
+> **Distribution mismatch (disclosed).** The etcd harness used uniform random
+> over 100k keys (its default workload generator); distrikv's baseline used
+> Zipfian α=1.1 over 100k keys. For the read and mixed rows this means etcd
+> paid uniform cache pressure while distrikv benefited from hot-key locality.
+> For writes the difference is smaller (both distributions produce distinct
+> keys at similar rates over 60 s at these QPS levels), but it is not zero.
 
 #### Why the gap has the shape it does
 
@@ -844,14 +862,25 @@ list below is where the decade of engineering actually went:
 Disclosed rather than corrected, because pretending they are not there would be
 worse than the asymmetry itself:
 
-- **Deployment shape.** distrikv's published numbers come from three Docker
-  containers inside a Colima VM (8 CPU / 8 GB), fsyncing through virtiofs. The
-  etcd harness launches three *native* host processes fsyncing to APFS
-  directly. That difference favours etcd, and on write latency it is probably
-  the second-largest effect after the read-path asymmetry — an fsync through
-  virtiofs is materially more expensive than a native one. The controlled
-  variant is in the runbook below: run distrikv natively too, and treat the
-  containerised row as the deployment-inclusive number.
+- **Durability cost (the dominant write confound).** etcd fsyncs its Raft log
+  per commit using `F_FULLFSYNC` on macOS — a real barrier to stable storage
+  that costs ~10–30 ms per flush and accounts for nearly all of etcd's 37 ms
+  write p50. distrikv's WAL fsyncs go through Colima's virtiofs, where flushes
+  are likely absorbed by the VM page cache and may never reach stable storage
+  on the host. **The write comparison is therefore substantially "real
+  durability vs maybe-durability", not architecture.** The architectural claim
+  — that Raft serialises all writes through one log while the ring fans out to
+  parallel primaries — is supported by structure (three independent write
+  streams vs one serialisation point), but these numbers cannot cleanly
+  separate it from the durability asymmetry. Write latencies are not directly
+  comparable across these two storage stacks.
+- **Deployment shape (previously misstated).** An earlier draft of this section
+  said the native-vs-VM difference "favours etcd". The opposite is true for
+  writes: native APFS with `F_FULLFSYNC` is *expensive* (~10–30 ms), while
+  virtiofs through a VM page cache is *cheap* (flushes may be no-ops). The
+  controlled variant — running distrikv natively on APFS too — would make its
+  write latencies materially *worse*, not better, because its fsyncs would
+  then pay the same real cost etcd's do. That variant is in the runbook below.
 - **Transport and encoding.** distrikv speaks HTTP/1.1 with JSON bodies; etcd
   speaks gRPC with protobuf over HTTP/2 with request multiplexing. The 256-byte
   value is identical, but distrikv additionally pays JSON framing and one
@@ -979,7 +1008,47 @@ docker run --rm --network docker_default -v "$PWD:/b" alpine \
     --workers 128 --valuesize 256
 ```
 
-#### Measured (2026-08-17, 3-node cluster, Linux dev container, 200k-key prefill)
+#### Measured (2026-08-17, 3-node cluster, Apple M4 Pro, Colima VM 8 CPU / 8 GB, 500k-key prefill)
+
+Prefill phase — 500,000 keys × 256 B, written once each:
+
+| Prefill | Value |
+| --- | ---: |
+| Keys written / failed | 500,000 / **0** |
+| Throughput | 3,071 keys/s |
+| `compactions_total` | **6** |
+| Compacted data | 314.5 MB |
+| Write amplification (WAF) | **4.28×** |
+| `write_stall_count` | 0 |
+| Retries / failures | 0 / 0 |
+
+Read phase — 60 s read-only windows at 4,000 QPS target, 0 errors across all
+three patterns:
+
+| Read pattern (60s, 4,000 QPS, 0 errors) | `bloom_hits` | `bloom_misses` | `bloom_fp_rate` | **cache hit rate** | p50 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Zipf α=1.1, 500k keys | 125,648 | 0 | — | **97.2%** | 634 µs | 1.60 ms |
+| Uniform, 500k keys | 77,948 | 0 | — | **70.9%** | 633 µs | 1.62 ms |
+| Uniform, 1M keys (half absent) | 39,078 | 39,755 | **0.01%** | 71.1% | 632 µs | 1.62 ms |
+
+Three things the Mac validation adds over the DevSpaces measurement (below):
+
+1. **The Zipf-vs-uniform cache gap at 500k keys is 26 points** (97.2% vs 70.9%),
+   compared to 32 points at 200k on the dev container (99.3% vs 60.8%). A
+   larger working set at fixed 64 MB cache naturally compresses the gap — the
+   cache covers fewer of the keyspace's distinct blocks — and the effect is in
+   the expected direction.
+2. **Bloom false-positive rate measured on the negative-lookup run: 0.01%.**
+   Of 39,078 bloom hits in the 1M-key run (half absent), an estimated ~0.01%
+   were false positives — well below the 1% design target. The DevSpaces run
+   reported exactly 0.00% at 200k scale; 500k keys with more L0 residency
+   between compactions produced the first measurable (but negligible) FP rate.
+3. **Latency stable across patterns.** p50 ~633 µs and p99 ~1.6 ms regardless
+   of access pattern — the SSTable read path is dominated by the HTTP + ring
+   forward hop, not by cache hits/misses. Cache misses trade a `ReadAt` syscall
+   for a sharded map lookup but both are sub-microsecond relative to the network.
+
+#### Earlier measurement (2026-08-17, 3-node cluster, Linux dev container, 200k-key prefill)
 
 **Read this table for the engine ratios, not for throughput.** All three nodes
 ran on one fsync-bound container filesystem, which held the prefill to 406
@@ -1432,6 +1501,25 @@ go run ./cmd/chaos \
   refused-but-applied:     48283
   converged:               true (after 1.4s, 20 keys × 40 node reads)
 ```
+
+**Live validation (2026-08-17, Apple M4 Pro, Colima VM 8 CPU / 8 GB).** Kill-restart
+nemesis against the same 3-node cluster used for the throughput baseline: 4/4 faults
+injected, all targeting node3. PASS.
+
+```
+  refused-but-applied:     33,449
+  converged:               true (after 562ms, 20 keys × 40 node reads, 2 attempts)
+  divergent:               0
+  indeterminate:           13
+  check_duration:          170ms
+  anti_entropy_passes:     25 / 22 / 4  (node1 / node2 / node3)
+```
+
+562 ms time-to-converge means the WAL catch-up pass shipped every missed write and
+confirmed nothing remained — two passes per affected replica (one ships, one
+confirms empty) — before the convergence grace window's first re-read poll. The 4
+passes on node3 (the victim) are self-directed: it processes no catch-up because it
+was the one missing data, not the one holding it.
 
 The check re-reads on a 500 ms poll until every replica agrees or the grace window
 expires, so the reported elapsed time is the observed time-to-converge. Three

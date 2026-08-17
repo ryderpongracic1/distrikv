@@ -75,6 +75,32 @@ func (l *LSMTree) RetainWALFrom(seq uint64) { l.walRetainFrom.Store(seq) }
 // WALRetentionFloor reports the current retention request set by RetainWALFrom.
 func (l *LSMTree) WALRetentionFloor() uint64 { return l.walRetainFrom.Load() }
 
+// highestWALSeq returns the largest segment sequence number this node has on
+// disk, counting both the live segments and the ones parked for replica catch-up.
+//
+// It exists so segment numbers are never reused. A parked segment is not replayed
+// at open (its contents are already in an SSTable), but its *number* is still
+// spoken for: replica cursors are (segment, offset) pairs, so handing that number
+// to a new segment makes every cursor recorded before the restart address a
+// different log. See the seeding comment in NewLSMTree for the three concrete
+// failures that follow.
+//
+// Zero means this node has no WAL segment at all, so the first segment it opens
+// is 1.
+func highestWALSeq(dataDir string) (uint64, error) {
+	segs, err := storewal.ListSegments(dataDir, filepath.Join(dataDir, retainedWALDir))
+	if err != nil {
+		return 0, err
+	}
+	var max uint64
+	for _, s := range segs {
+		if s.Seq > max {
+			max = s.Seq
+		}
+	}
+	return max, nil
+}
+
 // releaseWALSegment disposes of the WAL segment belonging to a memtable that has
 // just been flushed: either deleting it, or parking it under retainedWALDir when
 // a replica cursor still needs it.

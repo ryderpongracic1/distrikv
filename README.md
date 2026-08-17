@@ -314,6 +314,17 @@ Two things also schedule a pass: a replica still marked behind is retried every
 `RetryInterval` (5 s), and a durable cursor behind the tip at startup queues one
 immediately.
 
+Those three schedulers do not know about each other, so they are **coalesced per
+replica**: while a cycle for a replica is queued or running, another request for the
+same replica is dropped rather than queued behind it. Without that, a replica could
+have several identical cycles pending at once; every one after the first finds
+nothing left to ship and completes instantly, which is how a converged cluster
+produced six `replica caught up, entries_sent=0, took=0` lines inside one
+millisecond — wasted passes, and the same convergence claim logged over and over.
+The slot is released when the cycle *ends*, so anything a scheduler wanted while it
+ran is already covered by it, and a replica still behind afterwards is picked up by
+the next retry tick.
+
 #### A pass
 
 1. Read the WAL forward from the cursor to the tip observed when the pass started.
@@ -396,6 +407,31 @@ a pass finds nothing to ship, so the final pass in a quiet cluster sees a settle
 log and leaves every affected key equal on primary and replica. That is the
 property `--check-convergence` measures.
 
+**Guaranteed across a primary restart — and this is what a live run caught.** A
+cursor is a `(segment, offset)` pair, so it only means anything while segment
+numbers are never reused. They were: `Close` flushes the active memtable into an
+SSTable and releases its segment, so a gracefully stopped primary could be left with
+no live segment at all, and the next open seeded its numbering from the live segments
+only — restarting at 1 while `wal-retained/` already held a segment 1. Every cursor
+the primary had persisted then addressed a *different* log, with the same three
+consequences this document already spells out for a snapshot restore: the cursor
+orders after the new tip so the replica reads as up to date, `wal.ErrCursorStale` is
+keyed on the segment *number* and cannot fire, and a pass reads from a byte offset
+past the end of a shorter log — a clean stop with no error, so it ships nothing and
+the engine reports `replica caught up`. That is a silently wrong convergence claim,
+and it is why the chaos gate failed deterministically under the **graceful**
+`stop-restart` nemesis while passing under `kill-restart`: a SIGKILL leaves the
+segment on disk, so numbering continued past it and the cursors stayed valid.
+
+Segment numbers are now seeded from every segment on disk, parked ones included, so
+they are monotonic across a restart. A cursor into a segment that was genuinely
+released now names a number that no longer exists, which is exactly the condition
+`ErrCursorStale` reports and the engine already handles by withholding the claim.
+And as a backstop, a cursor that orders *after* the tip — impossible in a log this
+node kept appending to, so evidence that the log was replaced — is dropped at open,
+the replica is marked behind rather than assumed fine, and
+`anti_entropy_full_sync_required` is latched.
+
 **Not guaranteed: convergence under continuous write load.** Live replication is
 deliberately *not* blocked during a pass, so a live RPC for a write inside the
 pass's range can land at the replica after the pass has already shipped a newer
@@ -405,6 +441,32 @@ key is written. Blocking replication to a recovering replica for the duration of
 pass would close it — at the cost of refusing writes to a replica that has just
 come back, trading a rare stale key for guaranteed unavailability. That trade was
 declined.
+
+**Not guaranteed: per-key write ordering, and anti-entropy cannot see when it goes
+wrong.** A mutation carries no version or sequence number, so a replica applies
+whatever arrives in the order it arrives. The primary applies locally and *then* fans
+out, and the two steps are not atomic across concurrent requests: two client-
+concurrent writes to one key can be applied in one order on the primary and the
+opposite order at a replica, leaving the replica holding a value the primary does not
+have. Nothing marks that replica behind — it acknowledged both writes — so no
+health signal and no cursor comparison will ever schedule a pass on account of it.
+What does repair it is a pass triggered for any *other* reason: a pass ships the
+primary's newest value for every key in its range, so an inverted key inside that
+range is corrected as a side effect. A key that is never rewritten and never falls
+inside a pass's range stays inverted.
+
+The fix would be a primary-assigned monotonic per-key sequence carried in the
+`Replicate` RPC and in replay entries, with the replica applying only when the
+sequence is at least the one it has stored — which would also make replay idempotent
+and close the live-versus-replay race above. It is **not built here**: it changes the
+wire format, needs the sequence persisted alongside every value in the storage
+engine, and has to be read back on the replica's write path, which is a storage-
+format change rather than a repair-path change. Half-building it — a sequence that
+some paths set and others do not — would be worse than not having one, because it
+would license exactly the convergence claims this section exists to withhold. It is
+recorded here as the known limit, not as future-work decoration: the divergence it
+describes is real, reachable with no fault at all, and not detected by anything the
+repo currently ships.
 
 **Bounded recovery — and the claim is withheld, not just annotated.** If the log no
 longer reaches back far enough to cover what a replica missed, the gap cannot be
@@ -512,11 +574,12 @@ the write path.
 `anti_entropy_full_sync_required`. Node logs carry `catch-up scheduled`,
 `catch-up pass shipped missed writes`, `replica caught up`,
 `replica cursor is older than the retained WAL`, `replica has no recorded cursor
-and the retained WAL no longer starts at its first segment`, and — whenever the log
-cannot account for the data this node holds, after a snapshot restore or a
+and the retained WAL no longer starts at its first segment`, `replica cursor
+ordered after this node's WAL tip, so it cannot describe this log`, and — whenever
+the log cannot account for the data this node holds, after a snapshot restore or a
 retention gap — `this node cannot converge its replicas from its WAL`.
 
-The last two are the ones to grep for when a run reports `converged: false`:
+The last three are the ones to grep for when a run reports `converged: false`:
 together with the gauge they say whether the cluster failed to converge or the
 primary was never able to.
 

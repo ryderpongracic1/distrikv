@@ -31,6 +31,12 @@ type fakeNode struct {
 	// the primary's value from every node and make every run "converge".
 	localReads   int
 	forwardReads int
+
+	// failKeyReads, when > 0, makes that many key reads answer 500 before the node
+	// starts serving normally again. /status is unaffected, which matters: node
+	// discovery happens before the check's retry loop and returns early on
+	// failure, so a *transient* read error is only reachable from inside the loop.
+	failKeyReads int
 }
 
 func newFakeNode(id string) *fakeNode {
@@ -48,8 +54,16 @@ func newFakeNode(id string) *fakeNode {
 			n.forwardReads++
 		}
 		v, ok := n.values[key]
+		failing := n.failKeyReads > 0
+		if failing {
+			n.failKeyReads--
+		}
 		n.mu.Unlock()
 
+		if failing {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
@@ -72,6 +86,14 @@ func (n *fakeNode) set(key, value string) {
 func (n *fakeNode) del(key string) {
 	n.mu.Lock()
 	delete(n.values, key)
+	n.mu.Unlock()
+}
+
+// failNextKeyReads makes the next count key reads answer 500, modelling a
+// transient read error inside the check's grace window.
+func (n *fakeNode) failNextKeyReads(count int) {
+	n.mu.Lock()
+	n.failKeyReads = count
 	n.mu.Unlock()
 }
 
@@ -225,6 +247,48 @@ func TestConvergencePassesOnAnAgreeingCluster(t *testing.T) {
 	}, []string{"never-written"}, http.DefaultClient)
 	if !res.Converged {
 		t.Error("a key absent from every replica was reported divergent")
+	}
+}
+
+// TestConvergenceClearsUnreachableBetweenAttempts pins the report's internal
+// consistency. Unreachable is per-attempt evidence, but it was accumulated across
+// the whole grace window and never cleared — so a transient read error on an early
+// attempt survived into a later attempt that read every replica cleanly, and
+// convergenceLines printed "converged: true" with unreachable nodes listed
+// underneath it. A summary contradicted by its own detail lines is exactly the
+// kind of claim this harness exists to prevent.
+func TestConvergenceClearsUnreachableBetweenAttempts(t *testing.T) {
+	nodes, addrs := startCluster(t, "node1", "node2", "node3")
+	const key = "chaos-m1-k3"
+	owners := writeToOwners(t, nodes, addrs, key, "agreed", 2)
+
+	// One replica answers 500 for its first read, then serves normally — the shape
+	// of a node that is briefly busy mid-grace-window rather than gone.
+	nodes[owners[1]].failNextKeyReads(1)
+
+	res := checkConvergence(context.Background(), convergenceConfig{
+		Enabled: true, Grace: 3 * time.Second, Nodes: addrs, Replicas: 2,
+		PollInterval: 10 * time.Millisecond,
+	}, []string{key}, http.DefaultClient)
+
+	if !res.Converged {
+		t.Fatalf("a cluster that agrees on every key after one transient read error "+
+			"was reported unconverged: %+v", res)
+	}
+	if len(res.Unreachable) != 0 {
+		t.Errorf("converged=true was returned with %d unreachable entries still "+
+			"attached from an earlier attempt: %v", len(res.Unreachable), res.Unreachable)
+	}
+	if res.Attempts < 2 {
+		t.Fatalf("attempts = %d: the transient error did not force a retry, so this "+
+			"test is not exercising the accumulation it is about", res.Attempts)
+	}
+
+	// The rendered report is what an operator actually reads, so assert there too.
+	for _, line := range res.convergenceLines() {
+		if strings.Contains(line, "unreachable:") {
+			t.Errorf("the report prints %q under a converged summary", strings.TrimSpace(line))
+		}
 	}
 }
 

@@ -306,8 +306,9 @@ func TestAntiEntropyCursorSurvivesRestart(t *testing.T) {
 	if got := reopened.Get("node2"); got != cursorAfterCatchUp {
 		t.Errorf("cursor after restart = %s, want %s", got, cursorAfterCatchUp)
 	}
-	if floor := reopened.RetentionFloor(); floor != cursorAfterCatchUp.Segment {
-		t.Errorf("retention floor after restart = %d, want %d", floor, cursorAfterCatchUp.Segment)
+	if floor, ok := reopened.RetentionFloor(); !ok || floor != cursorAfterCatchUp.Segment {
+		t.Errorf("retention floor after restart = (%d, %t), want (%d, true)",
+			floor, ok, cursorAfterCatchUp.Segment)
 	}
 
 	// A restarted engine must conclude, from the durable cursor alone, that the

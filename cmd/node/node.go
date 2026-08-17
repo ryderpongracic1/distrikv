@@ -358,7 +358,15 @@ func (n *Node) ReplicateWrite(ctx context.Context, op, key string, value []byte)
 
 		client, ok := n.peerClients[vn.NodeID]
 		if !ok {
+			// No client is a replication failure like any other: the write is
+			// refused to the caller and this node is now ahead of that replica for
+			// this key. Skipping the bookkeeping here would leave the one hole in
+			// "any replication failure marks the replica behind" — and the hole
+			// widens rather than closes, because the ring can hand back a member
+			// that has no client at all (a peer added to the ring without a client
+			// entry), which is exactly the case where nothing else will notice.
 			n.metrics.ReplicationErrors.Add(1)
+			n.noteReplicationFailure(vn.NodeID)
 			errs = append(errs, fmt.Errorf("no client for replica %s", vn.NodeID))
 			continue
 		}

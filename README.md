@@ -359,6 +359,30 @@ Retention is bounded at `maxRetainedWALSegments` = 128. A replica that is gone f
 good must not turn into unbounded disk growth, so past the cap the oldest parked
 segments are dropped with a warning.
 
+**The floor cannot be the minimum over recorded cursors alone.** The replica that
+needs retention most is the one that has been behind since *before* its first
+cursor was ever persisted: it has no recorded cursor, so it contributes nothing to
+that minimum, and `advanceQuietCursors` will not give it one — it deliberately only
+adopts a tip for a replica that is **not** behind, since adopting one for a replica
+you are ahead of would assert exactly what you know to be false. The healthy
+replicas keep adopting tips, so a floor derived from cursors alone marches forward
+and the engine deletes precisely the segments the down replica is owed. With *no*
+cursors recorded at all it is worse: the floor is "none", which the engine reads as
+retention being switched off, so every flushed segment is deleted — and that is the
+state a freshly started node is in for its first few seconds, which is where a
+chaos run against a fresh cluster begins.
+
+So `publishRetentionFloor` pins the floor at the oldest segment whenever a replica
+is known to be behind and has no cursor. A zero cursor means *no evidence about
+what this replica has*, and the retention that matches that meaning is to keep
+everything still on disk. The pin is armed on the not-behind → behind transition
+rather than on the next flush tick, because the window would otherwise open at
+exactly the moment a fault starts; it costs one floor recomputation per fault
+window, not one per refused write. It lifts on its own, as soon as a completed pass
+records a real cursor. And it is still bounded by the 128-segment cap — when the cap
+bites, the pass detects the resulting gap and **withholds the convergence claim**
+rather than letting the cap become a silent false "caught up" (below).
+
 #### What is guaranteed, and what is not
 
 **Guaranteed: convergence once writes quiesce.** A repair cycle keeps passing until
@@ -376,12 +400,46 @@ pass would close it — at the cost of refusing writes to a replica that has jus
 come back, trading a rare stale key for guaranteed unavailability. That trade was
 declined.
 
-**Bounded recovery.** If a cursor points into a segment that has already been
-collected, the gap cannot be closed from the log. The pass says so
-(`wal.ErrCursorStale`, counted as `anti_entropy_stale`), then catches up from the
-oldest surviving segment — which converges every key written since, and leaves any
-key whose *only* write fell in the lost range divergent until it is written again.
-A full keyspace scan to repair that is deliberately out of scope for v1.
+**Bounded recovery — and the claim is withheld, not just annotated.** If the log no
+longer reaches back far enough to cover what a replica missed, the gap cannot be
+closed from the log. The pass says so (counted as `anti_entropy_stale`) and then
+catches up from the oldest surviving segment — which converges every key written
+since, and leaves any key whose *only* write fell in the lost range divergent until
+it is written again. A full keyspace scan to repair that is deliberately out of
+scope for v1.
+
+What matters is what the engine is then allowed to *say*. A pass that ships nothing
+is ordinarily convergence, but over a log with a hole in it it means only "the log
+had nothing left" — so the gap latches per replica and the pass reports *"the
+replica is NOT known to agree on the keys the log cannot account for"* instead of
+`replica caught up`, exactly as the post-restore case does. There are two ways in:
+
+- **A recorded cursor pointing into a released segment** raises
+  `wal.ErrCursorStale`, keyed on the segment number.
+- **No recorded cursor at all**, where the pass starts at the oldest surviving
+  segment. This one raises nothing: `wal.NewReader` returns on `from.IsZero()`
+  *before* it looks for the cursor's segment, so `ErrCursorStale` is structurally
+  unreachable on this path. Coverage is therefore checked directly — a zero-cursor
+  pass covers the replica's whole gap only if segment 1 is still on disk, i.e.
+  nothing has ever been released. The check is gated on the replica being known
+  behind, which is the only evidence the primary has that it missed anything at all;
+  a replica that merely failed a health probe and recovered has a zero cursor too,
+  and treating that as a gap would fire the gauge on a health flap.
+
+The condition is surfaced on both signals because they answer different questions.
+`anti_entropy_stale` is a counter of events — a pass could not cover a replica's gap
+— and it distinguishes this cause from a snapshot restore, but it cannot say whether
+the divergence still stands. `anti_entropy_full_sync_required` is the latched gauge
+whose documented meaning is precisely the standing condition here (this node's WAL
+is not a complete record of the data it holds) and whose remedy is precisely the
+same missing mechanism, the key-range scan below; it is persisted in the cursor
+file, because dropped segments do not come back and a restart must not forget the
+hole. The gauge is node-wide while the gap is per-replica, so latching it
+over-reports — a claim about a different replica that the log *can* still prove is
+suppressed too. That is the same direction the gauge already errs in by never
+clearing, and it is why the precise per-replica reason travels in the log line.
+Unlike a restore, this does **not** discard the cursors: they are the only record of
+how far each replica did get.
 
 **Not guaranteed after a snapshot restore: convergence of any kind.**
 `lsm.Restore` bulk-loads the snapshot payload straight into an L0 SSTable and
@@ -414,8 +472,10 @@ The node therefore does two things rather than pretending otherwise:
 - **It refuses to claim convergence it cannot deliver.** The condition is latched
   durably in the cursor file and surfaced as the `anti_entropy_full_sync_required`
   gauge plus a startup warning. While it is set, a pass that finds nothing to ship
-  is reported as *"the replica is NOT known to agree on keys restored from the
-  snapshot"* rather than `replica caught up`. The gauge never clears — v1 has no
+  is reported as *"this node cannot converge this replica from its WAL; the replica
+  is NOT known to agree on the keys the log cannot account for"* rather than
+  `replica caught up` — the same wording the retention gap above uses, with the
+  specific cause carried in the `reason` field. The gauge never clears — v1 has no
   full-sync mechanism — so it keeps reading 1 even after the affected keys have
   organically been rewritten. It over-reports a problem rather than going quiet
   while divergence remains, which is the only safe direction for a convergence
@@ -445,8 +505,14 @@ the write path.
 `anti_entropy_errors`, `anti_entropy_stale` and
 `anti_entropy_full_sync_required`. Node logs carry `catch-up scheduled`,
 `catch-up pass shipped missed writes`, `replica caught up`,
-`replica cursor is older than the retained WAL`, and — after a snapshot restore —
-`this node cannot converge its replicas from its WAL`.
+`replica cursor is older than the retained WAL`, `replica has no recorded cursor
+and the retained WAL no longer starts at its first segment`, and — whenever the log
+cannot account for the data this node holds, after a snapshot restore or a
+retention gap — `this node cannot converge its replicas from its WAL`.
+
+The last two are the ones to grep for when a run reports `converged: false`:
+together with the gauge they say whether the cluster failed to converge or the
+primary was never able to.
 
 `GET /keys/{key}?local=true` answers from the node's own store without
 forwarding. It is the only way to ask a *replica* what it holds — a plain GET on a

@@ -54,6 +54,21 @@ type ManifestEvent struct {
 	// before this field must stay decodable, and "not recorded" has to be
 	// distinguishable from zero so the engine knows to fall back to a scan.
 	MaxSeqNum *uint64 `json:"max_seq_num,omitempty"`
+
+	// Epoch records the incarnation epoch this store was opened with. It is
+	// carried by events of Type "epoch", which describe no SSTable and are
+	// therefore ignored by the live-file computation.
+	//
+	// It exists so that an incarnation never reuses its predecessor's epoch
+	// while local state survives: the clock alone would repeat if two opens fall
+	// inside one second or the clock is stepped backwards. See the seq.go package
+	// comment for the layout and for what the epoch is protecting against.
+	//
+	// Pointer + omitempty for the same reason as the fields above: a manifest
+	// written before this field existed must stay decodable, and "not recorded"
+	// — a fresh or wiped data directory — has to be distinguishable from epoch 0,
+	// which is the epoch every pre-upgrade sequence number carries.
+	Epoch *uint64 `json:"epoch,omitempty"`
 }
 
 // Manifest is the source of truth for which SSTable files are live.
@@ -145,6 +160,53 @@ func (m *Manifest) MaxSeqNum() (uint64, bool) {
 		}
 	}
 	return max, complete
+}
+
+// Epoch returns the highest incarnation epoch recorded in the manifest, and
+// whether any event carried one.
+//
+// A false result means a fresh or wiped data directory — either the manifest
+// predates the field or it was reset — which is exactly the case the epoch cannot
+// be recovered from local state at all. It scans for the highest rather than
+// trusting position, so that neither SetEpoch's rewrite nor a future event
+// ordering change can lower the epoch.
+func (m *Manifest) Epoch() (uint64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var max uint64
+	found := false
+	for _, ev := range m.events {
+		if ev.Epoch == nil {
+			continue
+		}
+		if !found || *ev.Epoch > max {
+			max = *ev.Epoch
+			found = true
+		}
+	}
+	return max, found
+}
+
+// SetEpoch records the incarnation epoch this store is opening with and rewrites
+// the manifest atomically. It is called once per open, before any write, so that
+// the next open can advance past this incarnation even if the clock does not.
+//
+// It replaces any epoch already recorded rather than appending beside it. Epochs
+// are monotonic, so the newest is the only one anyone reads — and since the whole
+// manifest is rewritten on every flush and compaction, one record per open would
+// otherwise be a slow leak paid on that path forever.
+func (m *Manifest) SetEpoch(epoch uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	kept := m.events[:0]
+	for _, ev := range m.events {
+		if ev.Type != "epoch" {
+			kept = append(kept, ev)
+		}
+	}
+	e := epoch
+	m.events = append(kept, ManifestEvent{Type: "epoch", Epoch: &e})
+	return m.writeAll()
 }
 
 // LastLiveKeys returns the most recently recorded live-key count and whether

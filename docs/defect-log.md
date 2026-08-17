@@ -1,6 +1,6 @@
 # Defect Log
 
-Eleven real defects, found and closed. Each one is recorded with the evidence that
+Twelve real defects, found and closed. Each one is recorded with the evidence that
 exposed it rather than quietly fixed, because in most cases the *way* it surfaced
 is the more interesting half: the measurement infrastructure kept paying compound
 interest, and every fix made the next layer visible.
@@ -14,6 +14,7 @@ The pattern, stated once so the individual entries can be read quickly:
 - the **container logs**, read while investigating something else, caught a Raft layer that had never worked ([6](#defect-6-no-leader-had-ever-sent-a-heartbeat))
 - the **convergence gate** caught WAL segment reuse ([10](#defect-10-wal-segment-numbers-reused-across-a-graceful-restart))
 - and the **Porcupine checker**, within hours of that convergence noise being cleared out of its way, caught the sequence counter ([11](#defect-11-lsm-sequence-counter-reopened-at-zero))
+- and an **external read review** of that fix caught the case its seed could not cover — a store that comes back without its data directory ([12](#defect-12-a-primary-that-lost-its-data-directory-had-its-writes-discarded-and-acked))
 
 > **On the numbering.** These numbers are assigned here, in this document, for
 > reference. They are not a pre-existing scheme carried over from anywhere: before
@@ -22,10 +23,13 @@ The pattern, stated once so the individual entries can be read quickly:
 > by discovery. Each entry links to the full narrative, which remains where the
 > defect happened — this is an index, not a replacement.
 >
-> Eleven is the count of defects serious enough to be narrated. Smaller findings
+> The count is of defects serious enough to be narrated. Smaller findings
 > that were fixed alongside them are listed under
 > [Smaller findings](#smaller-findings) rather than folded into the count, so the
 > headline number is not inflated by them.
+>
+> Defect 12 was added by a later review round. The earlier numbering was left
+> alone rather than renumbered, so links from other documents keep resolving.
 
 ---
 
@@ -429,9 +433,69 @@ condition that used to resurrect stale values.
 
 ---
 
+## Defect 12: A primary that lost its data directory had its writes discarded and ACKed
+
+**Class:** silent divergence / acknowledged-write loss · **Found by:** an external
+read review of the just-landed per-key sequence feature · **Narrated in:**
+[replication-and-anti-entropy.md → Per-key write ordering](replication-and-anti-entropy.md#what-is-guaranteed-and-what-is-not)
+
+Defect 11 made the write counter survive a restart *with* the data directory. It
+could not make it survive a restart **without** one, because the seed is local by
+construction — `MaxSeqNum` from the manifest, else a scan of the live SSTables. A
+primary redeployed onto empty storage therefore restarted its counter near zero
+while its replicas still held the high sequences its previous incarnation had
+assigned, and apply-if-newer — working exactly as designed — discarded every write
+it made. The discard is ACKed, because a stale arrival means the replica is already
+at or past what the primary wanted, so the client saw **200** while the replica kept
+its pre-wipe value. Catch-up replay shipped the same low sequences and was
+discarded too. The ring never changed, so the documented per-primary limit (framed
+around ring rebalance) did not cover it.
+
+Self-heal existed and was a race, not a guarantee: applying a foreign sequence
+carries the local counter up to it, so the first write this node received *as a
+replica* for another primary's key lifted it above the cluster's high-water mark.
+A workload touching only the wiped node's own keys never delivers one.
+
+**The in-repo instance, which the review did not name.** `Restore` (snapshot
+install) wipes the manifest, the SSTables and the WAL, and then reset the sequence
+counter to zero outright — `l.seqNum.Store(0)`. So this was not only a deployment
+accident: any node that installed a snapshot had every subsequent write for a
+pre-existing key discarded by its replicas, from a code path in the repository.
+
+**Fix.** The sequence number is split into an **incarnation epoch** in the high 42
+bits and the write counter in the low 22 — inside the same uint64 that already flows
+through `Entry.SeqNum`, the WAL v2 records, `ManifestEvent.MaxSeqNum` and
+`ReplicateRequest.seq`. No wire change, no record-format change, and no comparison
+change: comparing the composite is comparing `(epoch, counter)` lexicographically.
+The epoch is stamped per open from the clock in milliseconds, or from one above the
+previous incarnation's epoch, whichever is higher — the clock half because a wiped
+directory has nothing local left to read, the recorded half because two opens inside
+one millisecond (or a clock stepped backwards) must not reuse an epoch. `Restore`
+advances it from the in-memory value rather than resetting. Layout, overflow and the
+rejected alternatives are in
+[lsm-engine.md → Sequence number layout](lsm-engine.md#sequence-number-layout-incarnation-epoch--write-counter).
+
+**What is reported rather than fixed.** When the clock cannot carry a node forward,
+an arriving epoch can still be below the stored one — and the replica cannot resolve
+that from one RPC, because it is equally the signature of a stale in-flight write
+from the sender's previous incarnation, where discarding is right. So it discards
+and reports: `replica_writes_epoch_regressed`, a latched `replica_epoch_regressed`
+gauge, and one `ERROR` log carrying both epochs. The plain
+`replica_writes_discarded` counter added alongside is what distinguishes
+"inversions being suppressed" from "every write from this primary being dropped" —
+before it, both were silent.
+
+Pinned by `TestWipedPrimaryWritesSurviveTheReplicaComparison` (two engines, one
+wiped mid-test), `TestRestoreAdvancesTheIncarnationEpoch`,
+`TestOpenAdvancesTheIncarnationEpoch`,
+`TestPreUpgradeSequencesOrderBelowEpochStampedWrites` and
+`TestEpochRegressionIsCountedAndLogged`.
+
+---
+
 ## Smaller findings
 
-Fixed alongside the above, and not counted in the eleven — recorded because
+Fixed alongside the above, and not counted in the twelve — recorded because
 leaving them out would make the list look tidier than the work was:
 
 | Finding | Where |

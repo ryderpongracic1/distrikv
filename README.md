@@ -44,7 +44,7 @@ The deep material lives in [`docs/`](docs/). Start wherever the question is.
 | [raft.md](docs/raft.md) | Raft's honest scope: leader election and heartbeats. Log replication is a stub, and the §5.3 gaps are named |
 | [chaos-harness.md](docs/chaos-harness.md) | The Porcupine model, the nemesis, the convergence gate, the counterexample output, and every measured run |
 | [benchmarks.md](docs/benchmarks.md) | Every table, including the etcd ceiling comparison with its durability confound stated rather than corrected |
-| [defect-log.md](docs/defect-log.md) | **Eleven real defects**, numbered, with the evidence that exposed each one |
+| [defect-log.md](docs/defect-log.md) | **Twelve real defects**, numbered, with the evidence that exposed each one |
 | [api-and-cli.md](docs/api-and-cli.md) | The HTTP REST surface and `distrikv-cli` |
 | [development.md](docs/development.md) | Running the tests, repository layout, code-quality conventions |
 | [MIGRATION.md](MIGRATION.md) | v1 → v2 data migration |
@@ -97,6 +97,13 @@ ACK from each replica.
 | 100% reads (GET) | **6,017 /s** | 0.54 ms | **1.7 ms** |
 | 100% replicated writes (PUT) | **1,199 /s** | 1.7 ms | **4.6 ms** |
 | 20% write / 80% read | 3,000 /s | 0.70 ms | 2.5 ms |
+
+Re-measured on 2026-08-17 after replicated writes began carrying a per-key
+sequence, in both the configuration above and one that forces the comparison onto
+the SSTable path: no regression on either, and a pre-change control run shows the
+flushed-key write tail is *worse* before the change than after it. Numbers,
+controls and engine counters in
+[benchmarks.md → Post-H2 re-measurement](docs/benchmarks.md#post-h2-re-measurement-2026-08-17-same-cluster-and-method).
 
 **LSM read path** — 500k-key prefill so reads must traverse SSTables, then three
 60 s read-only windows at 4,000 QPS over the same data, changing only the access

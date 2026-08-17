@@ -237,6 +237,23 @@ sequence back out of the log rather than assigning one, which makes a pass
 idempotent and safe to race against live replication: a replayed entry that has
 been superseded loses to the newer write's higher sequence instead of reverting it.
 
+**Qualifier: pass idempotence holds for v2 records only.** A record written before
+the log carried sequences replays with sequence 0, and the replica routes such a
+write through `Put` — which stamps it with a *fresh local* sequence rather than
+storing it at 0, where compaction would drop it. That local counter has been
+carried above every foreign sequence the node stores, so the replayed entry does
+not merely apply unconditionally: it **outranks** whatever newer value was stored
+for the key, and keeps outranking it until the next real write. A pass over
+mixed-format segments — exactly what a binary upgrade produces, since v1 and v2
+records interleave in the segments already on disk — can therefore revert a newer
+value, until those segments age out under the 128-segment retention cap. No code
+fix is applied: skipping v1 records for keys the replica already holds would
+withhold the one case they are needed for (a key whose only surviving write is a
+v1 record), and the condition is bounded, self-clearing and confined to segments
+written before the upgrade. The behaviour is pinned by
+`TestUnsequencedReplayOutranksTheStoredVersion` so that the doc and the code
+cannot drift apart.
+
 The comparison is against what the replica has *stored*, so the sequence has to
 survive a restart with the same meaning — and the WAL did not record it. Recovery
 assigned every replayed entry a fresh number from the local counter, which is
@@ -258,7 +275,146 @@ compare against for any key that has been flushed and would apply such a write
 unconditionally, reinstating the inversion for most of the keyspace over a run.
 The lookup is Bloom-filtered, so the common absent-key case costs no disk read, and
 it is paid on a path that already serialises on the engine write lock behind a WAL
-fsync.
+fsync. **That was an argument about where the cost falls; it is now a measurement,
+and the comparison is acquitted** (2026-08-17, Apple M4 Pro, 3-node Colima
+cluster — [benchmarks.md → Post-H2 re-measurement](benchmarks.md#post-h2-re-measurement-2026-08-17-same-cluster-and-method)):
+
+| Configuration | Post-H2 | Pre-H2 | Reading |
+| --- | --- | --- | --- |
+| Memtable-resident writes (1,200 qps, Zipf, 100k keys) | p99 **3.8 ms**, p999 8.1 ms | p99 4.6 ms, p999 13.6 ms (08-16 baseline) | No regression; the improvement is within run variance |
+| Flushed-key writes (1,200 qps, Zipf over a 500k prefill) | p99 **40.5 ms**, p999 114.9 ms | p99 53.9 ms, p999 130.6 ms (control at `47958bb`) | The tail is *worse* before the change — it is pre-existing LSM write-load behaviour, not this comparison |
+
+The second row is the discriminating one, because the memtable-resident workload
+barely exercises the path that was flagged: with zero flushes there is nothing to
+read through, so the comparison answers from the memtable. Prefilling 500k keys
+forces the overwrite-of-a-flushed-key case, and the engine counters confirm the
+comparison really did execute — the post-H2 run shows live Bloom traffic (5,917
+hits / 7,460 misses) and block-cache activity (22.9% hit rate over 23,273 misses),
+while the pre-H2 control shows `bloom_hits=0` and no cache activity at all, because
+a pre-H2 replica write is blind. The instrumentation therefore establishes both
+halves independently: the read happens, and it costs nothing measurable at this
+load.
+
+One open observation, offered as a direction rather than a claim: both builds' p99
+on the flushed-key workload lands near the 50 ms soft-stall sleep cap, and a
+compaction ran during the post-H2 measurement. Whoever chases that pre-existing
+tail should start there rather than at the comparison.
+
+**A reachable trigger the per-primary sequence did not survive: a primary that
+comes back without its data directory (fixed by an incarnation epoch).** The
+counter is seeded from *local* state — `MaxSeqNum` from the manifest, else a scan
+of the live SSTables. A primary redeployed onto empty storage (volume recreated,
+data directory lost) therefore restarted its counter near zero while its replicas
+still held the high sequences its previous incarnation had assigned. Every write it
+then made lost the replicas' comparison and was discarded **and ACKed**: the client
+saw 200, the replica kept its pre-wipe value, and a catch-up pass shipped the same
+low sequences and was discarded too. The ring never changed, so the rebalance
+framing below did not cover it.
+
+Self-heal existed but was a race rather than a guarantee. Applying a foreign
+sequence carries the local counter up to it (`bumpSeqGen`), so the first inbound
+replicated write — one this node receives as a *replica* for some other primary's
+key — lifts the wiped counter above the cluster's high-water mark. On a mixed
+workload that happens in milliseconds. On a workload touching only the wiped node's
+own keys it never happens at all, and nothing reported the interim.
+
+`Restore` (snapshot install) was the same hazard reached from inside the repo
+rather than from a deployment accident: it wipes the manifest, the SSTables and the
+WAL, and then reset the sequence counter to zero outright — so every post-restore
+write ranked below the versions this node's replicas still held. That path is
+narrated as [defect 12](defect-log.md#defect-12-a-primary-that-lost-its-data-directory-had-its-writes-discarded-and-acked).
+
+The fix splits the sequence number into two fields inside the same uint64 that
+already flows through `Entry.SeqNum`, the WAL v2 records, the manifest's
+`MaxSeqNum` and `ReplicateRequest.seq` — no wire change, no new record format, and
+no change to any comparison, because comparing the composite is exactly comparing
+`(epoch, counter)` lexicographically:
+
+```
+ 63                              22 21                  0
++----------------------------------+---------------------+
+|        incarnation epoch         |    write counter    |
++----------------------------------+---------------------+
+          42 bits (milliseconds)          22 bits
+```
+
+The epoch is what a wiped node still has, because it does not come from the data
+directory: **every open stamps the incarnation with the current millisecond, or
+with one above the epoch of the previous incarnation, whichever is higher.** The
+clock half is what carries a recreated directory forward — there is nothing local
+left to read, and that is the whole problem. The recorded half is what keeps the
+epoch advancing when the clock does not: two opens inside one millisecond, or a
+clock stepped backwards, would otherwise reuse the predecessor's epoch and leave
+the comparison to the counter alone. The epoch is recorded before the first write
+of the incarnation, not at close, so a crash cannot lose the epoch its writes were
+issued under.
+
+Granularity is what bounds the fix, which is why it is milliseconds rather than
+seconds: two incarnations that stamp the *same* epoch fall back to comparing
+counters, and a wipe is exactly the case where the second incarnation's counter is
+the lower one. A redeploy fast enough to land in the same second is entirely
+plausible; one inside the same millisecond is not a process restart.
+
+Using a clock here is narrower than it sounds, and the narrowness is the reason it
+is sound: **on the replication path, only one node's own clock monotonicity
+matters, never agreement between nodes'.** Two sequences are compared only when
+they describe the same key, a key has exactly one ring-primary, so both sides of
+every comparison were stamped by the same machine. Cross-node skew cannot invert
+anything.
+
+Two paths stamp a *local* sequence on a key this node is not ring-primary for, and
+both are exceptions to that argument rather than counter-examples to it. An
+unsequenced replay (`seq == 0`) does, which is the qualifier two paragraphs up —
+bounded by segment retention, and pinned. And `Restore`'s bulk load does, for every
+key in a snapshot payload, so a later write from the actual ring-primary would be
+compared against a sequence this node stamped; that path is unreachable in a
+running cluster today (stated under *"Not guaranteed after a snapshot restore"*
+below) and is the first thing to re-derive if snapshots become real.
+
+Why not the two alternatives:
+
+- **Recovering the epoch from peers at startup.** A replica cannot answer "what is
+  the highest epoch you hold for keys this node is primary for?" without a
+  per-primary index it does not keep, so this needs new persisted state on every
+  replica, a new RPC, a policy for peers that are down, and a startup barrier —
+  and it still cannot distinguish a wiped node from a genuinely new one when every
+  peer is unreachable. The clock answers the same question with no coordination.
+- **Recovering it from inbound traffic behind a startup barrier.** The barrier can
+  never lift in the one failure mode that matters: a workload touching only this
+  node's own keys delivers no inbound replicated write, so the node would refuse
+  its own primary writes indefinitely. That trades silent divergence for unbounded
+  unavailability with no recovery path.
+
+**What the epoch does not fix, and is reported instead.** When the clock cannot
+carry a node forward — stepped backwards across the wipe, a container with an unset
+clock, or the field saturated (the 2160s, for 42 bits of milliseconds) — an
+arriving sequence can still have an epoch *below* the one stored for the key. That
+is never a benign inversion, because two writes from one incarnation share an
+epoch. But the replica cannot resolve it from one RPC either: an epoch below the
+stored one is equally the signature of a genuinely stale in-flight write from the
+sender's *previous* incarnation, where discarding is exactly right. Accepting the
+lower epoch would reintroduce the inversion this whole mechanism removes. So the
+replica discards — and reports, which is the part that was missing:
+
+| Observable | Meaning |
+| --- | --- |
+| `replica_writes_discarded` | Every apply-if-newer refusal, puts and deletes alike. A trickle is the mechanism working (suppressed inversions, plus re-shipped catch-up entries a replica already had — which is *why* a pass is idempotent). A rate close to the incoming write rate is the alarming reading: this node's stored sequences sit above everything its primary is sending |
+| `replica_writes_epoch_regressed` | The subset where the arriving epoch was below the stored one. Not an inversion; three causes, which one RPC cannot tell apart — a sender that lost its state and could not be carried forward by its clock, a genuinely stale in-flight write from the sender's previous incarnation, and a **rolling upgrade**, where an un-upgraded peer's bare-counter sequence reads as epoch 0 against a replica's epoch-stamped version. The third is expected and bounded by the upgrade window; the first two are not |
+| `replica_epoch_regressed` | 0/1 latched gauge, set by the first such discard. It latches because nothing in v1 reconciles a primary that lost history, and because the value of the signal is that it survives until someone reads it |
+
+The first regressed discard also logs at `ERROR` with both epochs and both
+sequences; subsequent ones are carried by the counter rather than repeating the log
+once per write.
+
+Two residuals are worth naming rather than leaving to be discovered. The epoch is
+only as good as its granularity, so a wipe that reopens inside the same millisecond
+as the previous incarnation's stamp falls back to comparing counters — the
+pre-epoch behaviour, now at least counted by `replica_writes_discarded` rather than
+silent. And the epoch restores *write acceptance*, not the replica's pre-wipe
+contents: values the wiped primary never writes again remain on its replicas as
+orphans that no client read can reach (reads route to the ring-primary), which is
+the same gap `anti_entropy_full_sync_required` names and which full sync would
+close.
 
 **The narrower limit that remains: the sequence is per-primary, not global.** Each
 node's counter is its own, so two sequences are only comparable when they describe
@@ -268,9 +424,14 @@ unrelated to the old one's, so its first writes for a moved key can carry a
 sequence below the one the replica already stored and be discarded until the
 counter passes it. distrikv has no rebalance today (the ring is fixed at startup
 from configuration), so the case is unreachable rather than merely unlikely — but
-membership changes cannot be added without addressing it, and the honest fix is a
-sequence that is comparable across nodes (an epoch or node-id tiebreak) rather than
-one that is merely monotonic per node.
+membership changes cannot be added without addressing it. The epoch **narrows this
+without closing it**: two nodes' epochs are both derived from wall-clock
+milliseconds, so a new primary's first writes land in an epoch at or above the old
+primary's unless the clocks disagree — and "unless the clocks disagree" is exactly
+the assumption a correctness argument may not rest on when the two sides of the
+comparison are different machines. A rebalance still needs a tiebreak that does not
+appeal to clocks (a node-id component, or ownership-transfer handoff of the
+sequence).
 
 One second-order effect is worth naming: because a replica stores its primaries'
 sequences, its own counter is carried above them so that its own writes still sort
@@ -410,6 +571,14 @@ The node therefore does two things rather than pretending otherwise:
   organically been rewritten. It over-reports a problem rather than going quiet
   while divergence remains, which is the only safe direction for a convergence
   claim.
+- **It advances the incarnation epoch instead of resetting the sequence counter.**
+  A restore is a wipe, so the counter used to be reset to zero — which put every
+  post-restore write *below* the versions this node's replicas still held, so they
+  discarded and ACKed them and the restored node could not converge its replicas
+  even on keys it wrote again. The epoch advances across a restore from the
+  in-memory value (the manifest that recorded it is exactly what the restore
+  replaced), so post-restore writes outrank everything the previous incarnation
+  issued. See [defect 12](defect-log.md#defect-12-a-primary-that-lost-its-data-directory-had-its-writes-discarded-and-acked).
 
 **Reachability, stated plainly: this path is currently unreachable in a running
 cluster.** No Raft snapshot file is ever created — `takeSnapshot` fires only from

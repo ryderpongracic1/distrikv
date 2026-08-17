@@ -45,6 +45,61 @@ with `linearizable: FAIL` — data consistent at rest, history illegal — and i
 sufficient to produce exactly that pair: a resurrected value fails a read
 mid-run, and the next write to the key converges every copy again.
 
+### Sequence number layout: incarnation epoch + write counter
+
+Seeding from disk fixes a restart *with* the data directory. It cannot fix a store
+that comes back **without** one — a recreated volume, or the wipe `Restore`
+performs on itself — because there is then nothing local to seed from, and the
+counter restarts near zero while this node's replicas still hold the sequences its
+previous incarnation assigned. Those replicas then discard its writes as stale
+([defect 12](defect-log.md#defect-12-a-primary-that-lost-its-data-directory-had-its-writes-discarded-and-acked)).
+
+So a sequence number is two fields inside the same uint64 it always was — no wire
+change, no record-format change, and no comparison change, because comparing the
+composite is exactly comparing `(epoch, counter)` lexicographically:
+
+```
+ 63                              22 21                  0
++----------------------------------+---------------------+
+|        incarnation epoch         |    write counter    |
++----------------------------------+---------------------+
+          42 bits (milliseconds)          22 bits
+```
+
+- **Epoch** (`internal/store/lsm/seq.go`): stamped once per open as the current
+  millisecond (counted from a 2026-01-01 origin, which is what makes millisecond
+  resolution fit in 42 bits), or one above the epoch of the previous incarnation,
+  whichever is higher. The clock half is what a wiped directory still has; the
+  recorded half — `ManifestEvent.Epoch`, plus the epoch of the highest sequence
+  already on disk — is what advances the epoch when the clock does not (two opens
+  inside one millisecond, or a clock stepped backwards). It is written to the
+  manifest *before* the incarnation's first write, so a crash cannot lose the epoch
+  its writes were issued under. `Restore` advances it too, from the in-memory value,
+  since the manifest it is replacing is already gone.
+- **Counter**: `seedSeqNum`'s result, floored at the epoch. The floor is why the
+  legacy scan is now a backstop rather than the mechanism — it can only raise the
+  counter above the floor, never below it.
+- **Pre-upgrade sequences** are bare counters, which read as epoch 0 — below every
+  epoch this code assigns, which is the true ordering since they were written
+  first. Nothing special-cases them.
+- **Overflow.** 2^22 writes (~4.2 million) inside one incarnation carry into the
+  epoch field. That is invisible to ordering (the composite is one atomic counter
+  and stays strictly monotonic) and can only make an epoch appear to advance, never
+  regress, so it can neither misorder a write nor fabricate an epoch regression;
+  its only effect is to borrow ~1 ms of future epoch per 4.2 M writes, and the next
+  open picks the epoch back up from the sequences on disk rather than from the
+  manifest record alone, so it cannot accumulate into a regression. The epoch field
+  itself saturates in the 2160s rather than wrapping, after which the scheme
+  degrades to seeding-from-disk alone.
+
+Why a clock is sound here and would not be in general: two sequences are compared
+only when they describe the same key, a key has exactly one ring-primary, so both
+sides of every comparison were stamped by the same machine. Only that machine's own
+clock monotonicity matters — never agreement between nodes'. The full argument,
+including the two alternatives that were rejected and the residual cases the epoch
+reports rather than fixes, is in
+[replication-and-anti-entropy.md → Per-key write ordering](replication-and-anti-entropy.md#what-is-guaranteed-and-what-is-not).
+
 ## Write-Ahead Log (`internal/store/wal`)
 
 Every `Put` and `Delete` is appended to a binary WAL file **before** the MemTable is updated. There are two record formats, discriminated by the op byte, and they interleave freely within a segment:

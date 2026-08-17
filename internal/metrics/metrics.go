@@ -40,6 +40,44 @@ type Metrics struct {
 	// ReplicationErrors counts failures when replicating a write to a replica.
 	ReplicationErrors atomic.Uint64
 
+	// --- Replica apply path (apply-if-newer) --------------------------------
+
+	// ReplicaWritesDiscarded counts replicated mutations — puts and deletes
+	// alike — that this node declined because it already held a version of the
+	// key at or above the arriving sequence.
+	//
+	// A steady trickle is the mechanism working: it is the count of arrival-order
+	// inversions suppressed, plus catch-up entries the replica already had (a
+	// pass is idempotent precisely because re-shipping is discarded). A rate
+	// close to the incoming write rate is the alarming reading — it means this
+	// node's stored sequences sit above everything its primary is sending, which
+	// is what a primary that came back on empty storage looks like. Without this
+	// counter the two are indistinguishable, because both are silent.
+	ReplicaWritesDiscarded atomic.Uint64
+
+	// ReplicaWritesEpochRegressed counts the subset of ReplicaWritesDiscarded
+	// where the arriving sequence's incarnation epoch was *below* the epoch of
+	// the version stored for that key.
+	//
+	// That is never a benign inversion — an inversion is two writes from one
+	// incarnation, which share an epoch. Three causes produce it, and one RPC
+	// cannot tell them apart: the sender lost its local state and came back with
+	// an epoch below the one it issued those writes under (a wipe whose clock
+	// could not carry it forward), the mutation is a genuinely stale in-flight
+	// write from the sender's previous incarnation, or the sender predates the
+	// epoch and its bare counter reads as epoch 0 (a rolling upgrade, bounded by
+	// the upgrade window). Discarding is correct in the second and third readings
+	// and lossy in the first — so the replica discards and reports, rather than
+	// guessing.
+	ReplicaWritesEpochRegressed atomic.Uint64
+
+	// ReplicaEpochRegressed is a 0/1 gauge: 1 means this node has discarded at
+	// least one replicated write whose epoch had regressed (see
+	// ReplicaWritesEpochRegressed). It latches, because the condition is not
+	// self-healing — nothing in v1 reconciles a primary that lost history — and
+	// because the value of the signal is that it survives until someone looks.
+	ReplicaEpochRegressed atomic.Uint64
+
 	// --- Anti-entropy (replica catch-up) ------------------------------------
 
 	// AntiEntropyPasses counts completed catch-up passes over this node's WAL,
@@ -158,6 +196,9 @@ func (m *Metrics) Snapshot() map[string]uint64 {
 		"leader_elections":                m.LeaderElections.Load(),
 		"forwarded_requests":              m.ForwardedRequests.Load(),
 		"replication_errors":              m.ReplicationErrors.Load(),
+		"replica_writes_discarded":        m.ReplicaWritesDiscarded.Load(),
+		"replica_writes_epoch_regressed":  m.ReplicaWritesEpochRegressed.Load(),
+		"replica_epoch_regressed":         m.ReplicaEpochRegressed.Load(),
 		"anti_entropy_passes":             m.AntiEntropyPasses.Load(),
 		"anti_entropy_entries":            m.AntiEntropyEntriesSent.Load(),
 		"anti_entropy_errors":             m.AntiEntropyPassErrors.Load(),

@@ -96,6 +96,11 @@ later phase has to be justified.
 
 ### Throughput baseline with replication (2026-08-16, 3-node docker-compose, Apple M4 Pro, Colima VM 8 CPU / 8 GB)
 
+> This table is the **pre-H2 baseline** — measured before replicated writes carried
+> a per-key sequence. The post-H2 re-measurement of the same workloads, plus the
+> flushed-key configuration that discriminates the apply-if-newer comparison's cost,
+> is [below](#post-h2-re-measurement-2026-08-17-same-cluster-and-method).
+
 Measured with `cmd/bench` open-loop Poisson arrivals against a healthy 3-node
 cluster; Zipfian α=1.1, 100k-key space, 256 B values, 128 workers. "Not
 saturated" means `max_queue_depth ≪ cap` and achieved QPS ≈ target QPS.
@@ -124,6 +129,81 @@ on the SSTable path. Reaching that path from a cluster bench requires writing
 each key once, which `--prefill` does — see
 [Read-path engine metrics](#read-path-engine-metrics---prefill) for the measured
 counters and the mechanism behind the zeros.
+
+#### Post-H2 re-measurement (2026-08-17, same cluster and method)
+
+The table above is the **pre-H2 baseline**: it was measured before replicated
+writes carried a per-key sequence, so a replica applied them blind. Apply-if-newer
+adds a comparison against the version the replica already stores, which for a key
+that is not memtable-resident is a Bloom-filtered SSTable lookup taken *inside* the
+engine write lock. The cost of that was argued rather than measured, so both
+configurations were re-run. Same cluster, same method, same flags.
+
+**Memtable-resident (the baseline's own configuration — Zipf α=1.1, 100k keys):**
+
+| Workload | Target QPS | p50 | p90 | p99 | p999 | Errors | Pre-H2 p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100% writes (PUT) | 1,200 | 1.5 ms | 2.3 ms | **3.8 ms** | 8.1 ms | 0 | 4.6 ms |
+| 100% reads (GET) | 6,000 | 0.58 ms | 1.4 ms | **1.7 ms** | 2.6 ms | 0 | 1.7 ms |
+| 20% write / 80% read | 3,000 | 0.70 ms | 1.6 ms | **2.5 ms** | 5.3 ms | 0 | 2.5 ms |
+
+No regression on any workload; the write improvement is within run variance. But
+this configuration cannot settle the question, and the reason is the same one the
+zeros above explain: with `flush_bytes=0` there is no SSTable to read through, so
+the comparison answers from the memtable and the flagged path is barely exercised.
+
+**Flushed-key writes (the discriminating configuration — 500k-key prefill, then
+writes at 1,200 qps Zipf, so overwrites land on keys that have been flushed):**
+
+| Build | p50 | p90 | p99 | p999 | Errors | Saturated? |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Post-H2 (`cab1dd9`) | 1.8 ms | 4.7 ms | **40.5 ms** | 114.9 ms | 0 | No |
+| Pre-H2 control (`47958bb`) | 1.7 ms | 4.6 ms | **53.9 ms** | 130.6 ms | 0 | No |
+
+**The comparison is acquitted: the pre-H2 tail is worse.** 40.5 ms against 53.9 ms
+on the same bench, same cluster, same day — so the flushed-key write tail is
+pre-existing LSM write-load behaviour rather than a cost this change introduced. The
+first run alone could not have said that, which is why the control was run: a
+compaction (97.9 MB written, WAF 4.35) overlapped the post-H2 measurement, and
+there was no baseline for this configuration at all — the 08-16 write table is
+memtable-resident and the earlier prefilled runs were reads-only.
+
+The engine counters establish the other half independently. The post-H2 run shows
+the comparison actually executing — `bloom_hits=5917`, `bloom_misses=7460`, block
+cache at 22.9% over 23,273 misses — while the pre-H2 control shows `bloom_hits=0`
+and no block-cache activity, because a pre-H2 replica write reads nothing. So the
+read path is demonstrably live post-H2 and demonstrably absent pre-H2, and the
+tail did not move in the direction that would implicate it.
+
+One open observation, a direction rather than a claim: both builds' p99 sits near
+the 50 ms soft-stall sleep cap
+([write-stall backpressure](lsm-engine.md#write-stall-backpressure)). Anyone
+chasing that pre-existing tail should start there.
+
+Reproducing the discriminating run (the prefill is what puts the overwritten keys
+on disk; everything after it is the ordinary write workload):
+
+```bash
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bench-linux ./cmd/bench
+docker run --rm --network docker_default -v "$PWD:/b" alpine \
+  /b/bench-linux --target node1:8001 --prefill \
+    --qps 1200 --duration 60s --warmup 60s --mix 100:0:0 \
+    --keyspace 500000 --keydist zipf --workers 128 --valuesize 256
+```
+
+The one thing this configuration needs that the memtable-resident one does not is
+a **fresh cluster per build** (`docker compose … down -v` between runs): the
+prefill is what establishes the on-disk state, so comparing two builds means
+prefilling for each rather than reusing a volume one of them wrote.
+
+Note for anyone re-running this after the incarnation-epoch change: **both builds
+measured above predate it** (`cab1dd9` and `47958bb`). The epoch adds work to the
+same critical section — two shifts, plus a handful of atomic counter increments on a
+*refused* write only (see
+[replication-and-anti-entropy.md → observables](replication-and-anti-entropy.md#what-is-guaranteed-and-what-is-not)).
+No additional disk read, and nothing on the accepted-write path, so these tables are
+not invalidated by it; they were simply not measured with it, and this note is here
+so the next reader does not have to infer that from the commit dates.
 
 #### Why these numbers replaced the earlier table
 

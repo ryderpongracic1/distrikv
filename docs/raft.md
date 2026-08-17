@@ -1,15 +1,15 @@
 # Raft
 
 **Raft here is a leader-election and failure-detection mechanism, not a data
-replication mechanism.** The section below states that first, then separates what
-runs in production traffic from what is a stub, and closes with the deviations
-from the paper that a reviewer needs in order to read the package correctly.
+replication mechanism.** It is the single most important thing to know about this
+package, and everything below is easy to misread without it. The section states
+that first, then separates what runs in production traffic from what is a stub, and
+closes with the deviations from the paper that a reviewer needs in order to read
+the package correctly.
 
 ---
 
 ## Raft (`internal/raft`)
-
-**Raft here is a leader-election and failure-detection mechanism, not a data replication mechanism.** Read that before the feature list below — it is the single most important thing to know about this package, and the feature list is easy to misread without it.
 
 **Live in production traffic:**
 

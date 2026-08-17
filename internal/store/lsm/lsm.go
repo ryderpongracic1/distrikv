@@ -176,6 +176,17 @@ type LSMTree struct {
 	nextSST atomic.Uint64 // SSTable file sequence number
 	walSeq  atomic.Uint64 // WAL file sequence number
 
+	// epoch is the incarnation epoch of this open — the high field of every
+	// sequence number this engine issues. See seq.go for the layout and for what
+	// it protects against; openEpoch establishes it.
+	epoch atomic.Uint64
+
+	// epochRegressionLogged makes the loud log about a discarded epoch-regressed
+	// write fire once per open rather than once per write: the condition repeats
+	// for every write from the affected primary, and a per-write Error log would
+	// bury the first one. The counter carries the rest.
+	epochRegressionLogged atomic.Bool
+
 	// WAL cursor/retention state for replica catch-up (see wal_retention.go).
 	walRetentionState
 
@@ -196,9 +207,14 @@ type LSMTree struct {
 	// closeOnce makes Close idempotent; see Close.
 	closeOnce sync.Once
 
-	dataDir         string
-	logger          *slog.Logger
-	maxMem          int64
+	dataDir string
+	logger  *slog.Logger
+	maxMem  int64
+
+	// now is the clock the incarnation epoch is stamped from. It is a field only
+	// so a test can drive it: an epoch that depends on wall-clock granularity
+	// would otherwise be asserted by racing the clock.
+	now             func() time.Time
 	nCompact        int              // L0 file count threshold for compaction
 	l0SlowThreshold int              // soft-stall threshold
 	l0StopThreshold int              // hard-stop threshold
@@ -229,6 +245,18 @@ func WithMaxMemBytes(n int64) Option {
 	return func(l *LSMTree) {
 		if n > 0 {
 			l.maxMem = n
+		}
+	}
+}
+
+// withClock replaces the clock the incarnation epoch is stamped from. It is
+// unexported because it is a test seam and not a deployment knob: the epoch's
+// guarantee is that it advances across an open, and a test that has to race
+// millisecond granularity to assert that would be asserting the clock instead.
+func withClock(now func() time.Time) Option {
+	return func(l *LSMTree) {
+		if now != nil {
+			l.now = now
 		}
 	}
 }
@@ -305,6 +333,7 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 		dataDir:         dataDir,
 		logger:          logger,
 		maxMem:          defaultMaxMemBytes,
+		now:             time.Now,
 		nCompact:        defaultCompactN,
 		l0SlowThreshold: defaultL0SlowThreshold,
 		l0StopThreshold: defaultL0StopThreshold,
@@ -409,6 +438,14 @@ func NewLSMTree(dataDir string, logger *slog.Logger, opts ...Option) (*LSMTree, 
 	// This must happen before the active memtable is created, because WAL replay
 	// draws from the same counter and its entries are newer than anything the
 	// SSTables hold.
+	//
+	// openEpoch runs first because the epoch is the high field of every sequence
+	// this engine issues, and seedSeqNum floors the counter at that epoch — which
+	// is what makes the ordering survive a data directory this node no longer has
+	// (see seq.go), not merely a restart with it intact.
+	if err := l.openEpoch(l.now()); err != nil {
+		return nil, err
+	}
 	if err := l.seedSeqNum(); err != nil {
 		return nil, err
 	}
@@ -611,6 +648,10 @@ func (l *LSMTree) putInternal(_ context.Context, key string, value []byte) (uint
 // lookup is not what bounds it. The alternative — applying unconditionally when
 // the key is not in memory — would silently reinstate the inversion for any key
 // that has been flushed.
+//
+// A refusal is not silent: see noteDiscard for what is counted, and why a
+// refusal whose epoch has gone backwards is counted separately from an ordinary
+// suppressed inversion.
 func (l *LSMTree) PutIfNewer(ctx context.Context, key string, value []byte, seq uint64) (applied bool, err error) {
 	if seq == 0 {
 		if _, err := l.Put(ctx, key, value); err != nil {
@@ -718,6 +759,11 @@ func (l *LSMTree) DeleteIfNewer(ctx context.Context, key string, seq uint64) (ap
 // which PutIfNewer and DeleteIfNewer resolve before they reach here by routing
 // the write through Put/Delete so it is stamped with a real local sequence —
 // comparing against 0, or storing it, would both be wrong.
+//
+// The comparison is on the whole sequence, which compares (epoch, counter)
+// lexicographically for free — so nothing here has to know about the split. What
+// the split buys is the classification of a *refusal*: noteDiscard separates a
+// suppressed inversion from a sender whose epoch has gone backwards.
 func (l *LSMTree) isNewerLocked(key string, seq uint64) (bool, error) {
 	stored, found, err := l.storedSeqLocked(key)
 	if err != nil {
@@ -726,7 +772,56 @@ func (l *LSMTree) isNewerLocked(key string, seq uint64) (bool, error) {
 	if !found {
 		return true, nil
 	}
-	return seq > stored, nil
+	if seq > stored {
+		return true, nil
+	}
+	l.noteDiscard(key, seq, stored)
+	return false, nil
+}
+
+// noteDiscard records a replicated mutation this engine declined because it
+// already holds a version of key at or above the arriving sequence.
+//
+// Both counters matter and they measure different things. A discard as such is
+// the mechanism working — a suppressed arrival-order inversion, or a catch-up
+// entry the replica already had — and only its *rate* distinguishes that from a
+// primary whose every write is being dropped, which is why it is counted rather
+// than logged.
+//
+// A discard where the arriving epoch is below the stored one is categorically
+// different: an inversion is two writes from one incarnation and they share an
+// epoch, so an epoch that has gone backwards is not an inversion at all. It means
+// one of three things: the sender lost its local state and came back under an epoch
+// below the one it issued those writes with (a wipe whose clock could not carry it
+// forward), the mutation is a stale in-flight write from the sender's previous
+// incarnation, or the sender predates the epoch entirely and its bare counter reads
+// as epoch 0 — a rolling upgrade, bounded by the upgrade window. Discarding is right
+// in the second and third readings and lossy in the first, and one RPC does not say
+// which, so this discards and reports rather than guessing. What it must not do is
+// stay silent: the pre-epoch behaviour ACKed such a write with nothing recorded
+// anywhere, so the client saw success while the replica kept a value the primary no
+// longer had.
+func (l *LSMTree) noteDiscard(key string, seq, stored uint64) {
+	if l.metrics != nil {
+		l.metrics.ReplicaWritesDiscarded.Add(1)
+	}
+	if seqEpoch(seq) >= seqEpoch(stored) {
+		return
+	}
+	if l.metrics != nil {
+		l.metrics.ReplicaWritesEpochRegressed.Add(1)
+		l.metrics.ReplicaEpochRegressed.Store(1)
+	}
+	if l.epochRegressionLogged.CompareAndSwap(false, true) {
+		l.logger.Error("lsm: discarded a replicated write whose incarnation epoch is below the version stored "+
+			"for this key; the sender either lost its local state or this is a stale write from its previous "+
+			"incarnation. Writes for these keys are not converging — see replica_writes_epoch_regressed",
+			"key", key,
+			"arriving_epoch", seqEpoch(seq),
+			"stored_epoch", seqEpoch(stored),
+			"arriving_seq", seq,
+			"stored_seq", stored)
+	}
 }
 
 // storedSeqLocked returns the sequence number of the newest version of key this
@@ -1347,7 +1442,23 @@ func (l *LSMTree) Restore(ctx context.Context, data map[string][]byte) error {
 	})
 	l.compact.metrics = l.metrics
 
-	l.seqNum.Store(0)
+	// A restore is a wipe: the manifest, the SSTables and the WAL that carried
+	// this node's write history are gone, so the write counter has nothing local
+	// left to outrank and restarts inside a fresh incarnation. Its replicas do
+	// still hold the sequences the pre-restore incarnation assigned, though —
+	// which is why the incarnation epoch has to advance here rather than reset.
+	// Resetting the whole sequence to zero left every post-restore write below the
+	// versions the replicas held, so they discarded and ACKed them: the client saw
+	// 200 and the replica kept its pre-restore value, permanently. Advancing the
+	// epoch puts every post-restore write above everything the previous
+	// incarnation issued, which is the same guarantee a clean restart gets.
+	//
+	// The previous epoch is still in memory here, so unlike an open onto a
+	// recreated directory this does not have to fall back to the clock.
+	if err := l.openEpoch(l.now()); err != nil {
+		return err
+	}
+	l.seqNum.Store(epochFloor(l.epoch.Load()))
 	l.nextSST.Store(0)
 	l.walSeq.Store(0)
 	// The store is now empty; bulkLoadL0 sets the count from the payload it
@@ -1581,6 +1692,62 @@ func (l *LSMTree) flushMemtableDirect(mem *Memtable) error {
 
 // ---- Helpers ---------------------------------------------------------------
 
+// openEpoch establishes this open's incarnation epoch and records it durably,
+// before any write draws a sequence number from it.
+//
+// The epoch is the high field of every sequence this engine issues (see seq.go).
+// It is taken from the clock, or from one above the epoch the manifest recorded,
+// whichever is higher — so it advances whether or not local state survived, which
+// is the whole point: a data directory that was recreated has no recorded epoch
+// to read, and the clock is the only thing left that still orders this
+// incarnation after the last one.
+//
+// Recording it is what keeps two opens inside one second, or an open after the
+// clock has been stepped backwards, from reusing an epoch. The record is written
+// before the first write rather than at close, because a crash must not be able
+// to lose the epoch its writes were issued under.
+func (l *LSMTree) openEpoch(now time.Time) error {
+	recorded, hasRecorded := l.manifest.Epoch()
+
+	// The sequences already on disk are part of the record, not just the manifest
+	// note: a counter that carried into the epoch field issued sequences in epochs
+	// above the one this store opened with, and reusing an epoch below them would
+	// make this incarnation's writes look like a regression to its replicas.
+	// (A manifest that predates MaxSeqNum answers nothing here; such a directory
+	// carries epoch-0 sequences, which are below every epoch anyway, and
+	// seedSeqNum's scan still floors the counter.)
+	if storedMax, complete := l.manifest.MaxSeqNum(); complete {
+		if e := seqEpoch(storedMax); e > recorded || !hasRecorded {
+			recorded, hasRecorded = max(e, recorded), true
+		}
+	}
+
+	if prev := l.epoch.Load(); prev > 0 && (!hasRecorded || prev > recorded) {
+		// A restore reopens this engine in-process against a manifest it has just
+		// replaced, so the record of the previous incarnation is gone from disk and
+		// the only surviving copy is the one in memory. Preferring it is what makes
+		// a restore's epoch advance from the epoch it is replacing even when the
+		// clock cannot carry it.
+		recorded, hasRecorded = prev, true
+	}
+	epoch := nextEpoch(recorded, hasRecorded, now)
+	if err := l.manifest.SetEpoch(epoch); err != nil {
+		return fmt.Errorf("lsm: record incarnation epoch: %w", err)
+	}
+	l.epoch.Store(epoch)
+	if hasRecorded {
+		l.logger.Debug("lsm: incarnation epoch", "epoch", epoch, "previous", recorded)
+	} else {
+		// No recorded epoch means a data directory with no manifest: a genuinely
+		// new store, or one whose storage was replaced. They are
+		// indistinguishable from here, which is why the epoch comes from the
+		// clock — it orders this incarnation above the last one either way.
+		l.logger.Info("lsm: opened with no recorded incarnation epoch; stamping from the clock",
+			"epoch", epoch)
+	}
+	return nil
+}
+
 // seedSeqNum sets the write-sequence counter above every entry on disk, so that
 // writes made after a restart outrank the data they replace. See the call site in
 // NewLSMTree for what an unseeded counter costs.
@@ -1591,10 +1758,19 @@ func (l *LSMTree) flushMemtableDirect(mem *Memtable) error {
 // entries themselves — so those files are scanned once. It is a one-time cost per
 // data directory: every file this engine writes records the field, and the first
 // compaction replaces the whole live set with one file that has it.
+//
+// The result is floored at this incarnation's epoch, which is what covers the
+// case local state cannot: a store whose data directory was replaced has nothing
+// on disk to outrank, so every local answer here is near zero while its replicas
+// still hold the sequences its previous incarnation issued. The floor is also why
+// the scan is now a backstop rather than the mechanism — it can only raise the
+// counter above the floor, never below it.
 func (l *LSMTree) seedSeqNum() error {
+	floor := epochFloor(l.epoch.Load())
+
 	recorded, complete := l.manifest.MaxSeqNum()
 	if complete {
-		l.seqNum.Store(recorded)
+		l.seqNum.Store(max(recorded, floor))
 		return nil
 	}
 
@@ -1606,7 +1782,7 @@ func (l *LSMTree) seedSeqNum() error {
 	if scanned < recorded {
 		scanned = recorded
 	}
-	l.seqNum.Store(scanned)
+	l.seqNum.Store(max(scanned, floor))
 	l.logger.Warn("lsm: manifest predates per-SSTable sequence numbers; scanned to recover the write order",
 		"max_seq_num", scanned,
 		"entries_scanned", entries,

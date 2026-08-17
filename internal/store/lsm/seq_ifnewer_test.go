@@ -55,9 +55,11 @@ func TestPutIfNewer(t *testing.T) {
 	l := newIfNewerTree(t)
 	ctx := context.Background()
 
-	// Pad first: on a fresh engine the first write is sequence 1, and seq-1
-	// would then be 0 — which means "unsequenced, apply unconditionally" and
-	// would exercise the compatibility path instead of the comparison.
+	// Pad first: seq-1 has to be a real sequence rather than 0, which means
+	// "unsequenced, apply unconditionally" and would exercise the compatibility
+	// path instead of the comparison. (A fresh engine's first write is no longer
+	// sequence 1 — it starts at this incarnation's epoch floor, see seq.go — but
+	// padding keeps the test independent of that.)
 	for i := 0; i < 4; i++ {
 		if _, err := l.Put(ctx, "pad", []byte("v")); err != nil {
 			t.Fatalf("pad Put: %v", err)

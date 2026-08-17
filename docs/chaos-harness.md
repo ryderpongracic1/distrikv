@@ -444,6 +444,7 @@ exposed a real defect:
 | Convergence gate **FAIL** (stop-restart, 2/2 divergent) | WAL segment numbers reused across a graceful restart, so every persisted replica cursor addressed a different log and a pass that shipped nothing logged `replica caught up` | Seed segment numbering from every segment on disk, `wal-retained/` included — [defect 10](defect-log.md#defect-10-wal-segment-numbers-reused-across-a-graceful-restart) |
 | `converged: true` + linearizable **FAIL** (1 in 4) | The LSM sequence counter reopened at zero, so the first compaction merging across a restart boundary resolved "newer" backwards — resurrecting stale values and dropping winning tombstones | Record each SSTable's max sequence in the manifest and seed the counter above all of them at open — [defect 11](defect-log.md#defect-11-lsm-sequence-counter-reopened-at-zero) |
 | Capstone **PASS** 4/4 (stop-restart) + 2/2 (kill-restart) | — | — |
+| H2 gate **PASS** 5/5 (stop-restart ×4 + kill-restart control) | Per-key ordering closed: writes carry the primary's sequence, replicas apply-if-newer, replay is idempotent — [replication-and-anti-entropy.md](replication-and-anti-entropy.md#regression-gate) | — |
 
 The standing property is unchanged and is the point: **a FAIL is now a real
 consistency bug**, and the printed note says so instead of telling the operator to

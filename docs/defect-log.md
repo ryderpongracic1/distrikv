@@ -456,6 +456,10 @@ leaving them out would make the list look tidier than the work was:
   sequence is per-primary, so a ring rebalance would need an epoch or node-id
   tiebreak — is unreachable today and is written up in
   [replication-and-anti-entropy.md → What is guaranteed, and what is not](replication-and-anti-entropy.md#what-is-guaranteed-and-what-is-not).
+  Validated live 2026-08-17: the chaos gate passed 5/5 (stop-restart ×4 +
+  kill-restart control), all converged, zero indeterminate writes on SIGTERM —
+  results table in
+  [replication-and-anti-entropy.md → Regression gate](replication-and-anti-entropy.md#regression-gate).
 
 ---
 

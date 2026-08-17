@@ -310,6 +310,26 @@ harness itself needs no modification — it already compares each node's local r
 per key (`?local=true`) and reports the divergent ones, which is exactly the
 property this change makes hold.
 
+**The gate was run and passed, 5/5 (2026-08-17, Apple M4 Pro, Colima VM 8 CPU /
+8 GB, fresh volumes).** Four consecutive `stop-restart` runs plus the
+`kill-restart` control, all against the merged sequence-carrying build:
+
+| Run | Nemesis | Ops | Errors | Refused-but-applied | Converged | Indeterminate | Verdict |
+| ---: | --- | ---: | ---: | ---: | --- | ---: | --- |
+| 1 | stop-restart | 291,338 | 84,909 | 20,058 | **true** (3.784 s) | 0 | **PASS** |
+| 2 | stop-restart | 280,077 | 65,588 | 18,632 | **true** (1.096 s) | 0 | **PASS** |
+| 3 | stop-restart | 285,183 | 64,161 | 23,577 | **true** (2.721 s) | 0 | **PASS** |
+| 4 | stop-restart | 302,195 | 91,617 | 24,120 | **true** (3.827 s) | 0 | **PASS** |
+| control | kill-restart | 279,222 | 68,456 | 18,130 | **true** (4.895 s) | 5 | **PASS** |
+
+`anti_entropy_full_sync_required` and `anti_entropy_stale` were 0 on all three
+nodes after all five runs. The dedup arithmetic held at scale: across the five
+runs the primaries shipped 373 catch-up entries against ~104,000
+refused-but-applied writes — the per-key deduplication doing exactly what it
+claims. Each gate run put its victims through two graceful restarts, so the WAL v2
+sequence records were exercised across eight replica restarts without a single
+stale cursor or full-sync latch.
+
 **Bounded recovery — and the claim is withheld, not just annotated.** If the log no
 longer reaches back far enough to cover what a replica missed, the gap cannot be
 closed from the log. The pass says so (counted as `anti_entropy_stale`) and then

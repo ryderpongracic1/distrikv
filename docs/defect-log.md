@@ -629,6 +629,15 @@ exactly (two spurious warnings and one spurious recovery from a three-entry
 history), always calling `Apply` fails the frontier pin, and always calling
 `ReplayApply` fails the live assertions.
 
+Validated live 2026-08-18 on the fixed build (Apple M4 Pro): after a gate run
+left four fault windows' worth of down/up pairs in the committed log, restarting
+node1 produced **zero** "consensus marked peer unhealthy" warnings — the replay
+walked the full history silently. Minutes later, the same freshly-restarted node
+announced a *live* node2 transition normally, at the same index and term its
+peers logged — replay silent, live announced, on one node in one session. The
+stop-restart gate on the same build: PASS, `converged: true` in 2.75s, zero
+indeterminate writes.
+
 ---
 
 ## Smaller findings

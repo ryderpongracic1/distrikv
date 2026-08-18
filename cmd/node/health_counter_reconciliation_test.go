@@ -157,6 +157,9 @@ func oneFaultCycle(t *testing.T, h *raftHarness, leader *healthNode, victimID st
 	awaitHealth(t, leader, victimID, true, 3*time.Second)
 }
 
+// reconcileFaults is the number of fault cycles the reconciliation test drives.
+const reconcileFaults = 3
+
 // TestHealthTransitionCountersReconcileWithTheLog is the pin for what the two
 // counters mean.
 //
@@ -171,24 +174,44 @@ func oneFaultCycle(t *testing.T, h *raftHarness, leader *healthNode, victimID st
 // HealthTransitionsCommitted increment above the self/unknown-op early returns
 // and the same assertion fails.
 func TestHealthTransitionCountersReconcileWithTheLog(t *testing.T) {
-	h := newRaftHarness(t, healthAggregatorConfig{DownAfter: 3, UpAfter: 2})
-	leader, followers := h.leader(5 * time.Second)
+	// The invariants below only hold when one node leads for the whole run.
+	// A victim rejoining from isolation can legitimately start a catch-up
+	// election and move leadership (observed on fast hardware — the same
+	// scheduling sensitivity TestConsensusHealthReachesANonLeader hit), which
+	// invalidates the premise, not the product. Counters are cumulative per
+	// harness, so a violated premise means a fresh harness, not a re-run on
+	// the same one.
+	const attempts = 3
+	var (
+		h                         *raftHarness
+		leader, victim, bystander *healthNode
+	)
+	for attempt := 1; ; attempt++ {
+		h = newRaftHarness(t, healthAggregatorConfig{DownAfter: 3, UpAfter: 2})
+		var followers []*healthNode
+		leader, followers = h.leader(5 * time.Second)
 
-	victim := followers[0]
-	bystander := followers[1]
+		victim = followers[0]
+		bystander = followers[1]
 
-	const faults = 3
-	for i := 0; i < faults; i++ {
-		oneFaultCycle(t, h, leader, victim.id)
+		for i := 0; i < reconcileFaults; i++ {
+			oneFaultCycle(t, h, leader, victim.id)
+		}
+		settleAppliesQuiet(t, h, 250*time.Millisecond, 10*time.Second)
+
+		// Leadership must not have moved, or "the leader proposed every entry"
+		// is not the invariant under test. This is the premise the live-cluster
+		// arithmetic assumed and could not check.
+		if h.nodes[leader.id].raft.IsLeader() {
+			break
+		}
+		if attempt == attempts {
+			t.Fatalf("%s lost leadership in all %d attempts; either the harness is too "+
+				"unstable for this invariant or elections are genuinely storming", leader.id, attempts)
+		}
+		t.Logf("attempt %d: %s lost leadership mid-run (catch-up election after heal); retrying with a fresh harness", attempt, leader.id)
 	}
-	settleAppliesQuiet(t, h, 250*time.Millisecond, 10*time.Second)
-
-	// Leadership must not have moved, or "the leader proposed every entry" is not
-	// the invariant under test. This is the premise the live-cluster arithmetic
-	// assumed and could not check.
-	if got := h.nodes[leader.id].raft.IsLeader(); !got {
-		t.Fatalf("%s is no longer the leader; this test's invariant does not apply", leader.id)
-	}
+	const faults = reconcileFaults
 
 	onDisk := readPersistedHealthLog(t, leader.dataDir)
 	if onDisk.other != 0 {

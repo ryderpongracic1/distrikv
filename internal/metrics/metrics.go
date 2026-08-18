@@ -133,7 +133,25 @@ type Metrics struct {
 	// "the log is empty and the local signals are carrying health on their own" —
 	// the state this system was in for three months without noticing. Every node
 	// increments it, leader or not: that is the point of the feature.
+	//
+	// It is not comparable to HealthTransitionsProposed on the same node. See
+	// RaftLastAppliedIndex for the number that makes both of them checkable, and
+	// docs/raft.md → Observables for the four reasons they diverge.
 	HealthTransitionsCommitted atomic.Uint64
+
+	// RaftLastAppliedIndex is the highest Raft log index this node has applied to
+	// its state machine.
+	//
+	// It exists so the two counters above can be reconciled instead of compared
+	// to each other. Because the Raft log carries health transitions only, this
+	// index *is* the number of entries the cluster has ever committed — so a
+	// reader can check HealthTransitionsCommitted against the log rather than
+	// against another counter, which is what a live 16-proposed/32-committed
+	// reading could not be checked against at the time.
+	//
+	// A gauge, not a counter: it is overwritten with each applied index and never
+	// decreases while a node is up.
+	RaftLastAppliedIndex atomic.Uint64
 
 	// --- LSM engine counters (Phase 1 benchmark harness) -------------------
 
@@ -226,6 +244,7 @@ func (m *Metrics) Snapshot() map[string]uint64 {
 		"anti_entropy_full_sync_required": m.AntiEntropyFullSyncRequired.Load(),
 		"health_transitions_proposed":     m.HealthTransitionsProposed.Load(),
 		"health_transitions_committed":    m.HealthTransitionsCommitted.Load(),
+		"raft_last_applied_index":         m.RaftLastAppliedIndex.Load(),
 		"bloom_hits":                      m.BloomHits.Load(),
 		"bloom_misses":                    m.BloomMisses.Load(),
 		"bloom_false_positives":           m.BloomFalsePositives.Load(),

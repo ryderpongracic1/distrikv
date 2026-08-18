@@ -558,6 +558,66 @@ leaving them out would make the list look tidier than the work was:
 
 ---
 
+## Investigated and not a defect
+
+Recorded because the reasoning is the useful part, and because the next reader of
+a chaos gate will ask the same question. Deliberately **not** counted in the
+thirteen: nothing here was broken.
+
+### The health-transition counters did not appear to reconcile (2026-08-18)
+
+**The reading.** After four consecutive stop-restart gates, node1 —
+the node the nemesis never touched — reported
+`health_transitions_proposed=16` and `health_transitions_committed=32`. An exact
+2×, against an expectation of 16 faults × (one down + one up) = 32 entries all
+proposed by that node. A repo whose claim is that its numbers reconcile cannot
+leave that alone.
+
+**Three hypotheses, in cost order.** (1) `committed` double-counts, i.e. `Apply`
+runs twice per entry on a node — `applyCommitted` has three callers racing each
+other. (2) `proposed` under-counts, i.e. a transition reaches the log without
+passing the metric. (3) The arithmetic is wrong.
+
+**What an in-process repro measured.** A 3-node cluster with the real state
+machine and the real aggregator, one fault cycle per iteration, counting the
+entries **on disk** rather than one counter against the other:
+
+- 3 faults → 6 entries in the persisted log (3 `health-down`, 3 `health-up`),
+  `proposed=6` on the leader, `committed=6/6/0` on leader/bystander/victim.
+- (1) **refuted**: an entry applies exactly once per node, under concurrent
+  triggers, with `-race`.
+- (2) **refuted**: the leader's `proposed` equals its log length exactly.
+- (3) **held.** The victim's 0 is the first clue: a node does not count
+  transitions about itself. The counters have different denominators, so
+  `proposed` and `committed` on one node were never comparable.
+
+**What the live 2× therefore means.** `committed=32` with `proposed=16` says
+node1's log held entries node1 did not author — which requires leadership to have
+moved, or the process to have restarted onto an existing log (`lastApplied` is
+volatile, so a restart re-applies and re-counts the whole log while the in-memory
+`proposed` starts at zero — that one produces exact multiples). The counter used
+to rule the first out does not measure it: `raft_terms` counts elections this node
+**started** (`internal/raft/raft.go:377`) and `leader_elections` the ones it
+**won** (`raft.go:509`), and a node that steps down on a peer's higher term
+increments neither.
+
+**What changed.** No metric was wrong, so no metric was fixed. What was missing
+was the denominator: nothing recorded the log's length, so `committed` could only
+be compared against another counter. `raft_last_applied_index` now exposes it —
+the log carries health transitions only, so the highest applied index *is* the
+number of entries the cluster has committed. Semantics and a reading recipe are in
+[raft.md → Observables](raft.md), and the four invariants are pinned in
+`cmd/node/health_counter_reconciliation_test.go`, each revert-checked.
+
+**The honest residual.** The specific cause of *that* session's numbers cannot be
+recovered — the container logs that would have named the leader per term are gone.
+What is established is that both counters are individually correct against the
+log, and that the comparison which flagged them is not a valid one. The
+instrumentation added here is what makes the next such reading answerable in one
+`curl` instead of an investigation.
+
+---
+
 ## Recently closed
 
 - **Per-key write ordering** was listed here as a known limit rather than a defect:

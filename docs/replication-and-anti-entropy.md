@@ -107,6 +107,28 @@ probe still enqueues a pass through the recovered channel, and a pass itself
 consults no health signal at all. The cost of a frozen view is a delay in the
 slowest of the four paths, never a missed convergence.
 
+**The pure twist: where it stands.** The end state for the design is Raft alone
+carrying node health, with no dedicated probing machinery — the probe deleted, not
+merely defaulted off. Two instruments for the evidence that requires have landed:
+a [`leader-kill` nemesis](chaos-harness.md#leader-kill-forcing-a-leaderless-window-under-load),
+which produces the leaderless-window-under-load case no gate had ever exercised,
+and `HEALTH_PROBE_INTERVAL=0`, which stops the probe ticker so a gate can run in
+the exact post-removal configuration without deleting anything. The gates
+themselves are **pending**; nothing has been removed and no default has changed.
+
+One design question is deliberately left open until those gates report, because
+answering it from an argument is what the instruments exist to avoid: under an
+**asymmetric partition**, the leader marks a peer down from its own vantage and
+commits that cluster-wide, while a ring-primary that can still reach that peer
+perfectly well has its retry loop gated by someone else's view. Today the local
+probe can contradict that; after removal it could not. The two honest options are
+to accept leader-vantage health (the gated retry self-heals once the leader's view
+catches up, and the write path was never gated at all), or to keep replication-RPC
+outcomes as a local veto **in the healthy direction only** — a node that has just
+replicated to a peer successfully may treat it as reachable regardless of
+consensus. Which one to take is a decision to make with gate evidence in hand, not
+before.
+
 Three things also schedule a pass: a replica still marked behind is retried every
 `RetryInterval` (5 s), a durable cursor behind the tip at startup queues one
 immediately, and either recovery channel — local or consensus — queues one on the

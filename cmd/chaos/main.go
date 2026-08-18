@@ -39,6 +39,36 @@
 // that produced it. The nemesis never runs during warmup, and any victim it
 // takes down is healed before the process exits.
 //
+// # leader-kill
+//
+// --nemesis=leader-kill resolves the current Raft leader over /status before
+// each fault window and stops that node, forcing a re-election while writes are
+// still flowing. It is the only mode that produces a leaderless window under
+// load — every other gate takes down a follower — which makes it the
+// discriminating case for the planned removal of the transport probe:
+//
+//	go run ./cmd/chaos \
+//	  --target            localhost:8001 \
+//	  --peers             localhost:8002,localhost:8003 \
+//	  --duration          60s \
+//	  --nemesis           leader-kill \
+//	  --nemesis-services  node1,node2,node3 \
+//	  --nemesis-interval  10s \
+//	  --nemesis-downtime  5s \
+//	  --check-convergence
+//
+// Three things to know before reading its output, all argued in leaderkill.go
+// and docs/chaos-harness.md:
+//
+//   - --peers is required, because the leader has to be identified from the
+//     cluster rather than assumed to be --target.
+//   - Pass every member to --nemesis-services. That list is a fence, not a
+//     rotation: the victim is always the resolved leader, and a leader outside
+//     the list makes the window skip rather than redirecting the kill.
+//   - The runner's own --target may be the node that dies. Operations fail for
+//     the duration of that outage, and are recorded as errors and indeterminate
+//     writes, which the checker already models.
+//
 // # Linearizability check
 //
 // The per-key PartitionEvent optimisation in the KVModel means Porcupine
@@ -101,8 +131,8 @@ func main() {
 		output       = flag.String("output", "table", "output format: table|json")
 		cxFile       = flag.String("counterexample-file", "", "where to write the counterexample on FAIL (default: chaos-counterexample-<timestamp>.json; \"none\" disables)")
 
-		nemesisMode     = flag.String("nemesis", nemesisNone, "fault injection during measurement: none|kill-restart|stop-restart")
-		nemesisServices = flag.String("nemesis-services", "", "comma-separated compose service names to draw victims from (required unless --nemesis=none)")
+		nemesisMode     = flag.String("nemesis", nemesisNone, "fault injection during measurement: none|kill-restart|stop-restart|leader-kill")
+		nemesisServices = flag.String("nemesis-services", "", "comma-separated compose service names to draw victims from (required unless --nemesis=none; for leader-kill it is the set the kill must stay inside, so pass every member)")
 		nemesisInterval = flag.Duration("nemesis-interval", 10*time.Second, "delay between the end of one outage and the start of the next")
 		nemesisDowntime = flag.Duration("nemesis-downtime", 5*time.Second, "how long a victim stays down")
 		nemesisCompose  = flag.String("nemesis-compose-file", "docker/docker-compose.yml", "compose file the nemesis operates on")
@@ -131,6 +161,17 @@ func main() {
 		os.Exit(3)
 	}
 
+	// leader-kill has to ask the cluster who leads, so it needs every node's
+	// client address. Checked here, with the other flag validation, so a bad
+	// invocation fails on its own terms rather than on whatever docker says
+	// first.
+	nodeAddrs := parseNodeAddrs(*target, *peers)
+	if ncfg.Mode == nemesisLeaderKill && len(nodeAddrs) < 2 {
+		fmt.Fprintln(os.Stderr, "error: --nemesis=leader-kill requires --peers "+
+			"(every other node's client HTTP address) so the current leader can be resolved")
+		os.Exit(3)
+	}
+
 	// Build the nemesis and prove it works before any load is issued: a nemesis
 	// that cannot reach docker would otherwise turn the run into a no-fault run
 	// that passes for the wrong reason.
@@ -154,6 +195,33 @@ func main() {
 			Interval: ncfg.Interval,
 			Downtime: ncfg.Downtime,
 			Logf:     log.Printf,
+		}
+
+		// leader-kill needs to ask the cluster who leads, per fault window. It
+		// resolves over the same node addresses the convergence check uses, so
+		// --peers is required: with only the target's address, a leader that is
+		// not the target could only be identified from the target's own view of
+		// it, which lags its actual loss.
+		if ncfg.Mode == nemesisLeaderKill {
+			resolver := newLeaderResolver(nodeAddrs, &http.Client{Timeout: 5 * time.Second})
+
+			// Prove the mode can work before any load is issued, for the same
+			// reason the nemesis has a Preflight at all: a run whose every window
+			// skips is a run that tested nothing while reporting PASS.
+			lctx, lcancel := context.WithTimeout(context.Background(), 2*nemesisCommandTimeout)
+			services, servicesErr := nem.definedServices(lctx)
+			if servicesErr != nil {
+				lcancel()
+				fmt.Fprintf(os.Stderr, "error: nemesis preflight failed: %v\n", servicesErr)
+				os.Exit(3)
+			}
+			leaderErr := preflightLeaderKill(lctx, resolver, services)
+			lcancel()
+			if leaderErr != nil {
+				fmt.Fprintf(os.Stderr, "error: nemesis preflight failed: %v\n", leaderErr)
+				os.Exit(3)
+			}
+			scheduler.SelectVictim = leaderVictimSelector(resolver, ncfg.Services, log.Printf)
 		}
 	}
 
@@ -543,6 +611,11 @@ type faultWindowReport struct {
 	DownMs         *int64  `json:"down_ms"`
 	DisruptError   string  `json:"disrupt_error,omitempty"`
 	HealError      string  `json:"heal_error,omitempty"`
+
+	// Skipped is the reason no victim was disrupted in this window, present only
+	// for a window that was skipped. Its victim is empty, because none was
+	// chosen.
+	Skipped string `json:"skipped,omitempty"`
 }
 
 // faultWindowReports converts recorded windows to their JSON shape, with
@@ -561,6 +634,7 @@ func faultWindowReports(windows []FaultWindow, start time.Time) []faultWindowRep
 			Healed:         w.Healed(),
 			DisruptError:   w.DisruptErr,
 			HealError:      w.HealErr,
+			Skipped:        w.Skipped,
 		}
 		if !w.UpAt.IsZero() {
 			upAt := w.UpAt.Format(time.RFC3339Nano)
@@ -576,11 +650,20 @@ func faultWindowReports(windows []FaultWindow, start time.Time) []faultWindowRep
 }
 
 // formatFaultWindows renders one line per outage for the table report.
+//
+// The victim is printed per window rather than taken from the flags, so a mode
+// that resolves its victim at strike time — leader-kill — shows which node it
+// actually took down each time instead of a static name.
 func formatFaultWindows(windows []FaultWindow, start time.Time) []string {
 	lines := make([]string, 0, len(windows))
 	for i, w := range windows {
 		offset := func(t time.Time) string {
 			return fmt.Sprintf("+%s", t.Sub(start).Round(100*time.Millisecond))
+		}
+		if w.Skipped != "" {
+			lines = append(lines, fmt.Sprintf("#%-3d %-12s at %-8s SKIPPED — %s",
+				i+1, "(none)", offset(w.DownAt), w.Skipped))
+			continue
 		}
 		up := "NEVER HEALED"
 		if !w.UpAt.IsZero() {

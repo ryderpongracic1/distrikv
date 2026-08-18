@@ -16,7 +16,15 @@ const (
 	nemesisNone        = "none"
 	nemesisKillRestart = "kill-restart"
 	nemesisStopRestart = "stop-restart"
+
+	// nemesisLeaderKill stops and restarts whichever node currently holds Raft
+	// leadership, re-resolved per fault window. See leaderkill.go for the design
+	// and for why it never falls back to a non-leader.
+	nemesisLeaderKill = "leader-kill"
 )
+
+// nemesisModes lists every accepted --nemesis value, for error messages.
+var nemesisModes = []string{nemesisNone, nemesisKillRestart, nemesisStopRestart, nemesisLeaderKill}
 
 // nemesisCommandTimeout bounds a single docker invocation. A `compose kill` is
 // near-instant and a `compose start` is a container start, so anything past
@@ -56,12 +64,22 @@ type FaultWindow struct {
 	UpAt       time.Time // zero if the victim was never successfully healed
 	DisruptErr string    // non-empty if Disrupt returned an error
 	HealErr    string    // non-empty if Heal returned an error
+
+	// Skipped is non-empty when the scheduler declined to inject this window
+	// because it could not choose a victim it was willing to act on — a
+	// leaderless cluster, or a leader outside the kill set.
+	//
+	// A skipped window is recorded rather than dropped so that a run which
+	// injected fewer faults than it attempted says so. Silently not injecting is
+	// the one failure mode that looks like a passing chaos run.
+	Skipped string
 }
 
-// Injected reports whether Disrupt returned success. A window whose Disrupt
-// failed is still recorded — the failure is worth seeing — but it is not an
-// outage and must not be counted as one.
-func (w FaultWindow) Injected() bool { return w.DisruptErr == "" }
+// Injected reports whether this window is an actual outage: Disrupt was attempted
+// and returned success. A window whose Disrupt failed, and a window that was
+// skipped before any victim was chosen, are both recorded — the fact is worth
+// seeing — but neither is an outage and neither may be counted as one.
+func (w FaultWindow) Injected() bool { return w.DisruptErr == "" && w.Skipped == "" }
 
 // Healed reports whether the victim was brought back up. UpAt is only set on a
 // successful heal, so an unhealed window carries no up-at time at all rather
@@ -95,6 +113,18 @@ type Scheduler struct {
 
 	// Rand selects victims. Nil means a time-seeded source.
 	Rand *rand.Rand
+
+	// SelectVictim chooses the victim for the next fault window. Nil means a
+	// uniform random pick from Victims, which is what the stop-restart and
+	// kill-restart modes want.
+	//
+	// A mode whose victim depends on cluster state — leader-kill — supplies this
+	// instead, and is re-consulted for every window so that leadership moving
+	// between windows is picked up. Returning an error skips the window: the
+	// scheduler records the reason and waits out the cycle rather than picking
+	// someone else, because a nemesis that quietly redirects its fault is a
+	// nemesis whose report cannot be trusted.
+	SelectVictim func(ctx context.Context) (string, error)
 
 	// HealTimeout bounds a single nemesis command (disrupt or heal), each of
 	// which runs on a context detached from the run context. Zero means 30s.
@@ -139,7 +169,22 @@ func (s *Scheduler) Run(ctx context.Context) {
 			return
 		}
 
-		victim := s.Victims[rng.Intn(len(s.Victims))]
+		victim, err := s.pickVictim(ctx, rng)
+		if err != nil {
+			// Record the skip and hold the cadence. Waiting out Downtime and
+			// Interval anyway keeps the fault schedule of a run with skips
+			// comparable to one without: the windows line up at the same offsets,
+			// which is what makes two gate runs readable side by side.
+			s.recordSkip(err)
+			s.logf("nemesis: fault window SKIPPED — %v", err)
+			if !sleep(ctx, s.Downtime) {
+				return
+			}
+			if !sleep(ctx, s.Interval) {
+				return
+			}
+			continue
+		}
 
 		outstanding = s.beginWindow(victim)
 		outstandingVictim = victim
@@ -216,6 +261,21 @@ func (s *Scheduler) beginWindow(victim string) int {
 	return len(s.windows) - 1
 }
 
+// pickVictim chooses who to disrupt next, deferring to SelectVictim when set.
+func (s *Scheduler) pickVictim(ctx context.Context, rng *rand.Rand) (string, error) {
+	if s.SelectVictim != nil {
+		return s.SelectVictim(ctx)
+	}
+	return s.Victims[rng.Intn(len(s.Victims))], nil
+}
+
+// recordSkip records a window that was never injected, with the reason.
+func (s *Scheduler) recordSkip(reason error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.windows = append(s.windows, FaultWindow{DownAt: time.Now(), Skipped: reason.Error()})
+}
+
 func (s *Scheduler) setDisruptErr(idx int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -275,7 +335,7 @@ type composeNemesis struct {
 }
 
 // newComposeNemesis builds a nemesis for mode, which must be one of the
-// nemesis*Restart constants.
+// nemesis*Restart constants or nemesisLeaderKill.
 func newComposeNemesis(mode, composeFile string) (*composeNemesis, error) {
 	var downCmd string
 	switch mode {
@@ -283,9 +343,15 @@ func newComposeNemesis(mode, composeFile string) (*composeNemesis, error) {
 		downCmd = "kill"
 	case nemesisStopRestart:
 		downCmd = "stop"
+	case nemesisLeaderKill:
+		// SIGTERM, matching stop-restart: the point of this mode is the
+		// leaderless window, not a torn connection, and using the graceful stop
+		// keeps indeterminate writes down so a linearizability failure is
+		// attributable to the election rather than to unknown-outcome writes.
+		downCmd = "stop"
 	default:
-		return nil, fmt.Errorf("unknown nemesis mode %q (want %s, %s or %s)",
-			mode, nemesisNone, nemesisKillRestart, nemesisStopRestart)
+		return nil, fmt.Errorf("unknown nemesis mode %q (want %s)",
+			mode, strings.Join(nemesisModes, ", "))
 	}
 	if strings.TrimSpace(composeFile) == "" {
 		return nil, fmt.Errorf("--nemesis-compose-file must not be empty")
@@ -313,11 +379,11 @@ func (n *composeNemesis) Preflight(ctx context.Context, victims []string) error 
 	if _, err := n.compose(ctx, "ps"); err != nil {
 		return err
 	}
-	out, err := n.compose(ctx, "config", "--services")
+	out, err := n.definedServices(ctx)
 	if err != nil {
 		return err
 	}
-	defined := parseServiceList(string(out))
+	defined := out
 	var unknown []string
 	for _, v := range victims {
 		if !slices.Contains(defined, v) {
@@ -329,6 +395,17 @@ func (n *composeNemesis) Preflight(ctx context.Context, victims []string) error 
 			n.file, strings.Join(unknown, ", "), strings.Join(defined, ", "))
 	}
 	return nil
+}
+
+// definedServices lists the services the compose file declares. Split out of
+// Preflight because leader-kill needs the same list to check that the node ID
+// the cluster reports as leader is a service this nemesis can address.
+func (n *composeNemesis) definedServices(ctx context.Context) ([]string, error) {
+	out, err := n.compose(ctx, "config", "--services")
+	if err != nil {
+		return nil, err
+	}
+	return parseServiceList(string(out)), nil
 }
 
 // compose runs `docker compose -f <file> <args...>`.
@@ -380,6 +457,13 @@ func (c nemesisConfig) Describe() string {
 	if !c.Enabled() {
 		return nemesisNone
 	}
+	if c.Mode == nemesisLeaderKill {
+		// "among" rather than "on": the victim is the current leader, and the
+		// service list is the fence the kill must stay inside, not the set the
+		// faults are spread over.
+		return fmt.Sprintf("%s among [%s] interval=%s downtime=%s",
+			c.Mode, strings.Join(c.Services, ","), c.Interval, c.Downtime)
+	}
 	return fmt.Sprintf("%s on [%s] interval=%s downtime=%s",
 		c.Mode, strings.Join(c.Services, ","), c.Interval, c.Downtime)
 }
@@ -398,9 +482,9 @@ func parseNemesisFlags(mode, services, composeFile string, interval, downtime ti
 		}
 		return nemesisConfig{Mode: nemesisNone}, nil
 	}
-	if mode != nemesisKillRestart && mode != nemesisStopRestart {
-		return nemesisConfig{}, fmt.Errorf("unknown --nemesis %q (want %s, %s or %s)",
-			mode, nemesisNone, nemesisKillRestart, nemesisStopRestart)
+	if mode != nemesisKillRestart && mode != nemesisStopRestart && mode != nemesisLeaderKill {
+		return nemesisConfig{}, fmt.Errorf("unknown --nemesis %q (want %s)",
+			mode, strings.Join(nemesisModes, ", "))
 	}
 	if len(victims) == 0 {
 		return nemesisConfig{}, fmt.Errorf("--nemesis=%s requires --nemesis-services (comma-separated compose service names)", mode)

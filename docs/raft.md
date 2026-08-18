@@ -45,7 +45,19 @@ This is the log's producer, and the reason the log exists.
 
 - **An unrecognised op succeeds.** Raft retries a failed `Apply` rather than skipping it, so returning an error for an entry from a future version would wedge the apply loop forever and freeze the health view of every node that received it.
 
-- **Observables.** `health_transitions_proposed` is non-zero on exactly one node at a time and identifies whose observations the current view came from; `health_transitions_committed` moves on every node, and is what distinguishes "the consensus signal is live" from "the log is empty and the local signals are carrying health on their own" — the state this system was in, unnoticed, for three months.
+- **Observables, and how to read them together.** The three counters are scoped differently on purpose, and comparing two of them on one node is not a reconciliation:
+
+  | Metric | Counts |
+  | --- | --- |
+  | `health_transitions_proposed` | Entries **this node appended** while it was leader. Non-zero on exactly one node at a time, so it identifies whose observations the current view came from. It counts local appends, so it also counts an entry an isolated leader wrote that a later leader truncated |
+  | `health_transitions_committed` | Health entries **this node applied** from the committed log, whoever proposed them — excluding entries about itself, and including entries that restate the view |
+  | `raft_last_applied_index` | The highest log index this node has applied. Because the log carries health transitions and nothing else, this *is* the number of entries the cluster has ever committed |
+
+  So the number to check `committed` against is `raft_last_applied_index`, never `proposed`. On a healthy 3-node cluster with one leader for the whole session, `proposed` on the leader equals the index, and `committed` equals the index minus the entries about the reading node — which is zero for a node no leader ever marked down.
+
+  Four things make `committed` and `proposed` diverge on one node, none of them a fault: leadership moving (entries this node applied but did not author), an isolated leader's truncated appends (`proposed` counted, never committed by anyone), entries about the reading node (applied by others, skipped here), and a **restart** — `commitIndex` and `lastApplied` are volatile, so a node that comes up to an existing log re-applies it and counts the whole thing, while its in-memory `proposed` starts again at zero. That last one alone can make `committed` an exact multiple of `proposed`.
+
+  The counters that do *not* settle the question: `raft_terms` counts the elections this node **started** (`internal/raft/raft.go:377`) and `leader_elections` the ones it **won** (`raft.go:509`). Neither moves when a node steps down on a peer's higher term, so a flat `raft_terms` is not evidence that leadership never moved. All of this is pinned in `cmd/node/health_counter_reconciliation_test.go`.
 
 - **The transport probe stays.** `cluster.PeerHealth`'s local signals are kept and the consensus view is added as a fourth signal, not a replacement. A consensus-backed view freezes during a leaderless window — no leader, no new committed entries — and the local signals are what cover it. Making the twist pure, with Raft alone carrying node health, is a documented future goal rather than this change; the discriminating test below is the evidence that removal would be safe, not the removal itself.
 

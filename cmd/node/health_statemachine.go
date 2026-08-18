@@ -101,6 +101,16 @@ func newHealthStateMachine(selfID string, peerCount int, m *metrics.Metrics, log
 // wedge the apply loop and freeze the health view of every node that received
 // it.
 func (h *HealthStateMachine) Apply(_ context.Context, entry raft.LogEntry) error {
+	// Recorded before every early return below, and for every op: this gauge
+	// describes how far through the log this node is, not what the health view
+	// says. It is the denominator HealthTransitionsCommitted has to be read
+	// against — see metrics.RaftLastAppliedIndex. A plain Store is correct because
+	// Raft's apply loop is serialised and hands entries over in index order, so
+	// the last write is the highest index.
+	if h.metrics != nil {
+		h.metrics.RaftLastAppliedIndex.Store(entry.Index)
+	}
+
 	var healthy bool
 	switch entry.Op {
 	case opHealthDown:

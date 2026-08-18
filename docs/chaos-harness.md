@@ -102,8 +102,8 @@ reported as `heal error` on the window.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--nemesis` | `none` | `none` \| `kill-restart` \| `stop-restart` |
-| `--nemesis-services` | *(empty)* | Comma-separated compose service names to draw victims from. Required unless `--nemesis=none` |
+| `--nemesis` | `none` | `none` \| `kill-restart` \| `stop-restart` \| `leader-kill` |
+| `--nemesis-services` | *(empty)* | Comma-separated compose service names to draw victims from. Required unless `--nemesis=none`. For `leader-kill` it is the set the kill must stay **inside** rather than the set faults rotate over — see [Leader-kill](#leader-kill-forcing-a-leaderless-window-under-load) |
 | `--nemesis-interval` | `10s` | Delay between the end of one outage and the start of the next |
 | `--nemesis-downtime` | `5s` | How long a victim stays down |
 | `--nemesis-compose-file` | `docker/docker-compose.yml` | Compose file the nemesis operates on |
@@ -676,6 +676,88 @@ can have, each asserted by running a hand-built history through the checker:
 | `TestCounterexampleIsNilForALegalHistory` | Nothing to localise reads as nothing, rather than as the first key |
 | `TestCounterexampleLabelsHowEachOpWasModelled` | Every modelling class — ok, refused-applied, no-op, pending, failed read — is labelled in the report |
 | `TestCounterexampleWindowIsBounded` | The printed window is capped and centred on the frontier, and its omission counts add up to the full operation list |
+
+---
+
+## Leader-kill: forcing a leaderless window under load
+
+`--nemesis=leader-kill` resolves whichever node currently holds Raft leadership
+and stops it, re-resolving before every fault window.
+
+### What it exercises that nothing else did
+
+Every gate up to now passed `--nemesis-services node2,node3` while node1 held
+leadership, so a **leaderless window under fault load had never been tested**:
+no run had ever taken the leader out while writes were flowing and a replica was
+behind. That window is the one state in which the consensus health signal cannot
+make progress — no leader, no committed health entry — which makes it the
+discriminating case for the planned removal of the transport probe. Until it is
+exercised, "the local signals cover the leaderless window" is an argument, not a
+measurement.
+
+### The design decision: it kills the leader or it kills nothing
+
+The hard part is that the runner's own `--target` may be the leader. Two
+behaviours were available — re-resolve and kill whoever leads, accepting that the
+target may die; or keep the kill inside `--nemesis-services` and fall back to
+another member when the leader is outside that set.
+
+This harness takes the first, with the service list kept as a **fence rather than
+a fallback**: the victim is always the resolved leader, and a leader outside the
+list makes the window *skip*, reported as a skip. A fallback would let a mode
+named leader-kill produce a full run of green windows without ever taking a leader
+down — a passing gate that tested nothing, which is the same silent degradation
+`Preflight` already exists to prevent. A skipped window is visible in three
+places: the log line, the `faults injected: N of M attempted` count, and its own
+row in the fault-window table. A misdirected kill is visible nowhere.
+
+The cost is real and accepted: when the target is the leader, the runner's
+operations fail for that outage. It is already modelled — failed operations are
+recorded as errors, and a write whose outcome is unknown becomes a pending
+operation the checker may place anywhere.
+
+### How the leader is resolved
+
+Over `GET /status`, in this order:
+
+1. **A node's own claim** (`role: "leader"`). The strongest evidence available:
+   the node that will be killed is the node that made the claim. On the split view
+   a partition can produce — two nodes claiming leadership in different terms —
+   the higher term wins, because the lower one has not yet learned it was
+   superseded.
+2. **Unanimous peer report.** If no node claims leadership but every reachable
+   node names the same leader, that is used. Weaker, since a follower's view can
+   lag, and it only arises when the leader's own HTTP address was not supplied.
+3. **Neither → the window is skipped.** Resolution retries for 3s first, so a
+   cluster merely mid-election is waited out rather than skipped.
+
+Two consequences worth stating plainly. `--peers` is **required**, because the
+leader has to be identified from the cluster rather than assumed to be the target.
+And the mode addresses nodes by compose service name while `/status` reports a
+Raft node ID: in this stack they are equal by design, and preflight fails the run
+at startup if they are not, rather than letting every window skip.
+
+The fault-window table prints the victim recorded per window, so a `leader-kill`
+run names the node it actually took down each time instead of a static list.
+
+### The P2 gate (pending)
+
+The instruments are landed; the evidence is not collected yet. The gate for
+probe removal is the existing suite plus the new mode, run with the probe
+**disabled** — uncomment `HEALTH_PROBE_INTERVAL: "0"` on all three services in
+`docker/docker-compose.yml`, which stops the probe ticker without deleting
+anything:
+
+- `stop-restart` 4/4 — `linearizable: PASS`, `converged: true`
+- `kill-restart` control — the path that already worked must not regress
+- `leader-kill` 4/4 — plus `raft_terms` recovering to a flat value after each
+  forced election, and convergence times still in seconds
+
+A convergence blow-up under `leader-kill` with the probe off is the result that
+would say recovery detection got materially slower without it — measured, rather
+than assumed either way. Read `health_transitions_committed` against
+`raft_last_applied_index` on all three nodes when reading these runs, not against
+`health_transitions_proposed`: see [raft.md → Observables](raft.md).
 
 ---
 

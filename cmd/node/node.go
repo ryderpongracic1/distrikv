@@ -194,25 +194,44 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 		peerIDs = append(peerIDs, p.ID)
 	}
 
+	probeInterval, probeEnabled, err := transportProbeConfig(
+		os.Getenv(healthProbeIntervalEnv), cfg.HeartbeatInterval)
+	if err != nil {
+		return nil, err
+	}
+	probe := func(nodeID string) bool {
+		conn, ok := peerConnByID[nodeID]
+		if !ok {
+			return false
+		}
+		// A channel that is Ready has a live connection to the peer. Idle is
+		// also treated as reachable: gRPC parks a channel with no traffic in
+		// Idle, and reporting that as unreachable would demote a peer this
+		// node simply has not spoken to recently.
+		switch conn.GetState() {
+		case connectivity.Ready, connectivity.Idle:
+			return true
+		default:
+			return false
+		}
+	}
+	if !probeEnabled {
+		// Handing PeerHealth no probe is what stops the ticker: its Run loop
+		// waits on ctx instead of polling (see cluster.PeerHealth.Run). The other
+		// three signals are untouched, which is the configuration the pure-twist
+		// gate measures.
+		probe = nil
+		logger.Warn("transport probe disabled by "+healthProbeIntervalEnv+"=0; "+
+			"local recovery detection now comes only from replication successes and, "+
+			"where this node is the Raft leader, heartbeat successes — "+
+			"the committed health view is unaffected",
+			"component", "peer-health")
+	}
+
 	n.health = cluster.NewPeerHealth(peerIDs, cluster.HealthConfig{
-		Interval: cfg.HeartbeatInterval,
-		Probe: func(nodeID string) bool {
-			conn, ok := peerConnByID[nodeID]
-			if !ok {
-				return false
-			}
-			// A channel that is Ready has a live connection to the peer. Idle is
-			// also treated as reachable: gRPC parks a channel with no traffic in
-			// Idle, and reporting that as unreachable would demote a peer this
-			// node simply has not spoken to recently.
-			switch conn.GetState() {
-			case connectivity.Ready, connectivity.Idle:
-				return true
-			default:
-				return false
-			}
-		},
-		Logger: logger,
+		Interval: probeInterval,
+		Probe:    probe,
+		Logger:   logger,
 	})
 	// The aggregator turns this node's heartbeat outcomes into proposed health
 	// transitions while it is the leader. It is registered *alongside* the local

@@ -15,6 +15,12 @@ services:
       ELECTION_TIMEOUT_MIN: "500ms"
       ELECTION_TIMEOUT_MAX: "1000ms"
       HEARTBEAT_INTERVAL: "150ms"
+      # Transport probe. Left ON in the default stack: it is the signal that
+      # tells a ring-primary which is not the Raft leader that a peer came back.
+      # Uncomment on all three nodes to run the pure-twist gate — health carried
+      # by the committed Raft log plus the write path's own outcomes, with no
+      # dedicated probing. See docs/chaos-harness.md → The P2 gate.
+      # HEALTH_PROBE_INTERVAL: "0"
     ports:
       - "8001:8001"
       - "9001:9001"
@@ -37,6 +43,12 @@ services:
       ELECTION_TIMEOUT_MIN: "500ms"
       ELECTION_TIMEOUT_MAX: "1000ms"
       HEARTBEAT_INTERVAL: "150ms"
+      # Transport probe. Left ON in the default stack: it is the signal that
+      # tells a ring-primary which is not the Raft leader that a peer came back.
+      # Uncomment on all three nodes to run the pure-twist gate — health carried
+      # by the committed Raft log plus the write path's own outcomes, with no
+      # dedicated probing. See docs/chaos-harness.md → The P2 gate.
+      # HEALTH_PROBE_INTERVAL: "0"
     ports:
       - "8002:8002"
       - "9002:9002"
@@ -59,6 +71,12 @@ services:
       ELECTION_TIMEOUT_MIN: "500ms"
       ELECTION_TIMEOUT_MAX: "1000ms"
       HEARTBEAT_INTERVAL: "150ms"
+      # Transport probe. Left ON in the default stack: it is the signal that
+      # tells a ring-primary which is not the Raft leader that a peer came back.
+      # Uncomment on all three nodes to run the pure-twist gate — health carried
+      # by the committed Raft log plus the write path's own outcomes, with no
+      # dedicated probing. See docs/chaos-harness.md → The P2 gate.
+      # HEALTH_PROBE_INTERVAL: "0"
     ports:
       - "8003:8003"
       - "9003:9003"

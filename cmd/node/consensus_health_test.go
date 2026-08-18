@@ -111,6 +111,11 @@ type healthNode struct {
 	sm      *HealthStateMachine
 	agg     *healthAggregator
 	metrics *metrics.Metrics
+
+	// dataDir is where this node's Raft state file lives, so a test can count
+	// what is actually on disk instead of inferring it from a counter. See
+	// health_counter_reconciliation_test.go.
+	dataDir string
 }
 
 type raftHarness struct {
@@ -208,7 +213,7 @@ func newRaftHarness(t *testing.T, hysteresis healthAggregatorConfig) *raftHarnes
 		// Exactly the production registration, minus the local tracker.
 		rn.SetPeerHealthObserver(multiPeerHealthObserver{agg})
 
-		h.nodes[id] = &healthNode{id: id, raft: rn, sm: sm, agg: agg, metrics: m}
+		h.nodes[id] = &healthNode{id: id, raft: rn, sm: sm, agg: agg, metrics: m, dataDir: cfg.DataDir}
 	}
 
 	// Resolve link targets now that every node exists. Nothing is running yet, so

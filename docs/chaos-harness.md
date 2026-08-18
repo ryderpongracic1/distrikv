@@ -445,7 +445,7 @@ exposed a real defect:
 | `converged: true` + linearizable **FAIL** (1 in 4) | The LSM sequence counter reopened at zero, so the first compaction merging across a restart boundary resolved "newer" backwards — resurrecting stale values and dropping winning tombstones | Record each SSTable's max sequence in the manifest and seed the counter above all of them at open — [defect 11](defect-log.md#defect-11-lsm-sequence-counter-reopened-at-zero) |
 | Capstone **PASS** 4/4 (stop-restart) + 2/2 (kill-restart) | — | — |
 | H2 gate **PASS** 5/5 (stop-restart ×4 + kill-restart control) | Per-key ordering closed: writes carry the primary's sequence, replicas apply-if-newer, replay is idempotent — [replication-and-anti-entropy.md](replication-and-anti-entropy.md#regression-gate) | — |
-| Final gate **PASS**, converged in 20 ms (epoch + replay-classification build) | Epoch survives a wiped primary ([defect 12](defect-log.md#defect-12-restore-reset-the-sequence-counter-to-zero)); catch-up replay no longer false-positives the regression alarm ([defect 13](defect-log.md#defect-13-a-catch-up-replay-after-a-restart-raised-the-epoch-regression-alarm)) | — |
+| Final gate **PASS**, converged in 20 ms (epoch + replay-classification build) | Epoch survives a wiped primary ([defect 12](defect-log.md#defect-12-a-primary-that-lost-its-data-directory-had-its-writes-discarded-and-acked)); catch-up replay no longer false-positives the regression alarm ([defect 13](defect-log.md#defect-13-a-catch-up-replay-after-a-restart-raised-the-epoch-regression-alarm)) | — |
 
 The standing property is unchanged and is the point: **a FAIL is now a real
 consistency bug**, and the printed note says so instead of telling the operator to

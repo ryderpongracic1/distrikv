@@ -1,6 +1,6 @@
 # Defect Log
 
-Thirteen real defects, found and closed. Each one is recorded with the evidence that
+Fourteen real defects, found and closed. Each one is recorded with the evidence that
 exposed it rather than quietly fixed, because in most cases the *way* it surfaced
 is the more interesting half: the measurement infrastructure kept paying compound
 interest, and every fix made the next layer visible.
@@ -16,6 +16,7 @@ The pattern, stated once so the individual entries can be read quickly:
 - and the **Porcupine checker**, within hours of that convergence noise being cleared out of its way, caught the sequence counter ([11](#defect-11-lsm-sequence-counter-reopened-at-zero))
 - and an **external read review** of that fix caught the case its seed could not cover — a store that comes back without its data directory ([12](#defect-12-a-primary-that-lost-its-data-directory-had-its-writes-discarded-and-acked))
 - and the **next review round** caught the benign trigger the new alarm had, which an in-process repro of the interleaving then confirmed ([13](#defect-13-a-catch-up-replay-after-a-restart-raised-the-epoch-regression-alarm))
+- and the round after **that** caught the same mistake in a second subsystem, by reading a commit message against one of this repo's own tests ([14](#defect-14-health-log-replay-re-announced-historical-recoveries-on-every-restart)) — the one entry here whose value is the repetition rather than the bug
 
 > **On the numbering.** These numbers are assigned here, in this document, for
 > reference. They are not a pre-existing scheme carried over from anywhere: before
@@ -29,9 +30,9 @@ The pattern, stated once so the individual entries can be read quickly:
 > [Smaller findings](#smaller-findings) rather than folded into the count, so the
 > headline number is not inflated by them.
 >
-> Defect 12 was added by a later review round, and defect 13 by the round after
-> it. The earlier numbering was left alone rather than renumbered, so links from
-> other documents keep resolving.
+> Defect 12 was added by a later review round, defect 13 by the round after
+> it, and defect 14 by the round after that. The earlier numbering was left alone
+> rather than renumbered, so links from other documents keep resolving.
 
 ---
 
@@ -543,9 +544,96 @@ longer touch those counters at all.
 
 ---
 
+## Defect 14: Health-log replay re-announced historical recoveries on every restart
+
+**Class:** the alarm, not the data · **Found by:** external read review of the
+pure-twist build, from a contradiction between a commit message and one of the
+repo's own tests · **Narrated in:** [raft.md → What the health state machine
+requires of Raft](raft.md#raft-internalraft) and
+[replication-and-anti-entropy.md → The trigger](replication-and-anti-entropy.md#the-trigger)
+
+**This is defect 13's shape, one subsystem over.** A replayed thing
+indistinguishable from a live thing, firing an operator-facing signal that only
+live evidence should fire. Defect 13 was a catch-up replay counted as an epoch
+regression; this is a log replay counted as a peer failing and recovering. Two
+independent subsystems, the same mistake, which makes the mistake the finding —
+and the reason this entry leads with the pattern rather than the symptom.
+
+`Apply`'s doc comment claimed a restart announced nothing, because the recovery
+notification sits inside the transition check and "a re-applied entry that changes
+nothing announces nothing." The premise is true and the conclusion does not
+follow, and `TestHealthSMRecoveredFiresOnTransitionOnly` had been asserting the
+counterexample all along: `down(node2)` then `up(node2)` **does** change the view
+twice, so it announces. That is not a synthetic sequence — it is what the log
+contains after any peer goes down and comes back.
+
+`commitIndex` and `lastApplied` are volatile (deviation 3), so a restarting node
+re-applies every committed entry above the snapshot boundary, and the health view
+starts **empty**. Since absent means healthy, replay begins from "everything is
+fine" and walks the whole history again. Per historical `down`→`up` pair in the
+post-snapshot log, a node coming up emitted:
+
+- `WARN consensus marked peer unhealthy` for a peer that is fine *right now*, and
+- `INFO consensus marked peer healthy again` plus a send on the recovery channel,
+  which schedules an anti-entropy catch-up pass for a replica that never went
+  anywhere.
+
+**Cost, stated honestly.** Bounded and not a correctness bug: the snapshot
+threshold is 1000 entries, so the worst case is ~500 spurious pairs, and the
+passes are idempotent — they run, find nothing owed, and stop. The expensive part
+is the `WARN`. A restart that prints a burst of "peer unhealthy" for healthy peers
+is exactly the noise that teaches an operator to ignore the line, and the line is
+load-bearing: it is the only place consensus tells a human a peer was lost.
+
+**The conceptual gap, which is the part worth keeping.** Raft's contract asks that
+`Apply` be **idempotent**, and it was: the body of a transition is a map
+assignment, so a replay converges on the same state. But **state idempotence is
+not effect idempotence**. A map assignment converges; a log line and a channel
+send do not. `RestoreFromSnapshot` had this right already and said so in its own
+comment — *"a snapshot is not an observation"* — so the fix is the same
+distinction extended to the one path that lacked it.
+
+**Why Raft has to draw the line.** The state machine cannot tell a replay from a
+live commit: every entry it receives looks the same. Only Raft knows which entries
+predate the process. So `RaftNode` records a **replay frontier** at open — the
+highest index already on disk — and routes entries at or below it to a separate
+`StateMachine.ReplayApply`, the same shape as `PutIfNewer`/`ReplayPutIfNewer` from
+defect 13. Separate entry points rather than a boolean argument for the same
+reason as last time: every existing caller keeps meaning "live" by construction,
+and the interface makes the classification a compile-time obligation instead of a
+parameter someone can forget.
+
+**One deliberate imprecision.** The frontier is the persisted log tail, not the
+pre-crash `lastApplied`, which is recorded nowhere. So an entry that was persisted
+but never applied before the crash is treated as a replay, and its announcement is
+suppressed the one time it is applied for real. That errs toward silence rather
+than noise, and the cost is a delayed catch-up pass — which the anti-entropy retry
+loop covers anyway, and which the recovery channel is already documented as lossy
+about. Removing the imprecision would mean persisting `lastApplied`: an fsync per
+commit advance, and a deviation from the paper this package otherwise follows, to
+buy a strictly better answer in a case whose wrong answer is already harmless.
+
+Pinned by `TestHealthSMReplayDoesNotReannounceHistory` (the same three-entry
+history applied live and then replayed, so the live half proves the assertions are
+not vacuous), `TestHealthSMLiveTransitionAfterReplayStillAnnounces` (the inverse —
+a gate stuck shut would trade spurious passes for a missed real one),
+`TestHealthSMReplayStillCountsAppliedEntries`,
+`TestHealthSMRestoreFromSnapshotStaysSilent`, and in the Raft layer
+`TestReplayFrontier_PersistedEntriesReplayLiveEntriesDoNot` — an honest restart,
+where a fresh node is opened over the same directory and every entry that came off
+the disk must arrive as a replay — plus the fresh-node and fully-compacted cases,
+which must leave no replay window at all.
+
+Revert-checked in three directions: removing the effect gate reproduces the defect
+exactly (two spurious warnings and one spurious recovery from a three-entry
+history), always calling `Apply` fails the frontier pin, and always calling
+`ReplayApply` fails the live assertions.
+
+---
+
 ## Smaller findings
 
-Fixed alongside the above, and not counted in the thirteen — recorded because
+Fixed alongside the above, and not counted in the fourteen — recorded because
 leaving them out would make the list look tidier than the work was:
 
 | Finding | Where |
@@ -562,7 +650,7 @@ leaving them out would make the list look tidier than the work was:
 
 Recorded because the reasoning is the useful part, and because the next reader of
 a chaos gate will ask the same question. Deliberately **not** counted in the
-thirteen: nothing here was broken.
+fourteen: nothing here was broken.
 
 ### The health-transition counters did not appear to reconcile (2026-08-18)
 

@@ -95,14 +95,28 @@ type PeerClient struct {
 //     error: Raft leaves lastApplied where it was and retries on the next
 //     commit advance rather than skipping the entry.
 //
+//   - ReplayApply is Apply for an entry that was already on disk when this node
+//     opened, and so may have been applied by a previous incarnation. Raft
+//     routes every such entry here instead of to Apply; see replayFrontier.
+//     State must move exactly as it would under Apply — replay is how the view
+//     is rebuilt — but an implementation MUST NOT emit an effect that only live
+//     evidence justifies. Idempotent *state* is not idempotent *effects*: a map
+//     assignment converges on replay, an operator-facing warning or a
+//     notification on a channel does not, and re-emitting one turns a restart
+//     into a burst of announcements about transitions that are already history
+//     (defect 14).
+//
 //   - SnapshotState must return a payload reflecting exactly the entries
 //     applied so far, with no partial application in it. Raft pairs the bytes
 //     with the index of the last applied entry.
 //
 //   - RestoreFromSnapshot replaces all state with the payload's. It is called
-//     on startup when a snapshot is on disk, and when a leader installs one.
+//     on startup when a snapshot is on disk, and when a leader installs one. A
+//     snapshot describes a state rather than a transition into it, so like
+//     ReplayApply it must be effect-free.
 type StateMachine interface {
 	Apply(ctx context.Context, entry LogEntry) error
+	ReplayApply(ctx context.Context, entry LogEntry) error
 	SnapshotState(ctx context.Context) ([]byte, error)
 	RestoreFromSnapshot(ctx context.Context, data []byte) error
 }
@@ -155,6 +169,29 @@ type RaftNode struct {
 	// construction a record of applied, committed entries.
 	commitIndex uint64
 	lastApplied uint64
+
+	// replayFrontier is the highest log index that was already on disk when this
+	// node opened. It never moves after New.
+	//
+	// It exists because lastApplied is volatile: an entry at or below the
+	// frontier may have been applied — and had its effects emitted — by a
+	// previous incarnation of this process, and applying it again is a replay
+	// rather than news. Entries above the frontier were appended in this
+	// incarnation, by Propose or by AppendEntries, so applying one is the first
+	// time anything has happened. applyCommitted routes the two cases to
+	// StateMachine.ReplayApply and StateMachine.Apply respectively.
+	//
+	// The boundary is deliberately the persisted log tail and not the pre-crash
+	// lastApplied, which is not recorded anywhere (see persistedState). That
+	// makes it conservative in one direction: an entry that was persisted but
+	// never applied before the crash is treated as a replay, so its effects are
+	// suppressed the one time it is applied for real. The cost is bounded and
+	// falls on the safe side — a missed recovery notification delays a catch-up
+	// pass, which the anti-entropy retry loop covers anyway, whereas the
+	// alternative is the noise defect 14 records. Persisting lastApplied would
+	// remove the imprecision at the cost of a disk write per apply and a
+	// deviation from the paper this package otherwise follows.
+	replayFrontier uint64
 
 	// --- Leader volatile state (reset on each election) ---
 	nextIndex  map[string]uint64 // peer → next log index to send
@@ -283,6 +320,16 @@ func New(cfg Config, peers []PeerClient, sm StateMachine, m metricsInterface, lo
 	// Apply must be idempotent.
 	r.commitIndex = r.snapLastIndex
 	r.lastApplied = r.snapLastIndex
+
+	// Everything the log holds right now predates this process, so applying any
+	// of it is a replay rather than an observation. Entries appended from here on
+	// are live. See replayFrontier.
+	r.replayFrontier = r.lastLogIndex()
+	if r.replayFrontier > r.snapLastIndex {
+		r.logger.Info("raft: entries from the persisted log will be replayed to the state machine; "+
+			"their side effects are suppressed because they may already have been emitted before the restart",
+			"from_index", r.snapLastIndex+1, "replay_frontier", r.replayFrontier)
+	}
 
 	return r, nil
 }

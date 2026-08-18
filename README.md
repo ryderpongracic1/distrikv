@@ -44,7 +44,7 @@ The deep material lives in [`docs/`](docs/). Start wherever the question is.
 | [raft.md](docs/raft.md) | Raft's honest scope: leader election, heartbeats, a complete §5.3/§5.4.2 log, and the node-health transitions it carries |
 | [chaos-harness.md](docs/chaos-harness.md) | The Porcupine model, the nemesis, the convergence gate, the counterexample output, and every measured run |
 | [benchmarks.md](docs/benchmarks.md) | Every table, including the etcd ceiling comparison with its durability confound stated rather than corrected |
-| [defect-log.md](docs/defect-log.md) | **Thirteen real defects**, numbered, with the evidence that exposed each one |
+| [defect-log.md](docs/defect-log.md) | **Fourteen real defects**, numbered, with the evidence that exposed each one |
 | [api-and-cli.md](docs/api-and-cli.md) | The HTTP REST surface and `distrikv-cli` |
 | [development.md](docs/development.md) | Running the tests, repository layout, code-quality conventions |
 | [MIGRATION.md](MIGRATION.md) | v1 → v2 data migration |
@@ -163,7 +163,7 @@ run (4.3–6.0 s, 9–12 attempts), `linearizable: PASS`, `indeterminate writes:
 `kill-restart` passed 2/2 the same day as the control. Full table in
 [chaos-harness.md](docs/chaos-harness.md).
 
-**Final state (2026-08-17, all thirteen defects fixed):** the same gate on the
+**Final state (2026-08-17, the thirteen defects known by then fixed):** the same gate on the
 finished build converged in **20 ms on the first attempt** — the fastest
 convergence any run has recorded, because idempotent replay finishes the repair
 during the run and the post-run check finds nothing left to do. 18,008

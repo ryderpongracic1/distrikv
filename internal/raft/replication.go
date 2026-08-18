@@ -227,6 +227,10 @@ func (r *RaftNode) advanceCommitIndexLocked() {
 // On an Apply error the loop stops without advancing lastApplied, leaving the
 // entry to be retried by the next trigger. Followers get one every heartbeat,
 // so a transient failure recovers on its own.
+//
+// Entries at or below replayFrontier go to StateMachine.ReplayApply instead of
+// StateMachine.Apply: they were on disk before this process started, so a
+// previous incarnation may already have applied them and emitted their effects.
 func (r *RaftNode) applyCommitted(ctx context.Context) {
 	r.applyMu.Lock()
 	defer r.applyMu.Unlock()
@@ -255,11 +259,22 @@ func (r *RaftNode) applyCommitted(ctx context.Context) {
 			return
 		}
 		entry := r.log[si]
+		// Below the frontier this entry was on disk before the process started,
+		// so a previous incarnation may already have applied it and emitted its
+		// effects. See replayFrontier.
+		replay := entry.Index <= r.replayFrontier
 		r.mu.Unlock()
 
-		if err := r.sm.Apply(ctx, entry); err != nil {
+		var err error
+		if replay {
+			err = r.sm.ReplayApply(ctx, entry)
+		} else {
+			err = r.sm.Apply(ctx, entry)
+		}
+		if err != nil {
 			r.logger.Error("raft: state machine apply failed; will retry",
-				"index", entry.Index, "term", entry.Term, "op", entry.Op, "error", err)
+				"index", entry.Index, "term", entry.Term, "op", entry.Op,
+				"replay", replay, "error", err)
 			return
 		}
 

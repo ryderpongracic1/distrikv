@@ -79,14 +79,32 @@ func newHealthStateMachine(selfID string, peerCount int, m *metrics.Metrics, log
 	}
 }
 
-// Apply folds one committed entry into the health view.
+// applyOrigin says how a committed entry reached this state machine. It changes
+// nothing about the view the entry produces — replay is how the view is rebuilt
+// after a restart — and everything about whether the transition is announced.
+//
+// It mirrors lsm.writeOrigin, which draws the same distinction one layer down
+// for the same reason: a replayed thing must not fire a signal that only live
+// evidence justifies (defects 13 and 14).
+type applyOrigin uint8
+
+const (
+	// originLive is an entry this node is applying for the first time: it was
+	// appended to the log during this process's lifetime, so the transition it
+	// describes is news.
+	originLive applyOrigin = iota
+
+	// originReplay is an entry that was already on disk when this node opened.
+	// A previous incarnation may have applied it and already announced it, so
+	// the state moves and nothing is emitted.
+	originReplay
+)
+
+// Apply folds one committed entry into the health view, treating it as live.
 //
 // It satisfies raft.StateMachine's idempotence requirement by construction: the
 // body of a health transition is a map assignment, so applying the same entry
-// twice — which happens after every restart, because commitIndex and lastApplied
-// are volatile — lands on the same state. The only non-idempotent side effect,
-// the recovery notification, is emitted from inside the transition check, so a
-// re-applied entry that changes nothing announces nothing.
+// twice lands on the same state.
 //
 // An entry about this node itself is ignored. A leader can legitimately commit
 // "node2 is down" while node2 is alive and applying that very entry (it was
@@ -100,7 +118,36 @@ func newHealthStateMachine(selfID string, peerCount int, m *metrics.Metrics, log
 // skipping it (see raft.StateMachine), so one entry from a future version would
 // wedge the apply loop and freeze the health view of every node that received
 // it.
-func (h *HealthStateMachine) Apply(_ context.Context, entry raft.LogEntry) error {
+func (h *HealthStateMachine) Apply(ctx context.Context, entry raft.LogEntry) error {
+	return h.apply(ctx, entry, originLive)
+}
+
+// ReplayApply folds one committed entry into the health view without announcing
+// it, for an entry that was on disk before this node opened.
+//
+// This is the effect gate defect 14 records. commitIndex and lastApplied are
+// volatile (raft deviation 3), so a restarting node re-applies every entry above
+// the snapshot boundary against a view that starts empty — and because absent
+// means healthy, each historical down→up pair in that window looks like a fresh
+// failure followed by a fresh recovery. Announcing those would emit an
+// operator-facing "consensus marked peer unhealthy" for a peer that is fine and
+// schedule a catch-up pass for a replica that never went anywhere, once per pair,
+// on every restart.
+//
+// The state assignment is identical to Apply's: replay is how the committed view
+// is reconstructed, and suppressing it would lose the history the log exists to
+// carry. Only the announcements are withheld — the WARN, the recovery Info, and
+// the send on the recovery channel — which is the distinction the raft.StateMachine
+// contract draws between idempotent state and idempotent effects.
+func (h *HealthStateMachine) ReplayApply(ctx context.Context, entry raft.LogEntry) error {
+	return h.apply(ctx, entry, originReplay)
+}
+
+// apply is the shared body of Apply and ReplayApply. origin decides only whether
+// a genuine transition is announced.
+func (h *HealthStateMachine) apply(_ context.Context, entry raft.LogEntry, origin applyOrigin) error {
+	live := origin == originLive
+
 	// Recorded before every early return below, and for every op: this gauge
 	// describes how far through the log this node is, not what the health view
 	// says. It is the denominator HealthTransitionsCommitted has to be read
@@ -152,7 +199,16 @@ func (h *HealthStateMachine) Apply(_ context.Context, entry raft.LogEntry) error
 		// on a change it observed, but a restart replays the log and a new leader
 		// may re-assert a transition its predecessor already committed.
 		h.logger.Debug("committed health entry restates the view",
-			"peer", nodeID, "healthy", healthy, "index", entry.Index)
+			"peer", nodeID, "healthy", healthy, "index", entry.Index, "replay", !live)
+		return nil
+	}
+
+	if !live {
+		// A transition, but one this node is only re-reading. Debug, not Warn:
+		// the entry describes history, and a restart that walked a hundred of
+		// these must not look like a hundred peers failing right now.
+		h.logger.Debug("replayed committed health transition (not announced)",
+			"peer", nodeID, "healthy", healthy, "index", entry.Index, "term", entry.Term)
 		return nil
 	}
 

@@ -161,6 +161,18 @@ Three things also schedule a pass: a replica still marked behind is retried ever
 immediately, and either recovery channel — local or consensus — queues one on the
 transition.
 
+The consensus channel fires on **live** committed transitions only. A restarting
+node re-applies the whole post-snapshot health log against a view that starts
+empty, so without a gate each historical `down`→`up` pair in that window would
+queue a pass for a replica that never went anywhere — bounded and idempotent, but
+noise, and accompanied by an operator-facing warning about a peer that is fine.
+Raft therefore marks entries that were already on disk at open and routes them to
+`StateMachine.ReplayApply`, which rebuilds the view and announces nothing; see
+[defect 14](defect-log.md#defect-14-health-log-replay-re-announced-historical-recoveries-on-every-restart).
+The suppression is safe in the one direction it is imprecise: a missed
+announcement costs a delayed pass, which the retry loop above covers, and the
+channel is already lossy by construction for the same reason.
+
 Those schedulers do not know about each other, so they are **coalesced per
 replica**: while a cycle for a replica is queued or running, another request for the
 same replica is dropped rather than queued behind it. Without that, a replica could

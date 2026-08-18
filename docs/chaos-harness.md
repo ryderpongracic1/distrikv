@@ -446,6 +446,7 @@ exposed a real defect:
 | Capstone **PASS** 4/4 (stop-restart) + 2/2 (kill-restart) | — | — |
 | H2 gate **PASS** 5/5 (stop-restart ×4 + kill-restart control) | Per-key ordering closed: writes carry the primary's sequence, replicas apply-if-newer, replay is idempotent — [replication-and-anti-entropy.md](replication-and-anti-entropy.md#regression-gate) | — |
 | Final gate **PASS**, converged in 20 ms (epoch + replay-classification build) | Epoch survives a wiped primary ([defect 12](defect-log.md#defect-12-a-primary-that-lost-its-data-directory-had-its-writes-discarded-and-acked)); catch-up replay no longer false-positives the regression alarm ([defect 13](defect-log.md#defect-13-a-catch-up-replay-after-a-restart-raised-the-epoch-regression-alarm)) | — |
+| P2 gate **PASS** 9/9, probe off (stop-restart ×4 + kill-restart control + leader-kill ×4) | — (no defect: the gate was built to answer a design question, and answered it). First exercise of a leaderless window under fault load; convergence with no probe stayed in the probe-on range, which is what the probe's removal rests on — [The P2 gate](#the-p2-gate-passed) | — |
 
 The standing property is unchanged and is the point: **a FAIL is now a real
 consistency bug**, and the printed note says so instead of telling the operator to
@@ -690,10 +691,12 @@ Every gate up to now passed `--nemesis-services node2,node3` while node1 held
 leadership, so a **leaderless window under fault load had never been tested**:
 no run had ever taken the leader out while writes were flowing and a replica was
 behind. That window is the one state in which the consensus health signal cannot
-make progress — no leader, no committed health entry — which makes it the
-discriminating case for the planned removal of the transport probe. Until it is
-exercised, "the local signals cover the leaderless window" is an argument, not a
-measurement.
+make progress — no leader, no committed health entry — which made it the
+discriminating case for removing the transport probe. It has now been exercised
+with the probe off, four forced elections per run, and it held: see
+[The P2 gate](#the-p2-gate-passed). "The local signals
+cover the leaderless window" is a measurement rather than an argument as of that
+gate, and the probe was removed on the strength of it.
 
 ### The design decision: it kills the leader or it kills nothing
 
@@ -738,8 +741,6 @@ a reason that is worth stating because the intuition runs the other way:
 10s applies; the node exits well inside it, which is why measured fault windows
 are `downtime + ~0.4s` of command overhead rather than `downtime + 10s`.
 
-### The P2 gate (pending)
-
 ### How the leader is resolved
 
 Over `GET /status`, in this order:
@@ -764,27 +765,74 @@ at startup if they are not, rather than letting every window skip.
 The fault-window table prints the victim recorded per window, so a `leader-kill`
 run names the node it actually took down each time instead of a static list.
 
-### The P2 gate (pending)
+### The P2 gate: passed
 
-The instruments are landed; the evidence is not collected yet. The gate for
-probe removal is the existing suite plus the new mode, run with the probe
-**disabled** — uncomment `HEALTH_PROBE_INTERVAL: "0"` on all three services in
-`docker/docker-compose.yml`, which stops the probe ticker without deleting
-anything:
+Run 2026-08-18 on main `998e51a`. The gate for removing the transport probe: the
+existing suite plus the new mode, every run with the probe **disabled**, so the
+cluster ran in the exact post-removal configuration. All nine runs on one machine
+— Apple M4 Pro, Colima VM 8 CPU / 8 GB, 3-node docker-compose, 60s at 8 workers
+over a 20-key space, `--nemesis-interval 10s --nemesis-downtime 5s`,
+`--check-convergence --convergence-grace 30s`. Every run: `linearizable: PASS`,
+`converged: true`.
 
-- `stop-restart` 4/4 — `linearizable: PASS`, `converged: true`
-- `kill-restart` control — the path that already worked must not regress
-- `leader-kill` 4/4 — plus `raft_terms` recovering to a flat value after each
-  forced election, and convergence times still in seconds. Read its
-  `indeterminate writes` and `workload paused` rows together: see
-  [Failure classification and fail-fast](#failure-classification-and-fail-fast)
-  for what a healthy reading looks like
+**`stop-restart` 4/4 — PASS**
 
-A convergence blow-up under `leader-kill` with the probe off is the result that
-would say recovery detection got materially slower without it — measured, rather
-than assumed either way. Read `health_transitions_committed` against
-`raft_last_applied_index` on all three nodes when reading these runs, not against
-`health_transitions_proposed`: see [raft.md → Observables](raft.md).
+| Run | Convergence | Indeterminate writes |
+| --- | --- | --- |
+| 1 | 1.137s | 0 |
+| 2 | 552ms | 0 |
+| 3 | 5.334s | 0 |
+| 4 | 3.742s | 0 |
+
+**`kill-restart` control — PASS.** Convergence 3.728s, 12 indeterminate writes —
+the ordinary torn-connection signature of SIGKILL, and the path that already
+worked did not regress.
+
+**`leader-kill` 4/4 — PASS.** The first time a leaderless window has been
+exercised under fault load, and the case the probe uniquely covered. Four forced
+elections per run.
+
+| Run | Convergence | Indeterminate writes | Workload pause episodes | Checker verdict |
+| --- | --- | --- | --- | --- |
+| 1 | 4.369s | 6 | 1 | 158ms |
+| 2 | 1.125s | 9 | 1 | 160ms |
+| 3 | 4.348s | 13 | 2 | 135ms |
+| 4 | 3.788s | 0 | 0 | 204ms |
+
+Two things in that table are worth reading together, because they are the
+harness auditing itself rather than the system.
+
+**The pause episodes match the target-kill windows one-for-one.** `leader-kill`
+resolves whichever node leads, so it takes down the runner's own `--target`
+(node1) only when node1 happens to be leading. Runs 1 and 2 killed node1 once
+each and recorded one pause episode each; run 3 killed it twice and recorded two;
+run 4 never killed it and recorded **zero pauses and zero indeterminate writes**.
+The circuit breaker engaging exactly when the target dies, and never otherwise, is
+what says it is reacting to the fault rather than to load.
+
+**The verdicts landed inside the default 60s budget** — 135–204ms, against the
+same workload that returned `UNKNOWN (timeout)` at both 60s and 300s before the
+phase taxonomy and the breaker existed, with 407 and 739 writes of unknown
+outcome. Single-digit-to-teens indeterminates is the whole difference between a
+searchable history and an intractable one; see
+[Failure classification and fail-fast](#failure-classification-and-fail-fast).
+
+**What the evidence supports, and what it does not.** With the probe off,
+recovery detection ran on the committed consensus health view plus this node's own
+replication-RPC outcomes alone, and convergence times (0.55–5.3s) sit inside the
+same range as the entire probe-ON history. So: **no degradation was observed
+across these nine runs, and the leaderless window was exercised rather than
+argued about.** That is not the same as proving the two configurations equivalent
+under all conditions — nine runs on one machine cannot, and the asymmetric-
+partition case is not a fault this harness injects at all. It was enough to act
+on, and the removal that followed
+([replication-and-anti-entropy.md](replication-and-anti-entropy.md#the-trigger))
+keeps the write path's own outcomes as a local veto precisely because the one case
+the gate could not reach is the one that veto covers.
+
+Read `health_transitions_committed` against `raft_last_applied_index` on all three
+nodes when reading these runs, not against `health_transitions_proposed`: see
+[raft.md → Observables](raft.md).
 
 ---
 

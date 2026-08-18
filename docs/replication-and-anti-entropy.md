@@ -65,69 +65,91 @@ A catch-up runs when a replica transitions **unreachable → healthy**, gated on
 restarted accepts connections before it is useful (WAL to replay, compaction
 backlog to arm), and a flapping peer would otherwise trigger a pass per flap.
 
-Health merges four signals, because no single one is enough:
+Health merges three signals, because no single one is enough:
 
 | Signal | Available on | Detects |
 |---|---|---|
-| Raft heartbeat outcomes | the leader only | failure and recovery, most directly |
-| Replication RPC outcomes | every ring-primary | failure |
-| gRPC channel state probe | every node | recovery |
 | **Committed health entries** (`HealthStateMachine`) | **every node** | **failure and recovery, cluster-consistently** |
+| Replication RPC outcomes | every ring-primary | failure, and recovery of the transport a pass will use |
+| Raft heartbeat outcomes | the leader only | failure and recovery, most directly |
+
+All three are outcomes of traffic the cluster was already sending. There is no
+dedicated probing machinery: a gRPC channel-state probe on a ticker used to be a
+fourth signal and has been **removed** — see *The pure twist* below.
 
 The heartbeat signal is the one the design called for and is wired in
 (`raft.SetPeerHealthObserver`), but only the Raft leader sends heartbeats — and in
 distrikv ring ownership is deliberately unrelated to Raft leadership, so a
 follower that is nonetheless a ring-primary would learn nothing from it. The
-probe is what let that node notice its replica came *back*: during a fault,
-writes to the replica are being refused, so the write path produces no successes
-to count.
+committed view is what closes that gap rather than working around it: the leader's
+heartbeat observations are aggregated with hysteresis and **committed through the
+Raft log**, so every node applies the same transitions and every ring-primary
+reads the same health view — leader or not. See [raft.md](raft.md) for the
+transition encoding, the hysteresis defaults, and the discriminating test that
+proves a follower can schedule a catch-up from consensus alone.
 
-The fourth signal is what closes that gap rather than working around it. The
-leader's heartbeat observations are aggregated with hysteresis and **committed
-through the Raft log**, so every node applies the same transitions and every
-ring-primary reads the same health view — leader or not. See
-[raft.md](raft.md) for the transition encoding, the hysteresis defaults, and the
-discriminating test that proves a follower can schedule a catch-up from consensus
-alone.
+**Precedence, and why it is asymmetric.** The gate is `antiEntropy.reachable`, and
+it treats the two directions differently because the two signals are not equally
+good evidence in both.
 
-**Precedence.** A committed `health-down` is sufficient on its own to hold the
-retry loop back, whatever the local signals say: it is the leader's own heartbeat
-outcome against that peer, agreed cluster-wide, which is strictly better evidence
-than a local gRPC channel state that reports Ready or Idle for a peer this node
-simply has not spoken to recently. The local signals still veto independently —
-either saying "down" is enough — because each observes a transport the catch-up
-pass will actually use. The gate is `antiEntropy.reachable`.
+*A local failure is decisive.* If this node's own most recent traffic to the peer
+failed, the retry loop holds back whatever the committed view says. A committed
+`health-up` is the *leader's* observation and says nothing about whether this node
+can reach the peer; letting it mask a local failure would send a pass down a
+transport this node already knows is broken. Nothing in this gate touches the
+behind-marking a failed write produces — that is `NoteReplicationFailure`, and it
+records the replica as owed the write regardless of any health signal.
 
-That precedence cannot stall repair, and the reason is worth stating because it is
-what justifies keeping the probe. The gate covers only the retry ticker. During a
-leaderless window no new health entry can be committed, so the consensus view
+*A committed "down" is decisive unless this node has reached the peer itself.* The
+committed view is cluster-wide knowledge derived from the leader's own heartbeats,
+so it outranks having no opinion. But under an **asymmetric partition** the leader
+can be unable to reach a peer that a given ring-primary reaches perfectly well —
+and that ring-primary is the node that owes the peer its data. So a node holding
+positive local evidence overrides the committed "down" for its own repair
+scheduling. This is the **healthy-direction veto**: it can cause a pass to be
+scheduled, never prevent one.
+
+The evidence the veto requires is deliberately narrow. `PeerHealth.Healthy`
+reporting true is not enough: a peer starts healthy and an untracked node reports
+healthy, so "healthy" also means "no opinion", and a node that had never spoken to
+a peer would otherwise overrule the cluster's committed view of it.
+`PeerHealth.LastReplicationSucceeded` is the veto's input instead — true only once
+this node has put bytes on the wire to that peer and got an answer, and
+last-outcome-wins, so a peer that has genuinely gone away withdraws its own veto on
+the next failed write. Both halves are pinned in `cmd/node/health_veto_test.go`.
+
+That precedence cannot stall repair. The gate covers only the retry ticker. During
+a leaderless window no new health entry can be committed, so the committed view
 freezes; if it froze at "down" for a peer that is in fact back, the retry loop
-skips that peer until a leader emerges. Meanwhile a recovery seen by the local
-probe still enqueues a pass through the recovered channel, and a pass itself
-consults no health signal at all. The cost of a frozen view is a delay in the
-slowest of the four paths, never a missed convergence.
+skips that peer until either a leader emerges or this node replicates to it
+successfully — at which point the veto fires. Meanwhile both recovery channels
+enqueue a pass independently of the gate, and a pass itself consults no health
+signal at all. The cost of a frozen view is a delay in one of three paths, never a
+missed convergence.
 
-**The pure twist: where it stands.** The end state for the design is Raft alone
-carrying node health, with no dedicated probing machinery — the probe deleted, not
-merely defaulted off. Two instruments for the evidence that requires have landed:
-a [`leader-kill` nemesis](chaos-harness.md#leader-kill-forcing-a-leaderless-window-under-load),
-which produces the leaderless-window-under-load case no gate had ever exercised,
-and `HEALTH_PROBE_INTERVAL=0`, which stops the probe ticker so a gate can run in
-the exact post-removal configuration without deleting anything. The gates
-themselves are **pending**; nothing has been removed and no default has changed.
+**The pure twist: where it stands.** Done, and measured before it was done. The end
+state for the design was Raft alone carrying node health with no dedicated probing
+machinery, and that is now the shipped configuration: `cluster.PeerHealth` has no
+probe function, no ticker and no goroutine, and the `HEALTH_PROBE_INTERVAL` knob
+that existed to disable the probe went with the thing it disabled.
 
-One design question is deliberately left open until those gates report, because
-answering it from an argument is what the instruments exist to avoid: under an
-**asymmetric partition**, the leader marks a peer down from its own vantage and
-commits that cluster-wide, while a ring-primary that can still reach that peer
-perfectly well has its retry loop gated by someone else's view. Today the local
-probe can contradict that; after removal it could not. The two honest options are
-to accept leader-vantage health (the gated retry self-heals once the leader's view
-catches up, and the write path was never gated at all), or to keep replication-RPC
-outcomes as a local veto **in the healthy direction only** — a node that has just
-replicated to a peer successfully may treat it as reachable regardless of
-consensus. Which one to take is a decision to make with gate evidence in hand, not
-before.
+The evidence base is the **P2 gate**, run entirely with the probe disabled on main
+`998e51a` and recorded in
+[chaos-harness.md](chaos-harness.md#the-p2-gate-passed):
+`stop-restart` 4/4 PASS, a `kill-restart` control PASS, and `leader-kill` 4/4 PASS
+— the last of these the first exercise of a leaderless window under fault load,
+which was the case the probe uniquely covered. Convergence stayed in the 0.55–5.3s
+range the entire probe-ON history sits in. Nine runs on one machine show no
+degradation and a leaderless window that held; they do not show the two
+configurations equivalent under all conditions, and they say nothing at all about
+the asymmetric partition, which is not a fault the harness injects.
+
+That last gap is exactly why the healthy-direction veto above exists rather than
+the alternative of accepting leader-vantage health outright. Keeping the write
+path's own outcomes as a veto is not a probe by another name: no dedicated traffic
+is added, `ReplicateWrite` still attempts every replica in the ring regardless of
+health, and the only thing being consulted is whether the work this node was doing
+anyway succeeded.
 
 Three things also schedule a pass: a replica still marked behind is retried every
 `RetryInterval` (5 s), a durable cursor behind the tip at startup queues one
@@ -605,7 +627,7 @@ replica is NOT known to agree on the keys the log cannot account for"* instead o
   pass covers the replica's whole gap only if segment 1 is still on disk, i.e.
   nothing has ever been released. The check is gated on the replica being known
   behind, which is the only evidence the primary has that it missed anything at all;
-  a replica that merely failed a health probe and recovered has a zero cursor too,
+  a replica that merely flapped unhealthy and recovered has a zero cursor too,
   and treating that as a gap would fire the gauge on a health flap.
 
 The condition is surfaced on both signals because they answer different questions.

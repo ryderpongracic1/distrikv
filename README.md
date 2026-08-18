@@ -59,6 +59,19 @@ rather than the etcd-style one. Raft settles "who is alive" *through its own log
 the leader commits node-health transitions, so every node reads the same
 cluster-consistent health view rather than only the leader knowing anything.
 
+The split is now **pure**: there is no dedicated liveness-probing machinery
+anywhere in the node. Health is the committed Raft log plus the outcomes of traffic
+the cluster was already sending — this node's own replication RPCs, and the
+leader's heartbeats. The gRPC channel-state probe that used to cover the case a
+consensus view cannot make progress through has been removed, and the word "pure"
+is earned by the [P2 gate](docs/chaos-harness.md#the-p2-gate-passed):
+the whole chaos suite run with the probe already off, including the first-ever
+`leader-kill` runs that force a leaderless window under load, all passing with
+convergence in the same range as the entire probe-on history. Nine runs on one
+machine, which is what they are worth — enough to show no degradation and to
+exercise the leaderless window, not enough to call the two configurations
+equivalent under all conditions.
+
 - **Consistent hash ring** (`internal/cluster`) — 150 virtual positions per node on
   a `uint32` ring. `GetN(key, R)` returns the `R` distinct physical nodes that own
   a key: the ring-primary plus its replicas.

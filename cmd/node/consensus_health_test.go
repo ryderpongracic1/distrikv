@@ -29,8 +29,9 @@ import (
 // So this test removes every local signal and leaves consensus as the only way
 // health can travel:
 //
-//   - the transport probe is disabled (its ticker is never started and its
-//     interval is set beyond the life of the test),
+//   - the local tracker is never fed an observation, and there is no probing
+//     machinery left that could feed it one — the transport probe that used to be
+//     a third signal has been removed,
 //   - no replication RPCs are issued, so there are no replication outcomes,
 //   - the observed node is a follower, so its own heartbeat observations are
 //     empty by construction — followers send no heartbeats.
@@ -373,8 +374,8 @@ func TestConsensusHealthReachesANonLeader(t *testing.T) {
 // Every other trigger is disabled, so a pass that runs can only have been
 // scheduled by the consensus recovery signal:
 //
-//   - the transport probe is never started and its interval is beyond the test,
-//   - the local tracker is never fed an observation,
+//   - the local tracker is never fed an observation, and no probing machinery
+//     exists that could feed it one,
 //   - nothing is behind at startup, so the startup sweep enqueues nothing,
 //   - RetryInterval is set beyond the life of the test, so the retry ticker cannot
 //     fire.
@@ -414,12 +415,11 @@ func TestConsensusHealthSchedulesCatchUpOnANonLeader(t *testing.T) {
 		ring.AddNode(id, id+":9000")
 	}
 
-	// The transport probe: configured, and disabled. An hour-long interval and a
-	// Run() that is never started mean it cannot contribute a single observation.
+	// The local tracker exists but is deliberately starved: nothing in this test
+	// feeds it a heartbeat or a replication outcome, and there is no probe left
+	// that could observe anything on its own.
 	localHealth := cluster.NewPeerHealth([]string{victim.id}, cluster.HealthConfig{
-		Interval: time.Hour,
-		Probe:    func(string) bool { t.Error("the transport probe must not run in this test"); return true },
-		Logger:   logger,
+		Logger: logger,
 	})
 
 	ae := newAntiEntropy(
@@ -477,13 +477,16 @@ func TestConsensusHealthSchedulesCatchUpOnANonLeader(t *testing.T) {
 }
 
 // TestConsensusHealthGatesTheRetryLoop pins the precedence rule: a committed
-// "down" is sufficient on its own to hold the retry loop back, even when every
-// local signal says the peer is fine.
+// "down" is sufficient on its own to hold the retry loop back, whenever this node
+// holds no positive local evidence to the contrary.
 //
-// It matters because the local signals are weaker evidence than they look. A gRPC
-// channel reports Ready or Idle for a peer this node simply has not spoken to
-// recently, whereas a committed transition is the leader's own heartbeat outcome
-// against that peer, agreed cluster-wide.
+// It matters because the local tracker's optimism looks like agreement. A peer
+// starts healthy and an untracked node reports healthy, so `Healthy` reporting true
+// here means only "this node has never seen this peer fail" — while a committed
+// transition is the leader's own heartbeat outcome against that peer, agreed
+// cluster-wide. The one thing that does override it is a replication success this
+// node performed itself; that is the healthy-direction veto, pinned separately in
+// health_veto_test.go.
 func TestConsensusHealthGatesTheRetryLoop(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	dir := t.TempDir()
@@ -502,11 +505,10 @@ func TestConsensusHealthGatesTheRetryLoop(t *testing.T) {
 	ring.AddNode("node1", "node1:9000")
 	ring.AddNode("node2", "node2:9000")
 
-	// Local signals: unanimously healthy.
+	// Local signals: no failure ever observed, so the tracker reports healthy —
+	// which here means "no opinion", not evidence.
 	localHealth := cluster.NewPeerHealth([]string{"node2"}, cluster.HealthConfig{
-		Interval: time.Hour,
-		Probe:    func(string) bool { return true },
-		Logger:   logger,
+		Logger: logger,
 	})
 	sm := newHealthStateMachine("node1", 1, &metrics.Metrics{}, logger)
 
@@ -563,9 +565,7 @@ func TestLocalSignalStillVetoesWithoutConsensus(t *testing.T) {
 	ring.AddNode("node2", "node2:9000")
 
 	localHealth := cluster.NewPeerHealth([]string{"node2"}, cluster.HealthConfig{
-		Interval: time.Hour,
-		Probe:    func(string) bool { return true },
-		Logger:   logger,
+		Logger: logger,
 	})
 	// Consensus knows nothing about node2 — absent means healthy.
 	sm := newHealthStateMachine("node1", 1, &metrics.Metrics{}, logger)

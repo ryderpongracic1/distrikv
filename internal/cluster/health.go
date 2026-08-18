@@ -1,7 +1,6 @@
 package cluster
 
 import (
-	"context"
 	"log/slog"
 	"sort"
 	"sync"
@@ -11,40 +10,40 @@ import (
 // DefaultStableChecks is how many consecutive healthy observations a peer must
 // produce before it is declared healthy again.
 //
-// A single successful probe is not enough. A node that has just restarted
+// A single successful observation is not enough. A node that has just restarted
 // accepts connections before it is useful — it still has a WAL to replay and a
 // compaction backlog to arm — and a flapping peer would otherwise trigger a
 // catch-up pass on every flap. Three observations is the same "wait for stable
 // health" gate Raft's own election timing uses in miniature: long enough to
-// exclude a single lucky probe, short enough to react within a fraction of a
+// exclude a single lucky success, short enough to react within a fraction of a
 // second at a 150ms heartbeat interval.
 const DefaultStableChecks = 3
 
-// PeerHealth is the cluster's view of which peers are reachable, and the source
-// of the unreachable → healthy transition that triggers replica catch-up.
+// PeerHealth is this node's *local* view of which peers are reachable, and one
+// of the two sources of the unreachable → healthy transition that triggers
+// replica catch-up. The other is the committed, cluster-wide health view the
+// Raft log carries; the two are merged by the anti-entropy engine
+// (`antiEntropy.reachable`), not here.
 //
-// It merges three independent signals rather than relying on any one:
+// It observes two signals, both of which are outcomes of traffic this node was
+// sending anyway. There is no dedicated probing machinery: a transport-level
+// probe on a ticker used to be a third signal and has been removed, because the
+// committed health view covers the case it uniquely covered (see
+// docs/replication-and-anti-entropy.md).
 //
-//   - Raft heartbeat outcomes, via ObserveHeartbeat. This is the signal the
-//     design calls for, and it is the most direct one — but only the Raft leader
-//     sends heartbeats, so a follower that is nonetheless a ring-primary for some
-//     key range would learn nothing from it. Ring ownership and Raft leadership
-//     are deliberately unrelated in distrikv, so health cannot depend on being
-//     the leader.
+//   - Raft heartbeat outcomes, via ObserveHeartbeat. The most direct signal
+//     available — but only the Raft leader sends heartbeats, so a follower that
+//     is nonetheless a ring-primary for some key range learns nothing from it.
+//     Ring ownership and Raft leadership are deliberately unrelated in distrikv,
+//     so health cannot depend on being the leader.
 //   - Replication RPC outcomes, via ObserveReplication. Every ring-primary has
 //     this signal for exactly the peers it replicates to, and it is the same
 //     transport the catch-up pass will use — so it fails and recovers together
 //     with the thing being triggered.
-//   - A transport-level probe run on a ticker, via the Probe function. This is
-//     what lets a non-leader notice that a peer has come *back*: replication
-//     failures tell you a peer is gone, but nothing on the write path tells you
-//     it returned, because writes to it are being refused.
 //
 // PeerHealth is safe for concurrent use.
 type PeerHealth struct {
-	interval     time.Duration
 	stableChecks int
-	probe        func(nodeID string) bool
 	logger       *slog.Logger
 
 	mu    sync.Mutex
@@ -61,24 +60,24 @@ type peerState struct {
 	healthy    bool
 	consecOK   int
 	lastChange time.Time
+
+	// sawReplication and lastReplicationOK record this node's most recent
+	// replication RPC outcome for the peer, which is *positive local evidence*
+	// about reachability rather than the absence of bad news. `healthy` cannot
+	// serve that purpose: a peer starts healthy and an untracked node reports
+	// healthy, so "healthy" also means "no opinion". LastReplicationSucceeded
+	// distinguishes the two, which is what lets the anti-entropy engine veto a
+	// committed "down" only when this node has actually reached the peer.
+	sawReplication    bool
+	lastReplicationOK bool
 }
 
-// HealthConfig configures a PeerHealth. Probe is required; the rest have
-// defaults.
+// HealthConfig configures a PeerHealth. Every field has a default.
 type HealthConfig struct {
-	// Interval is how often Probe is called for each peer.
-	Interval time.Duration
-
 	// StableChecks is the number of consecutive healthy observations required
 	// before an unreachable peer is declared healthy. Defaults to
 	// DefaultStableChecks.
 	StableChecks int
-
-	// Probe reports whether a peer looks reachable right now. It must not block
-	// for long: it is called for every peer on every tick. The intended
-	// implementation is a transport-state read (e.g. a gRPC channel's
-	// connectivity state), not an RPC.
-	Probe func(nodeID string) bool
 
 	Logger *slog.Logger
 }
@@ -88,11 +87,8 @@ type HealthConfig struct {
 // Peers start out considered healthy. Starting them unhealthy would make every
 // node fire a catch-up pass for every replica the first time it saw them, which
 // is exactly the thundering herd the stable-health gate exists to avoid; a peer
-// that really is down is demoted by the first failed probe one interval later.
+// that really is down is demoted by the first failed heartbeat or replication.
 func NewPeerHealth(nodeIDs []string, cfg HealthConfig) *PeerHealth {
-	if cfg.Interval <= 0 {
-		cfg.Interval = 250 * time.Millisecond
-	}
 	if cfg.StableChecks <= 0 {
 		cfg.StableChecks = DefaultStableChecks
 	}
@@ -100,9 +96,7 @@ func NewPeerHealth(nodeIDs []string, cfg HealthConfig) *PeerHealth {
 		cfg.Logger = slog.Default()
 	}
 	ph := &PeerHealth{
-		interval:     cfg.Interval,
 		stableChecks: cfg.StableChecks,
-		probe:        cfg.Probe,
 		logger:       cfg.Logger.With("component", "peer-health"),
 		peers:        make(map[string]*peerState, len(nodeIDs)),
 		recovered:    make(chan string, 2*len(nodeIDs)+4),
@@ -130,21 +124,57 @@ func (ph *PeerHealth) Healthy(nodeID string) bool {
 }
 
 // ObserveHeartbeat records a Raft heartbeat outcome for a peer.
-func (ph *PeerHealth) ObserveHeartbeat(nodeID string, ok bool) { ph.observe(nodeID, ok) }
+func (ph *PeerHealth) ObserveHeartbeat(nodeID string, ok bool) {
+	ph.observe(nodeID, ok, false)
+}
 
 // ObserveReplication records a replication RPC outcome for a peer.
 //
-// Only failures are meaningful here in practice — a successful replication also
-// counts towards stability, but during a fault there are no successes to count,
-// which is why recovery detection needs the probe.
-func (ph *PeerHealth) ObserveReplication(nodeID string, ok bool) { ph.observe(nodeID, ok) }
+// Failures are what demote a peer. Successes count towards the stable-health
+// gate and, separately, are recorded as the peer's most recent replication
+// outcome so that LastReplicationSucceeded can report positive local evidence.
+func (ph *PeerHealth) ObserveReplication(nodeID string, ok bool) {
+	ph.observe(nodeID, ok, true)
+}
 
-func (ph *PeerHealth) observe(nodeID string, ok bool) {
+// LastReplicationSucceeded reports whether this node's most recent replication
+// RPC to nodeID succeeded.
+//
+// Unlike Healthy, it is *positive* evidence and false when there is none: a peer
+// no replication has ever been attempted to reports false. That distinction is
+// the whole point. Healthy conflates "reachable" with "no opinion" — a freshly
+// tracked peer and an untracked node both report healthy — so it cannot be used
+// to override a committed consensus "down" without letting a node with no
+// evidence at all overrule the cluster. This can, because a true here means this
+// node put bytes on the wire to that peer and got an answer.
+//
+// It is deliberately last-outcome-wins rather than time-windowed. `ReplicateWrite`
+// attempts every replica in the ring regardless of health, so a peer that has
+// genuinely gone away produces a failure on the next write to any key it replicates
+// and the evidence flips back on its own. The residual case — a peer this node holds
+// a stale success for and is currently sending no traffic to — is bounded and errs
+// towards work rather than away from it: the retry loop schedules one catch-up pass
+// that fails, which records the failure and withdraws the evidence.
+func (ph *PeerHealth) LastReplicationSucceeded(nodeID string) bool {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+	st, ok := ph.peers[nodeID]
+	if !ok {
+		return false
+	}
+	return st.sawReplication && st.lastReplicationOK
+}
+
+func (ph *PeerHealth) observe(nodeID string, ok, fromReplication bool) {
 	ph.mu.Lock()
 	st := ph.peers[nodeID]
 	if st == nil {
 		ph.mu.Unlock()
 		return
+	}
+	if fromReplication {
+		st.sawReplication = true
+		st.lastReplicationOK = ok
 	}
 
 	var transitioned bool
@@ -178,32 +208,13 @@ func (ph *PeerHealth) observe(nodeID string, ok bool) {
 	}
 }
 
-// Run polls every peer on a ticker until ctx is cancelled. It is the only part
-// of PeerHealth that needs a goroutine; the Observe methods are called from
-// whichever goroutine produced the signal.
-func (ph *PeerHealth) Run(ctx context.Context) {
-	if ph.probe == nil {
-		ph.logger.Warn("no peer probe configured; recovery will be detected only " +
-			"from replication or heartbeat successes")
-		<-ctx.Done()
-		return
-	}
-	t := time.NewTicker(ph.interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			for _, id := range ph.Peers() {
-				ph.observe(id, ph.probe(id))
-			}
-		}
-	}
-}
-
-// Peers returns the tracked node IDs in sorted order.
-func (ph *PeerHealth) Peers() []string {
+// trackedPeers returns the tracked node IDs in sorted order.
+//
+// Unexported: its only production caller was the probe ticker, which is gone. It
+// is kept because the sorted-order invariant is worth pinning and it is a useful
+// handle when debugging a tracker, but a health tracker has no business offering
+// the cluster's peer list as public API — the ring owns that.
+func (ph *PeerHealth) trackedPeers() []string {
 	ph.mu.Lock()
 	out := make([]string, 0, len(ph.peers))
 	for id := range ph.peers {

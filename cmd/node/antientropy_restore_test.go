@@ -63,9 +63,7 @@ func withAntiEntropyLogging(t *testing.T, n *Node, afterRestore bool, peerIDs ..
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	n.health = cluster.NewPeerHealth(peerIDs, cluster.HealthConfig{
-		Interval: time.Hour,
-		Probe:    func(string) bool { return true },
-		Logger:   logger,
+		Logger: logger,
 	})
 
 	n.antiEntropy = newAntiEntropy(

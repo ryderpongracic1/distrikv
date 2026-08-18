@@ -1,12 +1,9 @@
 package cluster
 
 import (
-	"context"
 	"io"
 	"log/slog"
-	"sync/atomic"
 	"testing"
-	"time"
 )
 
 func quietHealth(peers []string, cfg HealthConfig) *PeerHealth {
@@ -19,7 +16,7 @@ func quietHealth(peers []string, cfg HealthConfig) *PeerHealth {
 // first time it looked — the thundering herd the stable-health gate exists to
 // avoid.
 func TestPeerStartsHealthyAndIsDemotedByAFailure(t *testing.T) {
-	ph := quietHealth([]string{"node2"}, HealthConfig{Probe: func(string) bool { return true }})
+	ph := quietHealth([]string{"node2"}, HealthConfig{})
 
 	if !ph.Healthy("node2") {
 		t.Error("a freshly tracked peer should start healthy")
@@ -40,13 +37,10 @@ func TestPeerStartsHealthyAndIsDemotedByAFailure(t *testing.T) {
 }
 
 // TestRecoveryRequiresStableHealth is the gate the design calls for: a node that
-// has just restarted accepts connections before it is useful, so one lucky probe
-// must not trigger a catch-up.
+// has just restarted accepts connections before it is useful, so one lucky
+// success must not trigger a catch-up.
 func TestRecoveryRequiresStableHealth(t *testing.T) {
-	ph := quietHealth([]string{"node2"}, HealthConfig{
-		StableChecks: 3,
-		Probe:        func(string) bool { return true },
-	})
+	ph := quietHealth([]string{"node2"}, HealthConfig{StableChecks: 3})
 
 	ph.ObserveReplication("node2", false)
 
@@ -79,10 +73,7 @@ func TestRecoveryRequiresStableHealth(t *testing.T) {
 // TestFlappingPeerNeverGraduates pins the other half of the gate: a peer that
 // alternates must not accumulate credit towards recovery.
 func TestFlappingPeerNeverGraduates(t *testing.T) {
-	ph := quietHealth([]string{"node2"}, HealthConfig{
-		StableChecks: 3,
-		Probe:        func(string) bool { return true },
-	})
+	ph := quietHealth([]string{"node2"}, HealthConfig{StableChecks: 3})
 
 	ph.ObserveReplication("node2", false)
 	for i := 0; i < 10; i++ {
@@ -103,7 +94,7 @@ func TestFlappingPeerNeverGraduates(t *testing.T) {
 // TestHealthyPeerDoesNotRe-notify guards against a stream of transitions for a
 // peer that is simply working: only a recovery from unreachable is an event.
 func TestHealthyPeerDoesNotRenotify(t *testing.T) {
-	ph := quietHealth([]string{"node2"}, HealthConfig{Probe: func(string) bool { return true }})
+	ph := quietHealth([]string{"node2"}, HealthConfig{})
 	for i := 0; i < 20; i++ {
 		ph.ObserveReplication("node2", true)
 	}
@@ -114,63 +105,68 @@ func TestHealthyPeerDoesNotRenotify(t *testing.T) {
 	}
 }
 
-// TestProbeLoopDetectsRecoveryWithoutAnyTraffic is why the probe exists at all.
-// During a fault, writes to the replica are refused, so the write path produces no
-// successes to count — and only the Raft leader sends heartbeats. A ring-primary
-// that is not the leader would otherwise never learn that its replica came back.
-func TestProbeLoopDetectsRecoveryWithoutAnyTraffic(t *testing.T) {
-	var reachable atomic.Bool
-	ph := quietHealth([]string{"node2"}, HealthConfig{
-		Interval:     time.Millisecond,
-		StableChecks: 3,
-		Probe:        func(string) bool { return reachable.Load() },
-	})
+// TestLastReplicationSucceededIsPositiveEvidenceOnly is the distinction the
+// healthy-direction veto rests on. Healthy() conflates "reachable" with "no
+// opinion" — a freshly tracked peer and an untracked node both report healthy — so
+// it cannot be used to override the cluster's committed view. This must report
+// false until this node has actually replicated to the peer and got an answer.
+func TestLastReplicationSucceededIsPositiveEvidenceOnly(t *testing.T) {
+	ph := quietHealth([]string{"node2"}, HealthConfig{})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go ph.Run(ctx)
-
-	// The probe reports the peer down; it must be demoted with no other signal.
-	deadline := time.Now().Add(2 * time.Second)
-	for ph.Healthy("node2") && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	if !ph.Healthy("node2") {
+		t.Fatal("precondition: a freshly tracked peer should report healthy")
 	}
-	if ph.Healthy("node2") {
-		t.Fatal("the probe loop never demoted an unreachable peer")
+	if ph.LastReplicationSucceeded("node2") {
+		t.Error("a peer no replication has been attempted to reports a success; " +
+			"'no opinion' must not read as positive evidence")
+	}
+	if ph.LastReplicationSucceeded("node-unknown") {
+		t.Error("an untracked node reports a replication success")
 	}
 
-	reachable.Store(true)
-	select {
-	case id := <-ph.Recovered():
-		if id != "node2" {
-			t.Errorf("recovered %q, want node2", id)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("the probe loop never reported the peer's recovery")
+	// A heartbeat success is not replication evidence: only the leader sends
+	// heartbeats, and the veto is about the transport a catch-up pass would use.
+	ph.ObserveHeartbeat("node2", true)
+	if ph.LastReplicationSucceeded("node2") {
+		t.Error("a heartbeat success was recorded as a replication success")
+	}
+
+	ph.ObserveReplication("node2", true)
+	if !ph.LastReplicationSucceeded("node2") {
+		t.Error("a successful replication was not recorded as positive evidence")
 	}
 }
 
-// TestRunWithoutAProbeDoesNotSpin covers the degraded configuration: no probe
-// means recovery is detected only from traffic, and Run must simply wait rather
-// than busy-looping on a nil function.
-func TestRunWithoutAProbeDoesNotSpin(t *testing.T) {
-	ph := quietHealth([]string{"node2"}, HealthConfig{Interval: time.Millisecond})
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
+// TestLastReplicationSucceededFollowsTheMostRecentOutcome pins the self-correcting
+// half: the evidence is last-outcome-wins, so a peer that has genuinely gone away
+// withdraws its own veto on the next failed write, and one that comes back
+// restores it.
+func TestLastReplicationSucceededFollowsTheMostRecentOutcome(t *testing.T) {
+	ph := quietHealth([]string{"node2"}, HealthConfig{StableChecks: 3})
 
-	done := make(chan struct{})
-	go func() { ph.Run(ctx); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("Run did not return when its context was cancelled")
+	ph.ObserveReplication("node2", true)
+	ph.ObserveReplication("node2", false)
+	if ph.LastReplicationSucceeded("node2") {
+		t.Error("a failure did not withdraw the previous success")
+	}
+
+	// One success is enough to restore the evidence, and deliberately so: this is
+	// not the stable-health gate. The peer is still not Healthy here — that needs
+	// StableChecks consecutive observations — which is exactly the asymmetry the
+	// veto exploits, since a node that just reached a peer may catch it up.
+	ph.ObserveReplication("node2", true)
+	if !ph.LastReplicationSucceeded("node2") {
+		t.Error("a success after a failure did not restore the evidence")
+	}
+	if ph.Healthy("node2") {
+		t.Error("one success graduated the peer past the stable-health gate")
 	}
 }
 
 func TestPeersIsSorted(t *testing.T) {
-	ph := quietHealth([]string{"node3", "node1", "node2"}, HealthConfig{Probe: func(string) bool { return true }})
-	got := ph.Peers()
+	ph := quietHealth([]string{"node3", "node1", "node2"}, HealthConfig{})
+	got := ph.trackedPeers()
 	if len(got) != 3 || got[0] != "node1" || got[1] != "node2" || got[2] != "node3" {
-		t.Errorf("Peers() = %v, want sorted", got)
+		t.Errorf("trackedPeers() = %v, want sorted", got)
 	}
 }

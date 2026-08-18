@@ -37,9 +37,7 @@ func withAntiEntropy(t *testing.T, n *Node, peerIDs ...string) *antiEntropy {
 	n.cursors = cursors
 
 	n.health = cluster.NewPeerHealth(peerIDs, cluster.HealthConfig{
-		Interval: time.Hour, // the probe loop is not run in these tests
-		Probe:    func(string) bool { return true },
-		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 
 	n.antiEntropy = newAntiEntropy(

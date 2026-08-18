@@ -506,32 +506,59 @@ func (ae *antiEntropy) finalFlush() {
 
 // reachable reports whether a replica looks well enough to be worth catching up.
 //
-// # Precedence
+// It gates one thing only: whether the retry ticker schedules a pass. `repair`
+// itself consults no health signal, and `ReplicateWrite` consults none either —
+// so nothing here can withhold a write, and nothing here can stop a pass that has
+// already been scheduled.
 //
-// Consensus wins on "unhealthy": if the committed view says a peer is down, this
-// returns false whatever the local signals think. The committed view is
-// cluster-wide knowledge derived from the leader's own heartbeats to that peer,
-// so it is strictly better evidence than a local gRPC channel state, which says
-// only that *this* node's connection has not been torn down yet. The local
-// signals still veto independently — either saying "down" is enough — because
-// each of them observes a transport the catch-up pass will actually use.
+// # Precedence, and why it is asymmetric
+//
+// The two directions are deliberately not symmetric, because the two signals are
+// not equally good evidence in both directions.
+//
+//  1. **A local failure is decisive.** If this node's own most recent traffic to
+//     the peer failed, this returns false whatever the committed view says. A
+//     committed `health-up` is the *leader's* observation; it says nothing about
+//     whether this node can reach the peer, and letting it mask a local failure
+//     would send a pass down a transport this node already knows is broken. The
+//     behind-marking that a local failure produces is recorded by
+//     NoteReplicationFailure and is untouched by anything here.
+//
+//  2. **A committed "down" is decisive unless this node has reached the peer
+//     itself.** The committed view is cluster-wide knowledge derived from the
+//     leader's own heartbeats, so it is better evidence than nothing. But under an
+//     **asymmetric partition** the leader can be unable to reach a peer that a
+//     given ring-primary reaches perfectly well, and that ring-primary is the node
+//     that owes the peer its data. So a node holding positive local evidence —
+//     LastReplicationSucceeded, meaning its most recent replication RPC to that
+//     peer got an answer — overrides the committed "down" for its own repair
+//     scheduling. This is the veto, and it operates in the healthy direction only:
+//     it can cause a pass to be scheduled, never prevent one.
+//
+// `Healthy` deliberately does not serve as the veto's evidence. A peer starts
+// healthy and an untracked node reports healthy, so "healthy" also means "no
+// opinion" — using it here would let a node that has never spoken to a peer
+// overrule the cluster's committed view of it. LastReplicationSucceeded is false
+// until this node has actually put bytes on the wire and got an answer.
 //
 // # Why an over-cautious consensus view cannot stall repair
 //
-// This gate covers only the retry ticker. During a leaderless window no new
-// health entry can be committed, so the consensus view freezes; if it froze at
-// "down" for a peer that is in fact back, the retry loop skips it until a leader
-// emerges. Repair is not blocked in the meantime: a recovery seen by the local
-// probe still enqueues a pass through the recovered channel, and repair() itself
-// consults no health signal at all. The cost of a frozen view is a delay in the
-// slowest of the four paths, not a missed convergence — which is the reason the
-// transport probe is deliberately retained rather than replaced.
+// During a leaderless window no new health entry can be committed, so the
+// committed view freezes. If it froze at "down" for a peer that is in fact back,
+// this gate skips that peer on the retry ticker until either a leader emerges or
+// this node replicates to it successfully — at which point the veto fires. Repair
+// is not blocked in the meantime: both recovery channels enqueue a pass
+// independently of this gate, and a pass consults no health signal at all. The
+// cost of a frozen view is a delay in one of three paths, never a missed
+// convergence.
 func (ae *antiEntropy) reachable(nodeID string) bool {
-	if ae.consensus != nil && !ae.consensus.Healthy(nodeID) {
-		return false
-	}
+	// Direction 1: local failure evidence is never overridden.
 	if ae.health != nil && !ae.health.Healthy(nodeID) {
 		return false
+	}
+	// Direction 2: a committed "down" holds unless this node has reached the peer.
+	if ae.consensus != nil && !ae.consensus.Healthy(nodeID) {
+		return ae.health != nil && ae.health.LastReplicationSucceeded(nodeID)
 	}
 	return true
 }

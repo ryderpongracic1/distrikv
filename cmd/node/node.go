@@ -10,7 +10,6 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/connectivity"
 
 	"github.com/ryderpongracic1/distrikv/internal/cluster"
 	"github.com/ryderpongracic1/distrikv/internal/config"
@@ -107,7 +106,6 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 
 	// 4. Dial all peer gRPC connections with retry.
 	peerClients := make(map[string]kvpb.KVServiceClient, len(cfg.Peers))
-	peerConnByID := make(map[string]*grpc.ClientConn, len(cfg.Peers))
 	raftPeers := make([]raft.PeerClient, 0, len(cfg.Peers))
 
 	for _, p := range cfg.Peers {
@@ -117,12 +115,6 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 			return nil, fmt.Errorf("node: dial peer %s: %w", p.ID, err)
 		}
 		n.peerConns = append(n.peerConns, conn)
-		// Keyed here, where the connection and the peer it belongs to are both in
-		// hand. Pairing them up afterwards by slice index would work only as long
-		// as this loop and that one iterate cfg.Peers identically — a coupling that
-		// costs nothing to avoid and would mis-key a peer's health probe if it ever
-		// broke.
-		peerConnByID[p.ID] = conn
 		client := server.NewPeerClient(conn)
 		peerClients[p.ID] = client
 		raftPeers = append(raftPeers, raft.PeerClient{
@@ -181,11 +173,12 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 
 	// 8. Anti-entropy: converge replicas from this node's WAL after a fault.
 	//
-	//    Health is tracked from four signals — Raft heartbeats observed by the
-	//    leader, replication outcomes (this node's own writes), a transport probe
-	//    over the peer channels, and the committed health view the Raft log
-	//    carries, which is the only one a ring-primary that is not the Raft leader
-	//    gets for free. See cluster.PeerHealth and HealthStateMachine.
+	//    Health is tracked from three signals — the committed health view the Raft
+	//    log carries, which is the only one a ring-primary that is not the Raft
+	//    leader gets for free; this node's own replication outcomes; and the Raft
+	//    heartbeat outcomes the leader observes. All three are outcomes of traffic
+	//    the cluster was sending anyway: there is no dedicated probing machinery.
+	//    See cluster.PeerHealth and HealthStateMachine.
 	//
 	//    The cursor store itself was opened in step 2, so the store could take
 	//    ownership of invalidating it across a snapshot restore.
@@ -194,44 +187,8 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 		peerIDs = append(peerIDs, p.ID)
 	}
 
-	probeInterval, probeEnabled, err := transportProbeConfig(
-		os.Getenv(healthProbeIntervalEnv), cfg.HeartbeatInterval)
-	if err != nil {
-		return nil, err
-	}
-	probe := func(nodeID string) bool {
-		conn, ok := peerConnByID[nodeID]
-		if !ok {
-			return false
-		}
-		// A channel that is Ready has a live connection to the peer. Idle is
-		// also treated as reachable: gRPC parks a channel with no traffic in
-		// Idle, and reporting that as unreachable would demote a peer this
-		// node simply has not spoken to recently.
-		switch conn.GetState() {
-		case connectivity.Ready, connectivity.Idle:
-			return true
-		default:
-			return false
-		}
-	}
-	if !probeEnabled {
-		// Handing PeerHealth no probe is what stops the ticker: its Run loop
-		// waits on ctx instead of polling (see cluster.PeerHealth.Run). The other
-		// three signals are untouched, which is the configuration the pure-twist
-		// gate measures.
-		probe = nil
-		logger.Warn("transport probe disabled by "+healthProbeIntervalEnv+"=0; "+
-			"local recovery detection now comes only from replication successes and, "+
-			"where this node is the Raft leader, heartbeat successes — "+
-			"the committed health view is unaffected",
-			"component", "peer-health")
-	}
-
 	n.health = cluster.NewPeerHealth(peerIDs, cluster.HealthConfig{
-		Interval: probeInterval,
-		Probe:    probe,
-		Logger:   logger,
+		Logger: logger,
 	})
 	// The aggregator turns this node's heartbeat outcomes into proposed health
 	// transitions while it is the leader. It is registered *alongside* the local
@@ -295,16 +252,12 @@ func (n *Node) Run(ctx context.Context) error {
 		return nil
 	})
 
-	// Peer liveness tracking and replica catch-up. Both are pure background
-	// convergence work: they never gate a client write, and a failure in either
-	// leaves the CP write path exactly as it was.
-	if n.health != nil {
-		g.Go(func() error {
-			n.health.Run(gCtx)
-			return nil
-		})
-	}
-	// The aggregator's own goroutine, which is where the Raft append for a health
+	// Replica catch-up. Pure background convergence work: it never gates a client
+	// write, and a failure in it leaves the CP write path exactly as it was.
+	// Peer liveness needs no goroutine of its own — cluster.PeerHealth is fed by
+	// the heartbeat and replication paths as they happen.
+	//
+	// The aggregator's own goroutine is where the Raft append for a health
 	// transition happens. It is deliberately not the heartbeat goroutine that
 	// observed the transition: Propose fsyncs, and the heartbeat path is the one
 	// every follower's election timer depends on.

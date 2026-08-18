@@ -163,7 +163,8 @@ optimisation, chaos testing, and operational hardening.
 | 6 | LSM-Tree storage engine + Raft pre-vote and snapshot codec | ✅ Done |
 | 7 | `distrikv-cli` — first-class CLI tool | ✅ Done |
 | 8 | Raft log replication — §5.3 log matching, §5.4.2 commit rule, apply-on-commit, log persistence, `StateMachine` decoupling ([Raft](raft.md)) | ✅ Done |
-| 9 | Consensus node health — leader-side aggregator proposes transitions, every node applies the committed view, anti-entropy consumes it as a fourth signal ([Raft](raft.md)) | ✅ Done |
+| 9 | Consensus node health — leader-side aggregator proposes transitions, every node applies the committed view, anti-entropy consumes it ([Raft](raft.md)) | ✅ Done |
+| 10 | The pure twist — the transport probe removed after the [P2 gate](chaos-harness.md#the-p2-gate-passed) measured the configuration without it; health is the committed log plus the write path's own outcomes, with replication successes as a healthy-direction-only local veto ([Replication](replication-and-anti-entropy.md#the-trigger)) | ✅ Done |
 
 > **Phase 3 note — honest disclosure.** The replication fan-out
 > (`Node.ReplicateWrite`) was written during Phase 3, but nothing ever called

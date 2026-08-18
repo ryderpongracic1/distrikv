@@ -115,6 +115,26 @@ type Metrics struct {
 	// this node as covering only the writes its log can still account for.
 	AntiEntropyFullSyncRequired atomic.Uint64
 
+	// --- Consensus node health --------------------------------------------
+
+	// HealthTransitionsProposed counts node-health transitions this node appended
+	// to the Raft log. Only the leader proposes, so on a healthy cluster this is
+	// non-zero on exactly one node at a time and zero on the others — which is
+	// also how to tell which node's observations the current health view came
+	// from.
+	HealthTransitionsProposed atomic.Uint64
+
+	// HealthTransitionsCommitted counts health entries this node applied from the
+	// committed log, including entries that restate the view (a redundant apply
+	// after a restart, or a new leader re-asserting its predecessor's
+	// transition).
+	//
+	// It is the counter that distinguishes "the consensus signal is live" from
+	// "the log is empty and the local signals are carrying health on their own" —
+	// the state this system was in for three months without noticing. Every node
+	// increments it, leader or not: that is the point of the feature.
+	HealthTransitionsCommitted atomic.Uint64
+
 	// --- LSM engine counters (Phase 1 benchmark harness) -------------------
 
 	// BloomHits counts SSTable lookups where the Bloom filter returned true
@@ -204,6 +224,8 @@ func (m *Metrics) Snapshot() map[string]uint64 {
 		"anti_entropy_errors":             m.AntiEntropyPassErrors.Load(),
 		"anti_entropy_stale":              m.AntiEntropyStaleCursors.Load(),
 		"anti_entropy_full_sync_required": m.AntiEntropyFullSyncRequired.Load(),
+		"health_transitions_proposed":     m.HealthTransitionsProposed.Load(),
+		"health_transitions_committed":    m.HealthTransitionsCommitted.Load(),
 		"bloom_hits":                      m.BloomHits.Load(),
 		"bloom_misses":                    m.BloomMisses.Load(),
 		"bloom_false_positives":           m.BloomFalsePositives.Load(),

@@ -275,11 +275,12 @@ condition is latched durably in the cursor file and surfaced as
 to ship is reported as *"this node cannot converge this replica from its WAL"*
 rather than `replica caught up`.
 
-**Reachability, stated plainly.** This path is currently unreachable in a running
-cluster: no Raft snapshot file is ever created, because nothing proposes log
-entries. It is defensive hardening for whenever snapshots become real, plus
-correctness for direct callers. It fixes no live incident, and it is recorded that
-way rather than as a save.
+**Reachability, stated plainly.** This path has no caller in a running cluster:
+Raft's snapshots carry the health state machine's payload rather than the storage
+engine's, so nothing asks the store to restore from one. It is defensive
+hardening for whenever a store-level snapshot becomes real, plus correctness for
+direct callers. It fixes no live incident, and it is recorded that way rather than
+as a save.
 
 ---
 

@@ -71,6 +71,7 @@ func withAntiEntropyLogging(t *testing.T, n *Node, afterRestore bool, peerIDs ..
 	n.antiEntropy = newAntiEntropy(
 		n.cfg.NodeID, n.cfg.ReplicaCount, peerIDs,
 		n.store, cursors, n.ring, n.peerClients, n.health,
+		nil, // no consensus health signal: these tests drive the local signals
 		n.raft.CurrentTerm, n.metrics, logger,
 		antiEntropyConfig{SettleDelay: time.Millisecond},
 	)

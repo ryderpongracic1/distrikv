@@ -78,6 +78,7 @@ func restartPrimary(t *testing.T, n *Node, peerIDs ...string) *antiEntropy {
 	ae := newAntiEntropy(
 		n.cfg.NodeID, n.cfg.ReplicaCount, peerIDs,
 		n.store, cursors, n.ring, n.peerClients, n.health,
+		nil, // no consensus health signal: these tests drive the local signals
 		n.raft.CurrentTerm, n.metrics, n.logger,
 		antiEntropyConfig{SettleDelay: time.Millisecond},
 	)
@@ -227,7 +228,7 @@ func TestAntiEntropyWithholdsTheClaimWhenACursorCannotDescribeThisLog(t *testing
 	// cursor the log cannot account for, not the restart mechanics.
 	reopened := newAntiEntropy(
 		n.cfg.NodeID, n.cfg.ReplicaCount, []string{"node2"},
-		n.store, n.cursors, n.ring, n.peerClients, nil,
+		n.store, n.cursors, n.ring, n.peerClients, nil, nil,
 		n.raft.CurrentTerm, n.metrics, n.logger, antiEntropyConfig{},
 	)
 

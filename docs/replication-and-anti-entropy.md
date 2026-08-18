@@ -65,27 +65,54 @@ A catch-up runs when a replica transitions **unreachable → healthy**, gated on
 restarted accepts connections before it is useful (WAL to replay, compaction
 backlog to arm), and a flapping peer would otherwise trigger a pass per flap.
 
-Health merges three signals, because no single one is enough:
+Health merges four signals, because no single one is enough:
 
 | Signal | Available on | Detects |
 |---|---|---|
 | Raft heartbeat outcomes | the leader only | failure and recovery, most directly |
 | Replication RPC outcomes | every ring-primary | failure |
 | gRPC channel state probe | every node | recovery |
+| **Committed health entries** (`HealthStateMachine`) | **every node** | **failure and recovery, cluster-consistently** |
 
 The heartbeat signal is the one the design called for and is wired in
 (`raft.SetPeerHealthObserver`), but only the Raft leader sends heartbeats — and in
 distrikv ring ownership is deliberately unrelated to Raft leadership, so a
 follower that is nonetheless a ring-primary would learn nothing from it. The
-probe is what lets that node notice its replica came *back*: during a fault,
+probe is what let that node notice its replica came *back*: during a fault,
 writes to the replica are being refused, so the write path produces no successes
 to count.
 
-Two things also schedule a pass: a replica still marked behind is retried every
-`RetryInterval` (5 s), and a durable cursor behind the tip at startup queues one
-immediately.
+The fourth signal is what closes that gap rather than working around it. The
+leader's heartbeat observations are aggregated with hysteresis and **committed
+through the Raft log**, so every node applies the same transitions and every
+ring-primary reads the same health view — leader or not. See
+[raft.md](raft.md) for the transition encoding, the hysteresis defaults, and the
+discriminating test that proves a follower can schedule a catch-up from consensus
+alone.
 
-Those three schedulers do not know about each other, so they are **coalesced per
+**Precedence.** A committed `health-down` is sufficient on its own to hold the
+retry loop back, whatever the local signals say: it is the leader's own heartbeat
+outcome against that peer, agreed cluster-wide, which is strictly better evidence
+than a local gRPC channel state that reports Ready or Idle for a peer this node
+simply has not spoken to recently. The local signals still veto independently —
+either saying "down" is enough — because each observes a transport the catch-up
+pass will actually use. The gate is `antiEntropy.reachable`.
+
+That precedence cannot stall repair, and the reason is worth stating because it is
+what justifies keeping the probe. The gate covers only the retry ticker. During a
+leaderless window no new health entry can be committed, so the consensus view
+freezes; if it froze at "down" for a peer that is in fact back, the retry loop
+skips that peer until a leader emerges. Meanwhile a recovery seen by the local
+probe still enqueues a pass through the recovered channel, and a pass itself
+consults no health signal at all. The cost of a frozen view is a delay in the
+slowest of the four paths, never a missed convergence.
+
+Three things also schedule a pass: a replica still marked behind is retried every
+`RetryInterval` (5 s), a durable cursor behind the tip at startup queues one
+immediately, and either recovery channel — local or consensus — queues one on the
+transition.
+
+Those schedulers do not know about each other, so they are **coalesced per
 replica**: while a cycle for a replica is queued or running, another request for the
 same replica is dropped rather than queued behind it. Without that, a replica could
 have several identical cycles pending at once; every one after the first finds
@@ -622,14 +649,17 @@ The node therefore does two things rather than pretending otherwise:
   replaced), so post-restore writes outrank everything the previous incarnation
   issued. See [defect 12](defect-log.md#defect-12-a-primary-that-lost-its-data-directory-had-its-writes-discarded-and-acked).
 
-**Reachability, stated plainly: this path is currently unreachable in a running
-cluster.** No Raft snapshot file is ever created — `takeSnapshot` fires only from
-`applyEntryLocked`, and nothing proposes log entries, because the ring (not the
-Raft log) carries the data. So `RestoreFromSnapshot` is reached today only by
-tests calling it directly. This is defensive hardening for whenever snapshots
-become real, plus correctness for direct callers; it fixes no live incident. It is
-recorded here rather than in a commit message because the same reasoning is what
-makes the missing full-sync mechanism a *known* gap rather than an oversight.
+**Reachability, stated plainly: this path has no caller in a running cluster.**
+Raft used to be the only one, and since the `StateMachine` decoupling its
+snapshots carry the health state machine's payload rather than the storage
+engine's — so `store.RestoreFromSnapshot` is now dead by *structure* rather than
+dead by circumstance, and is reached only by tests calling it directly. (The
+Raft snapshot path itself is reachable now that the log has a producer, but it
+compacts the health view, not the store; see [raft.md](raft.md).) This is
+defensive hardening for whenever a store-level snapshot becomes real, plus
+correctness for direct callers; it fixes no live incident. It is recorded here
+rather than in a commit message because the same reasoning is what makes the
+missing full-sync mechanism a *known* gap rather than an oversight.
 
 *Designed but not built (v1):* full sync is a key-range scan shipped to the
 replica — walk this node's live keys (the engine already iterates them for

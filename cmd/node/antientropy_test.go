@@ -45,6 +45,7 @@ func withAntiEntropy(t *testing.T, n *Node, peerIDs ...string) *antiEntropy {
 	n.antiEntropy = newAntiEntropy(
 		n.cfg.NodeID, n.cfg.ReplicaCount, peerIDs,
 		n.store, cursors, n.ring, n.peerClients, n.health,
+		nil, // no consensus health signal: these tests drive the local signals
 		n.raft.CurrentTerm, n.metrics, n.logger,
 		antiEntropyConfig{SettleDelay: time.Millisecond},
 	)
@@ -317,7 +318,7 @@ func TestAntiEntropyCursorSurvivesRestart(t *testing.T) {
 	// replica is owed writes — no health transition is coming to tell it.
 	restarted := newAntiEntropy(
 		n.cfg.NodeID, n.cfg.ReplicaCount, []string{"node2"},
-		n.store, reopened, n.ring, n.peerClients, nil,
+		n.store, reopened, n.ring, n.peerClients, nil, nil,
 		n.raft.CurrentTerm, n.metrics, n.logger, antiEntropyConfig{},
 	)
 	if !restarted.behindReplicas0(t, "node2") {

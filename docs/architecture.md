@@ -3,13 +3,16 @@
 distrikv is a sharded, replicated key-value store. A consistent hash ring decides
 where each key lives; the ring-primary owns writes for its keys and replicates
 them synchronously to the rest of the replica set; and Raft runs alongside as a
-leader-election and failure-detection mechanism that never carries data.
+leader-election, failure-detection and node-health replication mechanism that
+never carries data.
 
 **That split is a deliberate design decision, not an omission.** Raft answers
-"which nodes are alive, and who is the leader". The hash ring answers "where does
-this key live, and who replicates it". It is the Cassandra-style arrangement
-rather than the etcd-style one, and the guarantees distrikv therefore does *not*
-have are stated in [CAP Position](#cap-position) and in
+"which nodes are alive, and who is the leader" — and answers the first of those
+*through its own log*, so every node reads the same committed health view rather
+than only the leader knowing anything. The hash ring answers "where does this key
+live, and who replicates it". It is the Cassandra-style arrangement rather than
+the etcd-style one, and the guarantees distrikv therefore does *not* have are
+stated in [CAP Position](#cap-position) and in
 [raft.md](raft.md) under *Intentional deviations from the paper* — not left to be
 inferred.
 
@@ -37,7 +40,7 @@ Each subsystem has its own document:
 | --- | --- |
 | LSM-Tree engine, WAL, compaction, write stalls, block cache | [lsm-engine.md](lsm-engine.md) |
 | CP write path, refused-but-applied, anti-entropy and its known limits | [replication-and-anti-entropy.md](replication-and-anti-entropy.md) |
-| Raft's honest scope, the log path and its idle producer, deviations from the paper | [raft.md](raft.md) |
+| Raft's honest scope, consensus node health, deviations from the paper | [raft.md](raft.md) |
 | Porcupine model, nemesis, convergence gate, counterexample output | [chaos-harness.md](chaos-harness.md) |
 | Every measured table, including the etcd ceiling comparison | [benchmarks.md](benchmarks.md) |
 | The numbered log of defects the harness found | [defect-log.md](defect-log.md) |
@@ -159,7 +162,8 @@ optimisation, chaos testing, and operational hardening.
 | 5 | Docker Compose cluster + demo script | ✅ Done |
 | 6 | LSM-Tree storage engine + Raft pre-vote and snapshot codec | ✅ Done |
 | 7 | `distrikv-cli` — first-class CLI tool | ✅ Done |
-| 8 | Raft log replication — §5.3 log matching, §5.4.2 commit rule, apply-on-commit, log persistence, `StateMachine` decoupling ([Raft](raft.md)) | ✅ Done — no producer yet |
+| 8 | Raft log replication — §5.3 log matching, §5.4.2 commit rule, apply-on-commit, log persistence, `StateMachine` decoupling ([Raft](raft.md)) | ✅ Done |
+| 9 | Consensus node health — leader-side aggregator proposes transitions, every node applies the committed view, anti-entropy consumes it as a fourth signal ([Raft](raft.md)) | ✅ Done |
 
 > **Phase 3 note — honest disclosure.** The replication fan-out
 > (`Node.ReplicateWrite`) was written during Phase 3, but nothing ever called

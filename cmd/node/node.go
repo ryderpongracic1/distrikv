@@ -35,7 +35,9 @@ type Node struct {
 	peerClients map[string]kvpb.KVServiceClient // nodeID → gRPC client
 	peerConns   []*grpc.ClientConn              // held for Clean shutdown
 	cursors     *store.CursorStore              // per-replica WAL catch-up cursors
-	health      *cluster.PeerHealth             // peer liveness, drives catch-up
+	health      *cluster.PeerHealth             // local peer liveness signals
+	healthSM    *HealthStateMachine             // committed, cluster-wide health view
+	healthAgg   *healthAggregator               // leader-side proposer of health transitions
 	antiEntropy *antiEntropy                    // replica convergence engine
 	logger      *slog.Logger
 }
@@ -140,9 +142,14 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 		SnapshotThreshold:  1000,
 	}
 	// The Raft log carries cluster-control entries, never key/value data, so it
-	// is given its own state machine rather than the storage engine. Phase B
-	// swaps this placeholder for the node-health state machine.
-	raftNode, err := raft.New(raftCfg, raftPeers, newPlaceholderStateMachine(logger), &metricsAdapter{n.metrics}, logger)
+	// is given its own state machine rather than the storage engine. That state
+	// machine is the committed node-health view: the leader observes peers
+	// through its heartbeats and proposes transitions, and every node — leader or
+	// not — applies the same committed sequence.
+	healthSM := newHealthStateMachine(cfg.NodeID, len(cfg.Peers), n.metrics, logger)
+	n.healthSM = healthSM
+
+	raftNode, err := raft.New(raftCfg, raftPeers, healthSM, &metricsAdapter{n.metrics}, logger)
 	if err != nil {
 		_ = s.Close()
 		return nil, fmt.Errorf("node: init raft: %w", err)
@@ -174,10 +181,11 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 
 	// 8. Anti-entropy: converge replicas from this node's WAL after a fault.
 	//
-	//    Health is tracked from three signals — Raft heartbeats (leader only),
-	//    replication outcomes (this node's own writes), and a transport probe
-	//    over the peer channels, which is the only one that tells a non-leader
-	//    that a peer has come back. See cluster.PeerHealth.
+	//    Health is tracked from four signals — Raft heartbeats observed by the
+	//    leader, replication outcomes (this node's own writes), a transport probe
+	//    over the peer channels, and the committed health view the Raft log
+	//    carries, which is the only one a ring-primary that is not the Raft leader
+	//    gets for free. See cluster.PeerHealth and HealthStateMachine.
 	//
 	//    The cursor store itself was opened in step 2, so the store could take
 	//    ownership of invalidating it across a snapshot restore.
@@ -206,7 +214,15 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 		},
 		Logger: logger,
 	})
-	raftNode.SetPeerHealthObserver(n.health)
+	// The aggregator turns this node's heartbeat outcomes into proposed health
+	// transitions while it is the leader. It is registered *alongside* the local
+	// tracker, not in place of it: raft holds a single observer slot, and the
+	// local signals are what cover a leaderless window, when no health entry can
+	// be committed at all.
+	n.healthAgg = newHealthAggregator(
+		raftNode, healthSM, len(cfg.Peers), n.metrics, logger, healthAggregatorConfig{},
+	)
+	raftNode.SetPeerHealthObserver(multiPeerHealthObserver{n.health, n.healthAgg})
 
 	n.antiEntropy = newAntiEntropy(
 		cfg.NodeID,
@@ -217,6 +233,7 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 		ring,
 		peerClients,
 		n.health,
+		healthSM,
 		raftNode.CurrentTerm,
 		n.metrics,
 		logger,
@@ -265,6 +282,16 @@ func (n *Node) Run(ctx context.Context) error {
 	if n.health != nil {
 		g.Go(func() error {
 			n.health.Run(gCtx)
+			return nil
+		})
+	}
+	// The aggregator's own goroutine, which is where the Raft append for a health
+	// transition happens. It is deliberately not the heartbeat goroutine that
+	// observed the transition: Propose fsyncs, and the heartbeat path is the one
+	// every follower's election timer depends on.
+	if n.healthAgg != nil {
+		g.Go(func() error {
+			n.healthAgg.Run(gCtx)
 			return nil
 		})
 	}

@@ -192,6 +192,20 @@ type replicaState struct {
 	logGapReason string
 }
 
+// consensusHealth is the committed, cluster-wide health view the Raft log
+// carries — the fourth signal, and the only one available to a ring-primary that
+// is not the Raft leader. cmd/node's HealthStateMachine implements it; a nil
+// value means this node has no consensus signal wired, which is how every test
+// that predates the feature keeps its original behaviour.
+type consensusHealth interface {
+	// Healthy reports the committed view of a peer. A peer no transition has been
+	// committed for reports healthy.
+	Healthy(nodeID string) bool
+
+	// Recovered carries committed unhealthy → healthy transitions.
+	Recovered() <-chan string
+}
+
 // antiEntropy converges this node's replicas with its own WAL. One instance per
 // node; safe for concurrent use.
 type antiEntropy struct {
@@ -199,14 +213,15 @@ type antiEntropy struct {
 	replicaCount int
 	cfg          antiEntropyConfig
 
-	store   *store.Store
-	cursors *store.CursorStore
-	ring    *cluster.Ring
-	peers   map[string]kvpb.KVServiceClient
-	health  *cluster.PeerHealth
-	term    func() uint64
-	metrics *metrics.Metrics
-	logger  *slog.Logger
+	store     *store.Store
+	cursors   *store.CursorStore
+	ring      *cluster.Ring
+	peers     map[string]kvpb.KVServiceClient
+	health    *cluster.PeerHealth
+	consensus consensusHealth
+	term      func() uint64
+	metrics   *metrics.Metrics
+	logger    *slog.Logger
 
 	mu      sync.Mutex
 	replica map[string]*replicaState
@@ -232,6 +247,7 @@ func newAntiEntropy(
 	ring *cluster.Ring,
 	peers map[string]kvpb.KVServiceClient,
 	health *cluster.PeerHealth,
+	consensus consensusHealth,
 	term func() uint64,
 	m *metrics.Metrics,
 	logger *slog.Logger,
@@ -246,6 +262,7 @@ func newAntiEntropy(
 		ring:         ring,
 		peers:        peers,
 		health:       health,
+		consensus:    consensus,
 		term:         term,
 		metrics:      m,
 		logger:       logger.With("component", "anti-entropy"),
@@ -389,6 +406,23 @@ func (ae *antiEntropy) Run(ctx context.Context) {
 		recovered = ae.health.Recovered()
 	}
 
+	// The fourth signal: recoveries the cluster agreed on through the Raft log.
+	//
+	// This is the one that reaches a ring-primary which is not the Raft leader.
+	// The three local signals only ever told such a node that a peer had *gone*
+	// (its own replication failures) or made it discover recovery for itself with
+	// a transport probe; the leader's direct heartbeat observation stopped at the
+	// leader. A committed transition reaches every node, so every ring-primary
+	// now schedules its catch-up off the same evidence.
+	//
+	// It is additive. Both channels feed the same enqueue, which coalesces per
+	// replica, so whichever signal notices first schedules the pass and the other
+	// is dropped as already-pending.
+	var consensusRecovered <-chan string
+	if ae.consensus != nil {
+		consensusRecovered = ae.consensus.Recovered()
+	}
+
 	// One repair cycle at a time, cluster-wide for this node: passes read the
 	// same WAL and the point of a pass is to catch up, not to race.
 	var wg sync.WaitGroup
@@ -440,9 +474,12 @@ func (ae *antiEntropy) Run(ctx context.Context) {
 		case nodeID := <-recovered:
 			enqueue(nodeID, "peer recovered")
 
+		case nodeID := <-consensusRecovered:
+			enqueue(nodeID, "peer recovered (consensus)")
+
 		case <-retry.C:
 			for _, id := range ae.behindReplicas() {
-				if ae.health != nil && !ae.health.Healthy(id) {
+				if !ae.reachable(id) {
 					continue // still down; catching it up would just fail
 				}
 				enqueue(id, "replica still behind")
@@ -465,6 +502,38 @@ func (ae *antiEntropy) finalFlush() {
 	if err := ae.cursors.Flush(); err != nil {
 		ae.logger.Warn("persist replica cursors on shutdown", "err", err)
 	}
+}
+
+// reachable reports whether a replica looks well enough to be worth catching up.
+//
+// # Precedence
+//
+// Consensus wins on "unhealthy": if the committed view says a peer is down, this
+// returns false whatever the local signals think. The committed view is
+// cluster-wide knowledge derived from the leader's own heartbeats to that peer,
+// so it is strictly better evidence than a local gRPC channel state, which says
+// only that *this* node's connection has not been torn down yet. The local
+// signals still veto independently — either saying "down" is enough — because
+// each of them observes a transport the catch-up pass will actually use.
+//
+// # Why an over-cautious consensus view cannot stall repair
+//
+// This gate covers only the retry ticker. During a leaderless window no new
+// health entry can be committed, so the consensus view freezes; if it froze at
+// "down" for a peer that is in fact back, the retry loop skips it until a leader
+// emerges. Repair is not blocked in the meantime: a recovery seen by the local
+// probe still enqueues a pass through the recovered channel, and repair() itself
+// consults no health signal at all. The cost of a frozen view is a delay in the
+// slowest of the four paths, not a missed convergence — which is the reason the
+// transport probe is deliberately retained rather than replaced.
+func (ae *antiEntropy) reachable(nodeID string) bool {
+	if ae.consensus != nil && !ae.consensus.Healthy(nodeID) {
+		return false
+	}
+	if ae.health != nil && !ae.health.Healthy(nodeID) {
+		return false
+	}
+	return true
 }
 
 // behindReplicas returns the replicas currently believed to be behind.

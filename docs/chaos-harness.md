@@ -409,7 +409,7 @@ typed `forward_outcome` field rather than a bigger budget or a restored substrin
 With never-sent forwards classified as no-ops again, the pending count falls to the
 genuinely ambiguous handful and the checker reaches a verdict.
 
-*What the final runs found (2026-08-16, commit e59a545).* With the typed
+*What the final runs found (2026-08-16, commit e0458c4).* With the typed
 `forward_outcome` field, the election storm fixed (heartbeats now unconditional),
 and the recovery deadlock resolved (compaction armed at open), both nemesis modes
 pass — including `kill-restart`, the first PASS ever on this project:

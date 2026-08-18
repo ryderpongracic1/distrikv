@@ -166,21 +166,21 @@ it is what the rest of this section turns on.
 
 | Date | Build | Run | p99 | Max queue depth | Saturated? |
 | --- | --- | ---: | ---: | ---: | --- |
-| 08-17 | Post-H2 (`cab1dd9`) | 1 | **40.5 ms** | 36 | No |
-| 08-17 | Pre-H2 (`47958bb`) | 1 | **53.9 ms** | 57 | No |
-| 08-18 | Post-H2 (`c2495b0`) | 1 | **34.8 ms** | 20 | No |
-| 08-18 | Post-H2 (`c2495b0`) | 2 | 1,119 ms | 513 | **TRUE** |
-| 08-18 | Post-H2 (`c2495b0`) | 3 | 1,366 ms | 512 | **TRUE** |
-| 08-18 | Pre-H2 (`47958bb`) | 1 | 1,055 ms | — | **TRUE** |
-| 08-18 | Pre-H2 (`47958bb`) | 2 | 1,254 ms | — | **TRUE** |
-| 08-18 | Pre-H2 (`47958bb`) | 3 | 1,260 ms | — | **TRUE** |
+| 08-17 | Post-H2 (`28d410e`) | 1 | **40.5 ms** | 36 | No |
+| 08-17 | Pre-H2 (`5c7aa92`) | 1 | **53.9 ms** | 57 | No |
+| 08-18 | Post-H2 (`738ece7`) | 1 | **34.8 ms** | 20 | No |
+| 08-18 | Post-H2 (`738ece7`) | 2 | 1,119 ms | 513 | **TRUE** |
+| 08-18 | Post-H2 (`738ece7`) | 3 | 1,366 ms | 512 | **TRUE** |
+| 08-18 | Pre-H2 (`5c7aa92`) | 1 | 1,055 ms | — | **TRUE** |
+| 08-18 | Pre-H2 (`5c7aa92`) | 2 | 1,254 ms | — | **TRUE** |
+| 08-18 | Pre-H2 (`5c7aa92`) | 3 | 1,260 ms | — | **TRUE** |
 
 A dash in the queue column means the depth was not recorded for that run, not that
 it was zero; the saturation flag is what was captured.
 
 Full percentiles for the two unsaturated 08-17 runs, which are the only pair
-measured with the whole distribution recorded: post-H2 `cab1dd9` p50 1.8 ms, p90
-4.7 ms, p99 40.5 ms, p999 114.9 ms, 0 errors; pre-H2 `47958bb` p50 1.7 ms, p90
+measured with the whole distribution recorded: post-H2 `28d410e` p50 1.8 ms, p90
+4.7 ms, p99 40.5 ms, p999 114.9 ms, 0 errors; pre-H2 `5c7aa92` p50 1.7 ms, p90
 4.6 ms, p99 53.9 ms, p999 130.6 ms, 0 errors. Note that p50 and p90 are within
 ~0.1 ms of each other across builds — the divergence is confined to the tail, which
 is the part this regime measures worst.
@@ -272,7 +272,7 @@ service latency instead of queue wait. Discard, or re-run, any run whose
 the store, and averaging it with an unsaturated run mixes two different quantities.
 
 Note for anyone re-running this after the incarnation-epoch change: **both builds
-measured above predate it** (`cab1dd9` and `47958bb`). The epoch adds work to the
+measured above predate it** (`28d410e` and `5c7aa92`). The epoch adds work to the
 same critical section — two shifts, plus a handful of atomic counter increments on a
 *refused* write only (see
 [replication-and-anti-entropy.md → observables](replication-and-anti-entropy.md#what-is-guaranteed-and-what-is-not)).

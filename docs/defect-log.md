@@ -187,7 +187,7 @@ now `nextIndex <= snapLastIndex` and rides alongside the heartbeat rather than
 replacing it; the RPC deadline is decoupled from the send period and bounded by
 the minimum election timeout.
 
-**Field validation (2026-08-16, commit e59a545).** One election at startup
+**Field validation (2026-08-16, commit e0458c4).** One election at startup
 (term 5130 → 5131, the inherited number a fossil of the storm era), then term
 **flat for 2+ minutes**, all three nodes agreeing, exactly one leader at all
 times. `internal/raft/cluster_test.go` now fails if the term advances more than
@@ -232,7 +232,7 @@ Alongside it: the hard stop is bounded and returns a distinguishable
 rather than dead; `Restore` bulk-loads instead of fsyncing per key; and the
 replication deadline became an independent 2 s instead of 2× a Raft tuning knob.
 
-**Validated on the same dirty volumes (2026-08-16, commit e59a545).** The volumes
+**Validated on the same dirty volumes (2026-08-16, commit e0458c4).** The volumes
 that produced 287 ops / 164 errors now produce **122,551 ops / 30 s with 0
 errors**, PASS in 58 ms. Deterministically: time-to-first-accepted-write goes from
 *never* (no write accepted in 30 s) to **63 ms**, and at bench scale to 270 ms.
@@ -331,7 +331,7 @@ tip converts an over-shipping bug into **permanent silent divergence**.
 
 ## Defect 10: WAL segment numbers reused across a graceful restart
 
-**Class:** silently wrong convergence claim, live · **Fixed in:** `868bad3` · **Found by:** the convergence gate · **Narrated in:** [replication-and-anti-entropy.md → Guaranteed across a primary restart](replication-and-anti-entropy.md#what-is-guaranteed-and-what-is-not)
+**Class:** silently wrong convergence claim, live · **Fixed in:** `4fbb94c` · **Found by:** the convergence gate · **Narrated in:** [replication-and-anti-entropy.md → Guaranteed across a primary restart](replication-and-anti-entropy.md#what-is-guaranteed-and-what-is-not)
 
 A replica cursor is a `(segment, byte offset)` pair, so it only means anything
 while segment numbers are never reused. They were. A graceful `Close` flushes the
@@ -378,7 +378,7 @@ nothing.
 
 ## Defect 11: LSM sequence counter reopened at zero
 
-**Class:** data loss / consistency · **Fixed in:** `0ca6c3b` · **Found by:** the Porcupine checker, within hours of defect 10 clearing the convergence noise out of its way · **Narrated in:** [lsm-engine.md → Write sequence numbers](lsm-engine.md#lsm-tree-storage-engine-internalstorelsm)
+**Class:** data loss / consistency · **Fixed in:** `700ad7f` · **Found by:** the Porcupine checker, within hours of defect 10 clearing the convergence noise out of its way · **Narrated in:** [lsm-engine.md → Write sequence numbers](lsm-engine.md#lsm-tree-storage-engine-internalstorelsm)
 
 Every entry carries a sequence number, and that number is how compaction decides
 between two versions of a key: the higher one wins and the loser is **dropped**,

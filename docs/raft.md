@@ -92,7 +92,7 @@ This is the log's producer, and the reason the log exists.
 
 Because the data path is ring-based and never consults Raft leadership, the storm cost nothing but log volume and wasted CPU — which is why it went unnoticed until the container logs were read directly. `internal/raft/cluster_test.go` now stands an in-process 3-node cluster up and fails if the term advances more than once over three seconds, both on an idle cluster and with per-RPC latency injected above the send interval.
 
-**Field validation (2026-08-16, commit e59a545).** Measured on a live 3-node
+**Field validation (2026-08-16, commit e0458c4).** Measured on a live 3-node
 docker-compose cluster (Apple M4 Pro, Colima VM 8 CPU / 8 GB) with accumulated
 data volumes from prior bench and chaos runs: one election at startup
 (term 5130 → 5131 — the inherited term being a fossil of the storm era), then term

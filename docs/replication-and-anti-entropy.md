@@ -331,7 +331,7 @@ Pro, 3-node Colima cluster, fresh cluster and prefill per run — [benchmarks.md
 | Configuration | Post-H2 | Pre-H2 | Reading |
 | --- | --- | --- | --- |
 | Memtable-resident writes (1,200 qps, Zipf, 100k keys) | p99 **3.8 ms**, p999 8.1 ms | p99 4.6 ms, p999 13.6 ms (08-16 baseline) | No regression; the improvement is within run variance |
-| Flushed-key writes (1,200 qps, Zipf over a 500k prefill) | p99 **40.5 ms** / **34.8 ms** unsaturated | p99 53.9 ms unsaturated (control at `47958bb`) | No evidence of regression, and no ranking. Across n=3 per build, 5 of 6 runs tripped the saturation flag (~1.2 s p99 of *queue wait*, not service latency) on both builds alike, so no per-build p99 comparison is drawn from the series; the reading is that 1,200 qps against a flushed 500k store is at or above the cluster's capacity knee. Neither the three unsaturated latencies nor the saturation behaviour separates the builds |
+| Flushed-key writes (1,200 qps, Zipf over a 500k prefill) | p99 **40.5 ms** / **34.8 ms** unsaturated | p99 53.9 ms unsaturated (control at `5c7aa92`) | No evidence of regression, and no ranking. Across n=3 per build, 5 of 6 runs tripped the saturation flag (~1.2 s p99 of *queue wait*, not service latency) on both builds alike, so no per-build p99 comparison is drawn from the series; the reading is that 1,200 qps against a flushed 500k store is at or above the cluster's capacity knee. Neither the three unsaturated latencies nor the saturation behaviour separates the builds |
 
 The second row is the discriminating one, because the memtable-resident workload
 barely exercises the path that was flagged: with zero flushes there is nothing to

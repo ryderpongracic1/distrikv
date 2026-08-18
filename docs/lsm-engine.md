@@ -228,7 +228,7 @@ for 80+ minutes, where a clean-slate cluster on the identical binary served
 forward errors (503s and 502s) because the writes never returned — the stalled
 node was a black hole, not a slow node.
 
-**Validated on dirty volumes (2026-08-16, commit e59a545).** The same accumulated
+**Validated on dirty volumes (2026-08-16, commit e0458c4).** The same accumulated
 data volumes (bench + chaos residue) that produced 287 ops / 164 errors before the
 fix now produce **122,551 ops / 30 s with 0 errors**, PASS in 58 ms. The
 compaction-arm-at-open fix converts a permanent write outage into a sub-100 ms

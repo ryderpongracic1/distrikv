@@ -533,6 +533,13 @@ interleaving, end to end), `TestCatchUpReplayCarriesTheReplayMarker`,
 `TestLiveWriteIsNotMarkedAsReplay`, `TestReplayRefusalIsNotAnEpochRegression` and
 `TestReplicateHandlerPassesReplayMarker`.
 
+Validated live 2026-08-17 on the fixed build: the stop-restart gate passed with
+`converged: true` in **20 ms on the first attempt** (the fastest convergence any
+run has recorded), 1,850/57/149 replay discards counted across the three nodes,
+and both epoch counters at 0 — which the fix upgrades from "the race window was
+not hit" to "no live-write epoch regression occurred," since a replay can no
+longer touch those counters at all.
+
 ---
 
 ## Smaller findings

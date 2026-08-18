@@ -98,11 +98,13 @@ ACK from each replica.
 | 100% replicated writes (PUT) | **1,199 /s** | 1.7 ms | **4.6 ms** |
 | 20% write / 80% read | 3,000 /s | 0.70 ms | 2.5 ms |
 
-Re-measured on 2026-08-17 after replicated writes began carrying a per-key
+Re-measured on 2026-08-17/18 after replicated writes began carrying a per-key
 sequence, in both the configuration above and one that forces the comparison onto
-the SSTable path: no regression on either, and a pre-change control run shows the
-flushed-key write tail is *worse* before the change than after it. Numbers,
-controls and engine counters in
+the SSTable path: **no evidence of regression from three independent directions**
+(unsaturated latencies, saturation behaviour, and engine counters proving the
+comparison path live in one build and absent in the other). The flushed-key
+configuration turned out to sit at the cluster's capacity knee, so no per-build
+p99 ranking is drawn from it — the eight-run table with the saturation column is in
 [benchmarks.md → Post-H2 re-measurement](docs/benchmarks.md#post-h2-re-measurement-2026-08-17-same-cluster-and-method).
 
 **LSM read path** — 500k-key prefill so reads must traverse SSTables, then three
@@ -140,6 +142,14 @@ run (4.3–6.0 s, 9–12 attempts), `linearizable: PASS`, `indeterminate writes:
 14,295–29,949 refused-but-applied per run, check durations 169–206 ms.
 `kill-restart` passed 2/2 the same day as the control. Full table in
 [chaos-harness.md](docs/chaos-harness.md).
+
+**Final state (2026-08-17, all thirteen defects fixed):** the same gate on the
+finished build converged in **20 ms on the first attempt** — the fastest
+convergence any run has recorded, because idempotent replay finishes the repair
+during the run and the post-run check finds nothing left to do. 18,008
+refused-but-applied writes, `linearizable: PASS`, and both epoch-regression
+counters at 0 on every node — a reading the replay-classification fix makes
+structurally meaningful, since a catch-up replay can no longer touch them.
 
 **Positioned against etcd**, the reference CP key-value store: at matched
 throughput (~6,000 reads/s) etcd's read p99 is **0.79 ms vs distrikv's 1.7 ms** —

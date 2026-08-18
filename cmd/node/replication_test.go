@@ -153,7 +153,7 @@ func testNodeInDir(t *testing.T, dir string, replicaCount int, peerIDs ...string
 		ElectionTimeoutMin: 150 * time.Millisecond,
 		ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval:  cfg.HeartbeatInterval,
-	}, nil, st, &metricsAdapter{m}, logger)
+	}, nil, newPlaceholderStateMachine(logger), &metricsAdapter{m}, logger)
 	if err != nil {
 		t.Fatalf("init raft: %v", err)
 	}

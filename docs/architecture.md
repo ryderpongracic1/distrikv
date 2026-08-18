@@ -37,7 +37,7 @@ Each subsystem has its own document:
 | --- | --- |
 | LSM-Tree engine, WAL, compaction, write stalls, block cache | [lsm-engine.md](lsm-engine.md) |
 | CP write path, refused-but-applied, anti-entropy and its known limits | [replication-and-anti-entropy.md](replication-and-anti-entropy.md) |
-| Raft's honest scope, the stub log path, deviations from the paper | [raft.md](raft.md) |
+| Raft's honest scope, the log path and its idle producer, deviations from the paper | [raft.md](raft.md) |
 | Porcupine model, nemesis, convergence gate, counterexample output | [chaos-harness.md](chaos-harness.md) |
 | Every measured table, including the etcd ceiling comparison | [benchmarks.md](benchmarks.md) |
 | The numbered log of defects the harness found | [defect-log.md](defect-log.md) |
@@ -157,8 +157,9 @@ optimisation, chaos testing, and operational hardening.
 | 3 | Write replication to R=2 replicas via gRPC | ✅ Done |
 | 4 | Raft leader election + heartbeats | ✅ Done |
 | 5 | Docker Compose cluster + demo script | ✅ Done |
-| 6 | LSM-Tree storage engine + Raft pre-vote and snapshot codec (the log path is a stub — see [Raft](raft.md)) | ✅ Done |
+| 6 | LSM-Tree storage engine + Raft pre-vote and snapshot codec | ✅ Done |
 | 7 | `distrikv-cli` — first-class CLI tool | ✅ Done |
+| 8 | Raft log replication — §5.3 log matching, §5.4.2 commit rule, apply-on-commit, log persistence, `StateMachine` decoupling ([Raft](raft.md)) | ✅ Done — no producer yet |
 
 > **Phase 3 note — honest disclosure.** The replication fan-out
 > (`Node.ReplicateWrite`) was written during Phase 3, but nothing ever called

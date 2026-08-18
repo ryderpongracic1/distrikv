@@ -1,9 +1,7 @@
 package raft
 
 import (
-	"bytes"
 	"context"
-	"encoding/gob"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -23,6 +21,14 @@ import (
 
 func newTestNode(t *testing.T) *RaftNode {
 	t.Helper()
+	node, _ := newTestNodeWithSM(t)
+	return node
+}
+
+// newTestNodeWithSM returns a node and the state machine Raft applies to, for
+// tests that need to see what was applied.
+func newTestNodeWithSM(t *testing.T) (*RaftNode, *testSM) {
+	t.Helper()
 	dir := t.TempDir()
 	cfg := Config{
 		NodeID:             "test-node",
@@ -32,20 +38,11 @@ func newTestNode(t *testing.T) *RaftNode {
 		HeartbeatInterval:  75 * time.Millisecond,
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	node, err := New(cfg, nil, &noopStore{}, nil, logger)
+	sm := newTestSM()
+	node, err := New(cfg, nil, sm, nil, logger)
 	require.NoError(t, err)
-	return node
+	return node, sm
 }
-
-// noopStore satisfies StoreInterface without doing anything.
-type noopStore struct{}
-
-func (n *noopStore) Put(_ context.Context, _ string, _ []byte) (uint64, error) { return 0, nil }
-func (n *noopStore) Delete(_ context.Context, _ string) (uint64, error)        { return 0, nil }
-func (n *noopStore) Snapshot(_ context.Context) (map[string][]byte, error) {
-	return map[string][]byte{}, nil
-}
-func (n *noopStore) RestoreFromSnapshot(_ context.Context, _ map[string][]byte) error { return nil }
 
 // noopMetrics satisfies metricsInterface without recording anything.
 type noopMetrics struct{}
@@ -211,19 +208,27 @@ func TestAppendEntries_RejectsStaleTerm(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestPersistentState_RoundTrip verifies that Save + Load round-trips state
-// correctly (including snapshot metadata).
+// correctly — including snapshot metadata and, now that the log is persistent
+// state, the entries themselves.
 func TestPersistentState_RoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "raft-state")
 	ps := newPersistentState(path)
 
-	require.NoError(t, ps.Save(5, "node2", 10, 2))
+	want := persistedState{
+		CurrentTerm:   5,
+		VotedFor:      "node2",
+		SnapLastIndex: 10,
+		SnapLastTerm:  2,
+		Log: []LogEntry{
+			{Index: 11, Term: 2, Op: "health-down", Key: "node3"},
+			{Index: 12, Term: 3, Op: "health-up", Key: "node3", Value: []byte{0x00, 0xFF}},
+		},
+	}
+	require.NoError(t, ps.Save(want))
 
-	term, votedFor, snapIdx, snapTerm, err := ps.Load()
+	got, err := ps.Load()
 	require.NoError(t, err)
-	assert.Equal(t, uint64(5), term)
-	assert.Equal(t, "node2", votedFor)
-	assert.Equal(t, uint64(10), snapIdx)
-	assert.Equal(t, uint64(2), snapTerm)
+	assert.Equal(t, want, got)
 }
 
 // TestPersistentState_FreshNode verifies that Load on a non-existent file
@@ -232,29 +237,31 @@ func TestPersistentState_FreshNode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "does-not-exist")
 	ps := newPersistentState(path)
 
-	term, votedFor, snapIdx, snapTerm, err := ps.Load()
+	got, err := ps.Load()
 	require.NoError(t, err)
-	assert.Equal(t, uint64(0), term)
-	assert.Equal(t, "", votedFor)
-	assert.Equal(t, uint64(0), snapIdx)
-	assert.Equal(t, uint64(0), snapTerm)
+	assert.Equal(t, persistedState{}, got)
 }
 
 // TestPersistentState_Overwrite verifies that multiple Save calls correctly
-// overwrite prior state.
+// overwrite prior state — including shrinking the log, which is what compaction
+// and conflict truncation both do.
 func TestPersistentState_Overwrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "raft-state")
 	ps := newPersistentState(path)
 
-	require.NoError(t, ps.Save(1, "node1", 0, 0))
-	require.NoError(t, ps.Save(7, "node3", 50, 5))
+	require.NoError(t, ps.Save(persistedState{
+		CurrentTerm: 1, VotedFor: "node1",
+		Log: []LogEntry{{Index: 1, Term: 1}, {Index: 2, Term: 1}},
+	}))
+	want := persistedState{
+		CurrentTerm: 7, VotedFor: "node3", SnapLastIndex: 50, SnapLastTerm: 5,
+		Log: []LogEntry{{Index: 51, Term: 5}},
+	}
+	require.NoError(t, ps.Save(want))
 
-	term, votedFor, snapIdx, snapTerm, err := ps.Load()
+	got, err := ps.Load()
 	require.NoError(t, err)
-	assert.Equal(t, uint64(7), term)
-	assert.Equal(t, "node3", votedFor)
-	assert.Equal(t, uint64(50), snapIdx)
-	assert.Equal(t, uint64(5), snapTerm)
+	assert.Equal(t, want, got)
 }
 
 // TestElectionBecomesLeader verifies that a node with no peers (quorum = 1)
@@ -269,7 +276,7 @@ func TestElectionBecomesLeader(t *testing.T) {
 		HeartbeatInterval:  5 * time.Millisecond,
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	node, err := New(cfg, nil, &noopStore{}, &noopMetrics{}, logger)
+	node, err := New(cfg, nil, newTestSM(), &noopMetrics{}, logger)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -418,8 +425,16 @@ func TestLastLogIndex_WithEntries(t *testing.T) {
 // InstallSnapshot test
 // ---------------------------------------------------------------------------
 
+// TestInstallSnapshot_ResetsFollower verifies a follower adopts the leader's
+// snapshot: its log is discarded, its snapshot bounds move, and its term
+// follows the leader's.
+//
+// The payload used to be a gob-encoded KV map, because the snapshot carried the
+// key/value store. It is now whatever the state machine produced, and Raft's
+// only obligation is to hand those exact bytes to RestoreFromSnapshot — which
+// this test now also asserts, since the pass-through is the new contract.
 func TestInstallSnapshot_ResetsFollower(t *testing.T) {
-	node := newTestNode(t)
+	node, sm := newTestNodeWithSM(t)
 	node.mu.Lock()
 	node.currentTerm = 2
 	node.log = []LogEntry{
@@ -428,21 +443,20 @@ func TestInstallSnapshot_ResetsFollower(t *testing.T) {
 	}
 	node.mu.Unlock()
 
-	// Encode snapshot data as gob (matching what leader sends).
-	data := map[string][]byte{"key1": []byte("val1"), "key2": []byte("val2")}
-	var buf bytes.Buffer
-	require.NoError(t, gob.NewEncoder(&buf).Encode(data))
+	payload := []byte("opaque-state-machine-bytes")
 
 	resp, err := node.HandleInstallSnapshot(context.Background(), &kvpb.InstallSnapshotRequest{
 		Term:              3,
 		LeaderId:          "leader-1",
 		LastIncludedIndex: 50,
 		LastIncludedTerm:  3,
-		Data:              buf.Bytes(),
+		Data:              payload,
 	})
 	require.NoError(t, err)
 	assert.True(t, resp.Success)
 	assert.Equal(t, uint64(3), resp.Term)
+
+	assert.Equal(t, payload, sm.lastRestore(), "the state machine must receive the payload verbatim")
 
 	node.mu.Lock()
 	defer node.mu.Unlock()
@@ -450,6 +464,8 @@ func TestInstallSnapshot_ResetsFollower(t *testing.T) {
 	assert.Equal(t, uint64(50), node.snapLastIndex)
 	assert.Equal(t, uint64(3), node.snapLastTerm)
 	assert.Equal(t, uint64(3), node.currentTerm)
+	assert.Equal(t, uint64(50), node.commitIndex, "a snapshot's contents are committed by definition")
+	assert.Equal(t, uint64(50), node.lastApplied, "and applied by definition")
 }
 
 func TestInstallSnapshot_RejectsStaleTerm(t *testing.T) {

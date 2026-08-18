@@ -41,7 +41,7 @@ The deep material lives in [`docs/`](docs/). Start wherever the question is.
 | [architecture.md](docs/architecture.md) | How the pieces fit, the consistent hash ring, the CAP position, and the phase-by-phase status |
 | [lsm-engine.md](docs/lsm-engine.md) | MemTable → SSTable, the WAL, leveled compaction, write-stall backpressure, the sharded block cache |
 | [replication-and-anti-entropy.md](docs/replication-and-anti-entropy.md) | The CP write path, *a refused write is not an undone write*, WAL-cursor catch-up, and the convergence claims this design withholds |
-| [raft.md](docs/raft.md) | Raft's honest scope: leader election and heartbeats. Log replication is a stub, and the §5.3 gaps are named |
+| [raft.md](docs/raft.md) | Raft's honest scope: leader election, heartbeats, and a complete §5.3/§5.4.2 log that nothing proposes to yet |
 | [chaos-harness.md](docs/chaos-harness.md) | The Porcupine model, the nemesis, the convergence gate, the counterexample output, and every measured run |
 | [benchmarks.md](docs/benchmarks.md) | Every table, including the etcd ceiling comparison with its durability confound stated rather than corrected |
 | [defect-log.md](docs/defect-log.md) | **Thirteen real defects**, numbered, with the evidence that exposed each one |
@@ -61,10 +61,12 @@ rather than the etcd-style one.
   a `uint32` ring. `GetN(key, R)` returns the `R` distinct physical nodes that own
   a key: the ring-primary plus its replicas.
 - **Raft** (`internal/raft`) — randomised election timeouts with a pre-vote phase,
-  majority-vote elections, and heartbeats. It is a **leader-election and
-  failure-detection mechanism only**. Data never touches the Raft log, and the log
-  path is a stub rather than a finished implementation parked outside the data
-  path; [raft.md](docs/raft.md) names the specific §5.3 gaps.
+  majority-vote elections, heartbeats, and log replication implemented to §5.3 and
+  §5.4.2 with apply-on-commit against an opaque `StateMachine`. **Data never
+  touches the Raft log**: the log is for cluster control state, and nothing
+  proposes to it yet, so in a running cluster it stays empty. The intended
+  producer is a node-health state machine; [raft.md](docs/raft.md) states exactly
+  what is finished, what is idle, and why.
 - **LSM-Tree engine** (`internal/store/lsm`) — MemTable → immutable buffer →
   L0 SSTables → one merged L1, each SSTable carrying a Bloom filter, fronted by a
   32-shard LRU block cache, with every write WAL-fsynced first.

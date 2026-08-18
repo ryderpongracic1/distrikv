@@ -139,7 +139,10 @@ func NewNode(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Nod
 		HeartbeatInterval:  cfg.HeartbeatInterval,
 		SnapshotThreshold:  1000,
 	}
-	raftNode, err := raft.New(raftCfg, raftPeers, s, &metricsAdapter{n.metrics}, logger)
+	// The Raft log carries cluster-control entries, never key/value data, so it
+	// is given its own state machine rather than the storage engine. Phase B
+	// swaps this placeholder for the node-health state machine.
+	raftNode, err := raft.New(raftCfg, raftPeers, newPlaceholderStateMachine(logger), &metricsAdapter{n.metrics}, logger)
 	if err != nil {
 		_ = s.Close()
 		return nil, fmt.Errorf("node: init raft: %w", err)

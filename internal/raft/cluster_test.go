@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -78,6 +79,7 @@ func (p *inProcPeer) InstallSnapshot(ctx context.Context, req *kvpb.InstallSnaps
 // testCluster is a set of RaftNodes wired to each other in-process.
 type testCluster struct {
 	nodes []*RaftNode
+	sms   map[string]*testSM // node ID → the state machine Raft applies to
 }
 
 // newTestCluster builds and starts a 3-node cluster. latencyFor reports the
@@ -92,14 +94,16 @@ func newTestCluster(t *testing.T, timing Config, latencyFor func(from, to string
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	ids := []string{"n1", "n2", "n3"}
-	c := &testCluster{}
+	c := &testCluster{sms: make(map[string]*testSM, len(ids))}
 	for _, id := range ids {
 		cfg := timing
 		cfg.NodeID = id
 		cfg.DataDir = t.TempDir()
-		node, err := New(cfg, nil, &noopStore{}, &noopMetrics{}, logger)
+		sm := newTestSM()
+		node, err := New(cfg, nil, sm, &noopMetrics{}, logger)
 		require.NoError(t, err)
 		c.nodes = append(c.nodes, node)
+		c.sms[id] = sm
 	}
 
 	// Wire peers before any node starts, so no lock is needed here.
@@ -272,6 +276,223 @@ func TestCluster_SlowPeerDoesNotStarveOtherPeers(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Live-cluster log replication
+// ---------------------------------------------------------------------------
+
+// currentLeader returns the cluster's leader if there is one right now.
+//
+// It reports absence rather than failing, because a momentary leaderless instant
+// is not what most of these tests are about — term stability has its own
+// assertion, and a helper that aborted the run on a re-election would fail tests
+// for a property they were not measuring.
+func (c *testCluster) currentLeader() (*RaftNode, bool) {
+	for _, n := range c.nodes {
+		if n.IsLeader() {
+			return n, true
+		}
+	}
+	return nil, false
+}
+
+// leaderOf waits briefly for a leader and returns it, failing only if none
+// appears. Use it where a test needs a leader to proceed at all.
+func (c *testCluster) leaderOf(t *testing.T) *RaftNode {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if leader, ok := c.currentLeader(); ok {
+			return leader
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("no leader in cluster within 3s (term=%d)", maxTerm(c.nodes...))
+	return nil
+}
+
+// proposeOnLeader proposes an entry, retrying through a leadership change.
+//
+// ErrNotLeader is an expected outcome of a race between finding the leader and
+// proposing to it, not a defect — so it is retried rather than asserted away.
+// The index the winning proposal returns is still exact: a new leader inherits
+// the previous leader's log, so indices stay contiguous across an election.
+func (c *testCluster) proposeOnLeader(t *testing.T, op, key string) uint64 {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		leader, ok := c.currentLeader()
+		if !ok {
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		idx, err := leader.Propose(context.Background(), op, key, nil)
+		if err == nil {
+			return idx
+		}
+		require.ErrorIs(t, err, ErrNotLeader, "the only tolerable proposal failure is a lost leadership")
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("could not propose %q within 3s", key)
+	return 0
+}
+
+// TestCluster_EntriesReplicateAndApplyOnEveryNode drives real entries through the
+// real heartbeat ticker on a real three-node cluster, and asserts they arrive at
+// every node's state machine — including the two that never proposed anything.
+//
+// This is the end-to-end shape Phase B depends on: one node proposes, and all
+// three apply. Nothing here reaches into the log by hand.
+func TestCluster_EntriesReplicateAndApplyOnEveryNode(t *testing.T) {
+	c := newTestCluster(t, stormTiming(), nil)
+	waitForLeader(t, 3*time.Second, c.nodes...)
+
+	const proposals = 5
+	for i := 1; i <= proposals; i++ {
+		idx := c.proposeOnLeader(t, "health-down", fmt.Sprintf("n%d", i))
+		require.Equal(t, uint64(i), idx, "log indices must be contiguous")
+	}
+
+	// Every node — leader included — must apply all five, in order.
+	require.Eventually(t, func() bool {
+		for _, n := range c.nodes {
+			if len(c.sms[n.nodeID].appliedEntries()) < proposals {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 10*time.Millisecond,
+		"entries did not reach every state machine (applied: %v)", c.appliedCounts())
+
+	want := []string{"n1", "n2", "n3", "n4", "n5"}
+	for _, n := range c.nodes {
+		require.Equal(t, want, c.sms[n.nodeID].appliedKeys(),
+			"node %s applied the wrong entries or the wrong order", n.nodeID)
+	}
+
+	// And every node agrees on the committed frontier.
+	for _, n := range c.nodes {
+		require.Equal(t, uint64(proposals), n.CommitIndex(), "node %s commit index", n.nodeID)
+	}
+}
+
+// appliedCounts is a diagnostic for the failure message above.
+func (c *testCluster) appliedCounts() map[string]int {
+	out := make(map[string]int, len(c.sms))
+	for id, sm := range c.sms {
+		out[id] = len(sm.appliedEntries())
+	}
+	return out
+}
+
+// TestCluster_TermStableWhileEntriesFlow is the election-storm guard extended to
+// a cluster that is actually doing work.
+//
+// The storm's cause was heartbeat starvation, and this change puts new work on
+// the heartbeat path: entries to carry, a consistency check to run, and an fsync
+// on every append. Any of those could delay a heartbeat past a follower's
+// election timer. So the term-stability assertion is re-run with a steady stream
+// of proposals underneath it — a healthy cluster must hold one term while
+// replicating.
+func TestCluster_TermStableWhileEntriesFlow(t *testing.T) {
+	c := newTestCluster(t, stormTiming(), nil)
+	waitForLeader(t, 3*time.Second, c.nodes...)
+	time.Sleep(500 * time.Millisecond) // let the initial election settle
+
+	before := maxTerm(c.nodes...)
+
+	// Propose steadily for three seconds — faster than the heartbeat interval,
+	// so most ticks carry entries. A tick that finds no leader is skipped: the
+	// term assertion below is what judges leadership churn.
+	stop := time.After(3 * time.Second)
+	proposed := 0
+	for done := false; !done; {
+		select {
+		case <-stop:
+			done = true
+		case <-time.After(10 * time.Millisecond):
+			leader, ok := c.currentLeader()
+			if !ok {
+				continue
+			}
+			if _, err := leader.Propose(context.Background(), "health-up", fmt.Sprintf("k%d", proposed), nil); err == nil {
+				proposed++
+			}
+		}
+	}
+
+	after := maxTerm(c.nodes...)
+	require.LessOrEqualf(t, after-before, uint64(1),
+		"term advanced %d times in 3s (%d → %d) while replicating %d entries: "+
+			"the log path is starving heartbeats",
+		after-before, before, after, proposed)
+	require.Equal(t, 1, leaderCount(c.nodes...), "exactly one stable leader")
+	require.Greater(t, proposed, 50, "the test must actually have replicated something")
+
+	// The followers must have kept up rather than merely stayed quiet.
+	require.Eventually(t, func() bool {
+		leader, ok := c.currentLeader()
+		if !ok {
+			return false
+		}
+		want := leader.CommitIndex()
+		if want == 0 {
+			return false
+		}
+		for _, n := range c.nodes {
+			if n.LastLogIndex() < want {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 20*time.Millisecond, "followers did not keep up with the leader's committed log")
+}
+
+// TestCluster_FollowerCatchesUpAfterMissingEntries proves recovery through the
+// live tick loop: a follower is left behind while the leader accumulates entries,
+// then repaired by ordinary heartbeats with no special-case path.
+func TestCluster_FollowerCatchesUpAfterMissingEntries(t *testing.T) {
+	c := newTestCluster(t, stormTiming(), nil)
+	waitForLeader(t, 3*time.Second, c.nodes...)
+
+	for i := 0; i < 4; i++ {
+		c.proposeOnLeader(t, "health-down", fmt.Sprintf("a%d", i))
+	}
+
+	// Rewind one follower's replication state to what it would be after losing
+	// its log. This is the log-repair path only: a real partition would also
+	// have advanced the follower's term, which this does not simulate and which
+	// the election tests cover separately. The leader is re-read here rather
+	// than reused from before the proposals, so a leadership change in between
+	// is harmless.
+	leader := c.leaderOf(t)
+	var follower *RaftNode
+	for _, n := range c.nodes {
+		if n != leader {
+			follower = n
+			break
+		}
+	}
+	follower.mu.Lock()
+	follower.log = nil
+	follower.commitIndex = 0
+	follower.lastApplied = 0
+	follower.mu.Unlock()
+
+	leader.mu.Lock()
+	leader.nextIndex[follower.nodeID] = leader.lastLogIndex() + 1
+	leader.matchIndex[follower.nodeID] = 0
+	leader.mu.Unlock()
+
+	require.Eventually(t, func() bool {
+		l, ok := c.currentLeader()
+		return ok && follower.LastLogIndex() == l.LastLogIndex()
+	}, 5*time.Second, 10*time.Millisecond,
+		"follower did not catch up (follower=%d leader=%d)", follower.LastLogIndex(), leader.LastLogIndex())
+
+	require.Equal(t, snapshotLog(c.leaderOf(t)), snapshotLog(follower),
+		"the repaired log must be identical to the leader's")
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot-vs-heartbeat dispatch
 // ---------------------------------------------------------------------------
 
@@ -304,7 +525,7 @@ func newSnapshotLeader(t *testing.T, peerNext uint64) (*RaftNode, *recordingPeer
 	require.NoError(t, node.snapshotStore.Save(Snapshot{
 		LastIncludedIndex: 5,
 		LastIncludedTerm:  1,
-		Data:              map[string][]byte{"k": []byte("v")},
+		Data:              []byte("state-machine-snapshot"),
 	}))
 
 	node.currentTerm = 1

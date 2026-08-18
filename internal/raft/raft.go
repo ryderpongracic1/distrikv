@@ -1,29 +1,43 @@
-// Package raft implements Raft leader election, heartbeating, log compaction
-// via snapshots, and a pre-vote phase to prevent partitioned nodes from
-// disrupting the cluster on reconnect.
+// Package raft implements Raft leader election, log replication, heartbeating,
+// log compaction via snapshots, and a pre-vote phase to prevent partitioned
+// nodes from disrupting the cluster on reconnect.
 //
 // # Deviations from the Raft paper
 //
-// 1. Data writes are NOT replicated through the Raft log. They flow through
-// the consistent-hash ring's ReplicationManager. Raft is an election,
-// failure-detection, and snapshot-delivery mechanism.
+// 1. Client data writes are NOT replicated through the Raft log. They flow
+// through the consistent-hash ring's ReplicationManager. The Raft log exists to
+// carry cluster-control entries — node-health transitions — and never key/value
+// data. Raft is an election, failure-detection, control-plane replication, and
+// snapshot-delivery mechanism.
 //
-// 2. nextIndex/matchIndex are initialised on leader election for snapshot
-// delivery; full pipelined AppendEntries replication is not implemented.
+// 2. Log replication is complete (§5.3 log matching with conflict truncation and
+// nextIndex backoff, §5.4.2 commit rule, apply-on-commit) and rides the
+// heartbeat ticker rather than a separate pipelined replication loop. Entries
+// are batched per heartbeat interval, which suits a log whose write rate is one
+// entry per genuine change in a peer's reachability. There is no fast-backup
+// hint on rejection: nextIndex walks back one index per interval, which is
+// bounded by how far a follower's log can diverge and needs no wire change.
 //
 // 3. No membership change protocol. Cluster members are static (env-var config).
 //
 // 4. Pre-vote phase (§9.6 of Raft dissertation) prevents a partitioned node
 // from incrementing its term and disrupting the cluster on reconnect.
 //
-// 5. Snapshots (§7) allow log compaction. A snapshot contains a full copy of
-// the state machine serialised as map[string][]byte (not raw SSTable files).
+// 5. Snapshots (§7) allow log compaction. A snapshot carries the opaque bytes
+// the StateMachine produced; Raft never inspects the payload.
+//
+// 6. A new leader does not append a no-op entry to discover its commit index.
+// The consequence is the one the paper describes for §5.4.2: entries carried
+// over from a previous term stay uncommitted until the leader appends and
+// commits an entry of its own term, at which point they commit indirectly. For
+// a control-plane log this costs nothing but a bounded delay; the no-op
+// optimisation would need the state machine to tolerate an entry with no
+// meaning, so it is deliberately not taken.
 package raft
 
 import (
-	"bytes"
 	"context"
-	"encoding/gob"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -61,19 +75,41 @@ type PeerClient struct {
 	Client kvpb.KVServiceClient
 }
 
-// StoreInterface is the subset of store.Store that RaftNode uses.
-// Extends the original Put/Delete with Snapshot/RestoreFromSnapshot for §7.
+// StateMachine is the application Raft replicates. It is the only thing Raft
+// applies committed entries to, and the only thing it snapshots.
 //
-// Put and Delete return the sequence number the storage engine assigned to the
-// write. Raft has no use for it — a log entry carries its own index and term as
-// its ordering — so this path discards it; it exists for the replication fan-out
-// (see server.ReplicationManager).
-type StoreInterface interface {
-	Put(ctx context.Context, key string, value []byte) (uint64, error)
-	Delete(ctx context.Context, key string) (uint64, error)
-	Snapshot(ctx context.Context) (map[string][]byte, error)
-	RestoreFromSnapshot(ctx context.Context, data map[string][]byte) error
+// Raft deliberately knows nothing else about it: no key/value semantics, no
+// storage engine. That is what keeps this package free of a dependency on the
+// data path, whose replication is the hash ring's business (see deviation 1).
+//
+// Contract:
+//
+//   - Apply is called once per entry, in log-index order, only after the entry
+//     is committed. It is called without any Raft lock held, so an
+//     implementation may block on I/O — but every subsequent apply waits behind
+//     it, so it should be quick.
+//
+//   - Apply MUST be idempotent. commitIndex and lastApplied are volatile (see
+//     persistedState), so entries after the snapshot point are applied again
+//     after a restart. Apply may also be re-attempted after it returns an
+//     error: Raft leaves lastApplied where it was and retries on the next
+//     commit advance rather than skipping the entry.
+//
+//   - SnapshotState must return a payload reflecting exactly the entries
+//     applied so far, with no partial application in it. Raft pairs the bytes
+//     with the index of the last applied entry.
+//
+//   - RestoreFromSnapshot replaces all state with the payload's. It is called
+//     on startup when a snapshot is on disk, and when a leader installs one.
+type StateMachine interface {
+	Apply(ctx context.Context, entry LogEntry) error
+	SnapshotState(ctx context.Context) ([]byte, error)
+	RestoreFromSnapshot(ctx context.Context, data []byte) error
 }
+
+// ErrNotLeader is returned by Propose on a node that is not the current leader.
+// The caller can find the leader it should retry against with Leader().
+var ErrNotLeader = errors.New("raft: not leader")
 
 // Config carries RaftNode configuration.
 type Config struct {
@@ -85,28 +121,40 @@ type Config struct {
 	SnapshotThreshold  int // take snapshot when log exceeds this many entries
 }
 
-// RaftNode implements Raft leader election, heartbeating, snapshot delivery,
-// and pre-vote. All mutable state is protected by mu.
+// RaftNode implements Raft leader election, log replication, heartbeating,
+// snapshot delivery, and pre-vote. All mutable state is protected by mu.
 //
 // Goroutine model:
 //   - Run() starts exactly one goroutine: runElectionTimer.
 //   - runElectionTimer is the sole owner of all role transitions.
 //   - When Leader, runElectionTimer starts runLeader in a new goroutine.
 //   - stepDown closes leaderStop to terminate the leader goroutine.
-//   - takeSnapshot runs in its own goroutine (started from applyEntryLocked).
+//   - takeSnapshot runs in its own goroutine (started from the apply path).
+//
+// Lock order: applyMu before mu, never the reverse. applyMu serialises the
+// apply loop so that entries reach the state machine exactly once and in order
+// without mu being held across StateMachine.Apply.
 type RaftNode struct {
 	mu sync.Mutex
 
-	// --- Persistent state ---
+	// --- Persistent state (survives a crash; see persistedState) ---
 	currentTerm   uint64
 	votedFor      string
-	snapLastIndex uint64 // last log index captured in a snapshot
-	snapLastTerm  uint64 // term of that entry
+	snapLastIndex uint64     // last log index captured in a snapshot
+	snapLastTerm  uint64     // term of that entry
+	log           []LogEntry // entries after snapLastIndex, contiguous and ascending
 
 	// --- Volatile state ---
 	role     Role
 	leaderID string
-	log      []LogEntry // entries after snapLastIndex
+
+	// commitIndex is the highest index known to be committed: replicated to a
+	// majority under the current leader's term (§5.4.2). lastApplied is how far
+	// the state machine has consumed. Both are volatile by design — see
+	// persistedState — and both start at snapLastIndex, since a snapshot is by
+	// construction a record of applied, committed entries.
+	commitIndex uint64
+	lastApplied uint64
 
 	// --- Leader volatile state (reset on each election) ---
 	nextIndex  map[string]uint64 // peer → next log index to send
@@ -118,11 +166,15 @@ type RaftNode struct {
 	// --- Infrastructure ---
 	nodeID        string
 	peers         []PeerClient
-	store         StoreInterface
+	sm            StateMachine
 	persist       *PersistentState
 	snapshotStore *SnapshotStore
 	metrics       metricsInterface
 	logger        *slog.Logger
+
+	// applyMu serialises the apply loop. Held across StateMachine.Apply, which
+	// is why mu must never be acquired before it.
+	applyMu sync.Mutex
 
 	// peerHealth, when set, receives the outcome of every heartbeat RPC this
 	// node sends as leader. Guarded by mu. See SetPeerHealthObserver.
@@ -146,11 +198,15 @@ type metricsInterface interface {
 }
 
 // New creates a RaftNode and loads any persisted state from disk.
-func New(cfg Config, peers []PeerClient, store StoreInterface, m metricsInterface, logger *slog.Logger) (*RaftNode, error) {
+func New(cfg Config, peers []PeerClient, sm StateMachine, m metricsInterface, logger *slog.Logger) (*RaftNode, error) {
+	if sm == nil {
+		return nil, fmt.Errorf("raft.New: nil StateMachine")
+	}
+
 	persistPath := cfg.DataDir + "/raft-state"
 	ps := newPersistentState(persistPath)
 
-	term, votedFor, snapLastIndex, snapLastTerm, err := ps.Load()
+	st, err := ps.Load()
 	if err != nil {
 		return nil, fmt.Errorf("raft.New: load persistent state: %w", err)
 	}
@@ -163,14 +219,15 @@ func New(cfg Config, peers []PeerClient, store StoreInterface, m metricsInterfac
 	}
 
 	r := &RaftNode{
-		currentTerm:        term,
-		votedFor:           votedFor,
-		snapLastIndex:      snapLastIndex,
-		snapLastTerm:       snapLastTerm,
+		currentTerm:        st.CurrentTerm,
+		votedFor:           st.VotedFor,
+		snapLastIndex:      st.SnapLastIndex,
+		snapLastTerm:       st.SnapLastTerm,
+		log:                st.Log,
 		role:               Follower,
 		nodeID:             cfg.NodeID,
 		peers:              peers,
-		store:              store,
+		sm:                 sm,
 		persist:            ps,
 		snapshotStore:      ss,
 		metrics:            m,
@@ -182,19 +239,76 @@ func New(cfg Config, peers []PeerClient, store StoreInterface, m metricsInterfac
 		resetTimerCh:       make(chan struct{}, 1),
 	}
 
-	// On restart, if a snapshot exists, restore the state machine.
-	if snap, ok, err := ss.Load(); err != nil {
+	// On restart, if a snapshot exists, restore the state machine from it.
+	//
+	// The snapshot file is written before the state file that records its
+	// bounds (in both takeSnapshot and HandleInstallSnapshot), so a crash
+	// between the two leaves a snapshot on disk that is ahead of the recorded
+	// snapLastIndex. The snapshot is the more advanced durable record of
+	// applied state, so it wins: its bounds are adopted and the entries it
+	// already covers are dropped from the log.
+	snap, hasSnap, err := ss.Load()
+	if err != nil {
 		return nil, fmt.Errorf("raft.New: load snapshot: %w", err)
-	} else if ok && store != nil {
-		if err := store.RestoreFromSnapshot(context.Background(), snap.Data); err != nil {
+	}
+	if hasSnap {
+		if err := sm.RestoreFromSnapshot(context.Background(), snap.Data); err != nil {
 			return nil, fmt.Errorf("raft.New: restore snapshot on startup: %w", err)
 		}
-		logger.Info("raft: restored snapshot on startup",
+		if snap.LastIncludedIndex > r.snapLastIndex {
+			r.snapLastIndex = snap.LastIncludedIndex
+			r.snapLastTerm = snap.LastIncludedTerm
+		}
+		r.logger.Info("raft: restored snapshot on startup",
 			"last_index", snap.LastIncludedIndex,
 			"last_term", snap.LastIncludedTerm)
 	}
 
+	// Enforce the log invariants the virtual indexing depends on: every entry
+	// sits above snapLastIndex, and indices are contiguous and ascending.
+	//
+	// A file that violates them is corrupt, not merely stale, and the longest
+	// valid prefix is the most that can be trusted. Truncating it is strictly
+	// better than either refusing to start — which would brick a node over a
+	// log this cheap to rebuild from the leader — or carrying entries whose
+	// index no longer locates them.
+	if dropped := r.normaliseLogLocked(); dropped > 0 {
+		r.logger.Warn("raft: dropped log entries that violate index invariants",
+			"dropped", dropped, "snap_last_index", r.snapLastIndex, "kept", len(r.log))
+	}
+
+	// A snapshot's contents are applied, committed entries by construction, so
+	// both indices start at its boundary. Entries above it are replayed to the
+	// state machine once the leader tells us they are committed, which is why
+	// Apply must be idempotent.
+	r.commitIndex = r.snapLastIndex
+	r.lastApplied = r.snapLastIndex
+
 	return r, nil
+}
+
+// normaliseLogLocked drops entries the snapshot already covers and any suffix
+// following a break in the index sequence. Returns how many were dropped.
+// Caller must hold r.mu, or hold no reference to the node yet (as in New).
+func (r *RaftNode) normaliseLogLocked() int {
+	kept := make([]LogEntry, 0, len(r.log))
+	want := r.snapLastIndex + 1
+	for _, e := range r.log {
+		if e.Index < want {
+			continue // already in the snapshot, or a duplicate of one kept
+		}
+		if e.Index != want {
+			break // gap: everything from here on is unlocatable
+		}
+		kept = append(kept, e)
+		want++
+	}
+	dropped := len(r.log) - len(kept)
+	if len(kept) == 0 {
+		kept = nil
+	}
+	r.log = kept
+	return dropped
 }
 
 // Run starts the Raft election timer goroutine and blocks until ctx is cancelled.
@@ -252,7 +366,7 @@ func (r *RaftNode) startElection(ctx context.Context) {
 	lastIdx := r.lastLogIndex()
 	lastTerm := r.lastLogTerm()
 
-	if err := r.persist.Save(r.currentTerm, r.votedFor, r.snapLastIndex, r.snapLastTerm); err != nil {
+	if err := r.persistLocked(r.log); err != nil {
 		r.logger.Error("failed to persist state before election", "error", err)
 		r.mu.Unlock()
 		return
@@ -421,67 +535,173 @@ func (r *RaftNode) runLeader(ctx context.Context, leaderStop <-chan struct{}) {
 	}
 }
 
-// broadcastHeartbeat sends an AppendEntries heartbeat to every peer, plus an
-// InstallSnapshot to any peer whose next log entry has already been compacted.
+// appendArgs is one peer's AppendEntries payload, computed under r.mu so that
+// the whole set — prev pointer, entries, commit index — is drawn from one
+// consistent view of the log.
+type appendArgs struct {
+	term         uint64
+	prevLogIndex uint64
+	prevLogTerm  uint64
+	entries      []*kvpb.LogEntry
+	leaderCommit uint64
+
+	// nextIndexSent is the nextIndex this payload was built from. The response
+	// handler only adjusts nextIndex if it still holds that value, so two RPCs
+	// in flight to the same peer cannot decrement it twice for one mismatch.
+	nextIndexSent uint64
+}
+
+// broadcastHeartbeat sends an AppendEntries to every peer — carrying whatever
+// entries that peer is missing — plus an InstallSnapshot to any peer whose next
+// log entry has already been compacted.
 //
-// Every peer gets a heartbeat on every tick, unconditionally. The heartbeat is
-// the only liveness signal a follower's election timer has, so it is never
-// traded away for another RPC — doing so silently starves that follower into
-// calling an election against a healthy leader.
+// Every peer gets an AppendEntries on every tick, unconditionally. It is the
+// only liveness signal a follower's election timer has, so it is never traded
+// away for another RPC — doing so silently starves that follower into calling an
+// election against a healthy leader. That is not hypothetical: it is the defect
+// that produced a three-month election storm in this system.
 //
 // Each peer is served by its own goroutine, so a slow or unreachable peer can
-// neither delay nor suppress the heartbeat owed to any other peer.
+// neither delay nor suppress the AppendEntries owed to any other peer.
 func (r *RaftNode) broadcastHeartbeat(ctx context.Context) {
 	r.mu.Lock()
-	term := r.currentTerm
-	lastIdx := r.lastLogIndex()
-	lastTerm := r.lastLogTerm()
+	if r.role != Leader {
+		r.mu.Unlock()
+		return
+	}
 	peers := r.peers
-	// Decide snapshot delivery under the lock: nextIndex is mutated by
-	// sendInstallSnapshot from other goroutines, so it must not be read once
-	// the lock is dropped.
-	//
-	// A peer needs a snapshot only when the entry it asks for next has already
-	// been compacted away. nextIndex == snapLastIndex+1 is the fully-caught-up
-	// case: PrevLogIndex is then snapLastIndex, whose term the leader still
-	// holds in snapLastTerm, so a plain AppendEntries carries everything the
-	// peer needs.
+	args := make(map[string]appendArgs, len(peers))
 	needSnapshot := make(map[string]bool, len(peers))
+
 	for _, p := range peers {
-		needSnapshot[p.NodeID] = r.nextIndex[p.NodeID] <= r.snapLastIndex
+		a, need := r.appendArgsForLocked(p.NodeID)
+		args[p.NodeID] = a
+		needSnapshot[p.NodeID] = need
 	}
 	r.mu.Unlock()
 
 	for _, peer := range peers {
 		peer := peer
-		go r.sendHeartbeat(ctx, peer, term, lastIdx, lastTerm)
+		a := args[peer.NodeID]
+		go r.sendAppendEntries(ctx, peer, a)
 		if needSnapshot[peer.NodeID] {
-			go r.sendInstallSnapshot(ctx, peer, term)
+			go r.sendInstallSnapshot(ctx, peer, a.term)
 		}
 	}
 }
 
-// sendHeartbeat sends one AppendEntries heartbeat to one peer and applies any
-// higher term the peer reports.
-func (r *RaftNode) sendHeartbeat(ctx context.Context, peer PeerClient, term, prevLogIndex, prevLogTerm uint64) {
+// appendArgsForLocked builds the AppendEntries payload owed to one peer, and
+// reports whether that peer also needs a snapshot.
+//
+// A peer needs a snapshot only when the entry it asks for next has already been
+// compacted away. nextIndex == snapLastIndex+1 is the fully-caught-up case:
+// PrevLogIndex is then snapLastIndex, whose term the leader still holds in
+// snapLastTerm, so a plain AppendEntries carries everything the peer needs.
+//
+// Caller must hold r.mu.
+func (r *RaftNode) appendArgsForLocked(peerID string) (a appendArgs, needSnapshot bool) {
+	next := r.nextIndex[peerID]
+	if next < 1 {
+		next = 1 // log indices start at 1; guard against an unseeded peer
+	}
+
+	a = appendArgs{
+		term:          r.currentTerm,
+		leaderCommit:  r.commitIndex,
+		nextIndexSent: next,
+	}
+
+	if prevTerm, ok := r.termAtLocked(next - 1); ok {
+		a.prevLogIndex = next - 1
+		a.prevLogTerm = prevTerm
+		a.entries = r.entriesFromLocked(next)
+	} else {
+		// The position this peer asks about is compacted away, so no consistency
+		// check can be built for it. Point at the snapshot boundary and send no
+		// entries: the follower will reject, but it still resets its election
+		// timer on a current-term request, and the InstallSnapshot going out
+		// alongside is what actually repairs it.
+		a.prevLogIndex = r.snapLastIndex
+		a.prevLogTerm = r.snapLastTerm
+	}
+
+	return a, next <= r.snapLastIndex
+}
+
+// sendAppendEntries sends one AppendEntries to one peer and folds the reply into
+// the leader's replication bookkeeping: a higher term steps us down, success
+// advances matchIndex (and possibly commitIndex), and a log mismatch walks
+// nextIndex back one position for the next tick.
+func (r *RaftNode) sendAppendEntries(ctx context.Context, peer PeerClient, a appendArgs) {
 	hbCtx, cancel := context.WithTimeout(ctx, r.heartbeatRPCTimeout())
 	defer cancel()
 
 	resp, err := peer.Client.AppendEntries(hbCtx, &kvpb.AppendEntriesRequest{
-		Term:         term,
+		Term:         a.term,
 		LeaderId:     r.nodeID,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
+		PrevLogIndex: a.prevLogIndex,
+		PrevLogTerm:  a.prevLogTerm,
+		Entries:      a.entries,
+		LeaderCommit: a.leaderCommit,
 	})
 	if err != nil {
 		r.notePeerHeartbeat(peer.NodeID, false)
-		r.logger.Warn("heartbeat failed", "peer", peer.NodeID, "error", err)
+		r.logger.Warn("AppendEntries failed", "peer", peer.NodeID, "error", err)
 		return
 	}
+
+	// A peer that answered is a peer that is up — including one that answered
+	// "no". A log mismatch is a healthy follower disagreeing about history, and
+	// reporting it as unreachable would poison the health signal this log
+	// exists to carry: the peer would be marked down at the exact moment it is
+	// proving it is alive. Only a transport failure is ok=false, above.
 	r.notePeerHeartbeat(peer.NodeID, true)
+
 	r.mu.Lock()
+
 	if resp.Term > r.currentTerm {
 		r.stepDownLocked(resp.Term)
+		r.mu.Unlock()
+		return
+	}
+	// Ignore a reply that belongs to a term or a role we have since left: its
+	// bookkeeping would be about a log we no longer own.
+	if r.role != Leader || r.currentTerm != a.term {
+		r.mu.Unlock()
+		return
+	}
+
+	if resp.Success {
+		matched := a.prevLogIndex + uint64(len(a.entries))
+		if matched > r.matchIndex[peer.NodeID] {
+			r.matchIndex[peer.NodeID] = matched
+		}
+		if next := matched + 1; next > r.nextIndex[peer.NodeID] {
+			r.nextIndex[peer.NodeID] = next
+		}
+		before := r.commitIndex
+		r.advanceCommitIndexLocked()
+		advanced := r.commitIndex > before
+		r.mu.Unlock()
+
+		if advanced {
+			// Detached from the heartbeat deadline deliberately: that deadline
+			// exists to abandon a stale RPC, and letting it also abort
+			// application would make how far the state machine gets depend on
+			// network timing.
+			r.applyCommitted(context.WithoutCancel(ctx))
+		}
+		return
+	}
+
+	// Log mismatch. Walk back one index and retry on the next tick. Only adjust
+	// if no other in-flight reply has already moved it, and never below the
+	// first index (1) — a peer whose nextIndex reaches the snapshot boundary is
+	// picked up by the InstallSnapshot path instead.
+	if r.nextIndex[peer.NodeID] == a.nextIndexSent && a.nextIndexSent > 1 {
+		r.nextIndex[peer.NodeID] = a.nextIndexSent - 1
+		r.logger.Debug("AppendEntries rejected; backing off",
+			"peer", peer.NodeID, "next_index", a.nextIndexSent-1)
 	}
 	r.mu.Unlock()
 }
@@ -555,12 +775,6 @@ func (r *RaftNode) sendInstallSnapshot(ctx context.Context, peer PeerClient, ter
 		return
 	}
 
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(snap.Data); err != nil {
-		r.logger.Error("sendInstallSnapshot: encode data", "err", err)
-		return
-	}
-
 	isCtx, cancel := context.WithTimeout(ctx, 5*r.heartbeatInterval)
 	defer cancel()
 
@@ -569,7 +783,9 @@ func (r *RaftNode) sendInstallSnapshot(ctx context.Context, peer PeerClient, ter
 		LeaderId:          r.nodeID,
 		LastIncludedIndex: snap.LastIncludedIndex,
 		LastIncludedTerm:  snap.LastIncludedTerm,
-		Data:              buf.Bytes(),
+		// The state machine's own bytes, passed through untouched: Raft has no
+		// business knowing their shape.
+		Data: snap.Data,
 	})
 	if err != nil {
 		r.logger.Warn("InstallSnapshot RPC failed", "peer", peer.NodeID, "err", err)
@@ -578,9 +794,13 @@ func (r *RaftNode) sendInstallSnapshot(ctx context.Context, peer PeerClient, ter
 	r.mu.Lock()
 	if resp.Term > r.currentTerm {
 		r.stepDownLocked(resp.Term)
-	} else if resp.Success {
-		r.nextIndex[peer.NodeID] = snap.LastIncludedIndex + 1
-		r.matchIndex[peer.NodeID] = snap.LastIncludedIndex
+	} else if resp.Success && r.role == Leader && r.currentTerm == term {
+		if next := snap.LastIncludedIndex + 1; next > r.nextIndex[peer.NodeID] {
+			r.nextIndex[peer.NodeID] = next
+		}
+		if snap.LastIncludedIndex > r.matchIndex[peer.NodeID] {
+			r.matchIndex[peer.NodeID] = snap.LastIncludedIndex
+		}
 	}
 	r.mu.Unlock()
 }
@@ -593,7 +813,7 @@ func (r *RaftNode) stepDownLocked(newTerm uint64) {
 	r.role = Follower
 	r.votedFor = ""
 
-	if err := r.persist.Save(r.currentTerm, r.votedFor, r.snapLastIndex, r.snapLastTerm); err != nil {
+	if err := r.persistLocked(r.log); err != nil {
 		r.logger.Error("failed to persist state on step-down", "error", err)
 	}
 	if wasLeader && r.leaderStop != nil {
@@ -638,7 +858,7 @@ func (r *RaftNode) HandleRequestVote(ctx context.Context, req *kvpb.RequestVoteR
 
 	if !alreadyVoted && logOK {
 		r.votedFor = req.CandidateId
-		if err := r.persist.Save(r.currentTerm, r.votedFor, r.snapLastIndex, r.snapLastTerm); err != nil {
+		if err := r.persistLocked(r.log); err != nil {
 			r.logger.Error("failed to persist vote", "error", err)
 			return resp, fmt.Errorf("raft: persist vote: %w", err)
 		}
@@ -649,14 +869,29 @@ func (r *RaftNode) HandleRequestVote(ctx context.Context, req *kvpb.RequestVoteR
 	return resp, nil
 }
 
-// HandleAppendEntries processes an incoming AppendEntries RPC.
+// HandleAppendEntries processes an incoming AppendEntries RPC (§5.3).
+//
+// The order of the steps is load-bearing:
+//
+//  1. A stale term is rejected outright.
+//  2. Leader recognition — leaderID, lastHeardFromLeader, election-timer reset —
+//     happens for every request from a current-term leader, *before* the log is
+//     inspected and regardless of how the inspection turns out. A follower whose
+//     log has diverged is still hearing from the legitimate leader, and starving
+//     its election timer while the leader repairs it would make it stand for
+//     election against the very node fixing it.
+//  3. The consistency check, then the merge, then persistence, and only then
+//     Success. Nothing is acknowledged before it is durable.
+//  4. Applying happens after the lock is released, so a slow state machine
+//     cannot delay the next heartbeat.
 func (r *RaftNode) HandleAppendEntries(ctx context.Context, req *kvpb.AppendEntriesRequest) (*kvpb.AppendEntriesResponse, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	resp := &kvpb.AppendEntriesResponse{Term: r.currentTerm}
 
+	// 1. Reply false if the leader's term is behind ours (§5.1).
 	if req.Term < r.currentTerm {
+		r.mu.Unlock()
 		return resp, nil
 	}
 	if req.Term > r.currentTerm || r.role == Candidate {
@@ -664,15 +899,59 @@ func (r *RaftNode) HandleAppendEntries(ctx context.Context, req *kvpb.AppendEntr
 		resp.Term = r.currentTerm
 	}
 
+	// 2. Recognise the leader.
 	r.leaderID = req.LeaderId
 	r.lastHeardFromLeader = time.Now() // used by pre-vote to detect active leader
 	r.sendResetTimer()
 
-	for _, entry := range req.Entries {
-		r.applyEntryLocked(ctx, entry)
+	// 3. Reply false if we have no entry at PrevLogIndex whose term matches
+	//    PrevLogTerm (§5.3). termAtLocked reports the snapshot boundary, so a
+	//    caught-up follower whose log was compacted answers correctly; an index
+	//    below the boundary is unresolvable, and rejecting it is what makes the
+	//    leader fall back to InstallSnapshot.
+	localTerm, ok := r.termAtLocked(req.PrevLogIndex)
+	if !ok || localTerm != req.PrevLogTerm {
+		r.logger.Debug("AppendEntries consistency check failed",
+			"prev_log_index", req.PrevLogIndex, "leader_prev_term", req.PrevLogTerm,
+			"local_term", localTerm, "have_index", ok, "last_log_index", r.lastLogIndex())
+		r.mu.Unlock()
+		return resp, nil
 	}
 
+	newLog, changed, err := r.mergeEntriesLocked(req.PrevLogIndex, req.Entries)
+	if err != nil {
+		// An invariant violation, not a routine mismatch. Reject without
+		// touching the log and let it be visible in the logs.
+		r.logger.Error("AppendEntries merge refused", "error", err)
+		r.mu.Unlock()
+		return resp, nil
+	}
+
+	if changed {
+		// Durable before acknowledged. Because mergeEntriesLocked built a copy,
+		// a failed write leaves r.log exactly as the disk has it — so the
+		// leader's retry re-derives the same append rather than finding the
+		// entry already present and being acknowledged for it.
+		if err := r.persistLocked(newLog); err != nil {
+			r.logger.Error("AppendEntries: persist log", "error", err)
+			r.mu.Unlock()
+			return resp, nil
+		}
+		r.log = newLog
+	}
+
+	// 4. Advance commitIndex, bounded by the last entry this request vouches
+	//    for. Bounding on lastLogIndex instead would be wrong when the merge
+	//    kept a tail beyond the request's range: those entries came from some
+	//    earlier leader and this request says nothing about them.
+	lastNewIndex := req.PrevLogIndex + uint64(len(req.Entries))
+	if req.LeaderCommit > r.commitIndex {
+		r.commitIndex = min(req.LeaderCommit, lastNewIndex)
+	}
 	resp.Success = true
+	r.mu.Unlock()
+
+	r.applyCommitted(ctx)
 	return resp, nil
 }
 
@@ -693,7 +972,7 @@ func (r *RaftNode) HandlePreVote(_ context.Context, req *kvpb.PreVoteRequest) (*
 	return &kvpb.PreVoteResponse{Term: r.currentTerm, VoteGranted: granted}, nil
 }
 
-// HandleInstallSnapshot applies a full snapshot from the leader.
+// HandleInstallSnapshot applies a full snapshot from the leader (§7).
 func (r *RaftNode) HandleInstallSnapshot(ctx context.Context, req *kvpb.InstallSnapshotRequest) (*kvpb.InstallSnapshotResponse, error) {
 	r.mu.Lock()
 
@@ -708,63 +987,104 @@ func (r *RaftNode) HandleInstallSnapshot(ctx context.Context, req *kvpb.InstallS
 	r.leaderID = req.LeaderId
 	r.lastHeardFromLeader = time.Now()
 	r.sendResetTimer()
-	r.mu.Unlock()
 
-	// Decode snapshot data outside the lock (I/O).
-	var data map[string][]byte
-	if err := gob.NewDecoder(bytes.NewReader(req.Data)).Decode(&data); err != nil {
-		return &kvpb.InstallSnapshotResponse{Term: req.Term, Success: false},
-			fmt.Errorf("raft: InstallSnapshot decode: %w", err)
+	// A snapshot ending at or before our own boundary carries nothing we do not
+	// already have applied. Installing it anyway would move the state machine
+	// backwards.
+	if req.LastIncludedIndex <= r.snapLastIndex {
+		term := r.currentTerm
+		r.mu.Unlock()
+		r.logger.Debug("InstallSnapshot ignored: not newer than local snapshot",
+			"req_last_index", req.LastIncludedIndex, "local_snap_index", r.snapLastIndex)
+		return &kvpb.InstallSnapshotResponse{Term: term, Success: true}, nil
 	}
 
-	// Apply to the state machine (I/O, no lock held).
-	if err := r.store.RestoreFromSnapshot(ctx, data); err != nil {
+	// §7's retention decision is deliberately NOT made here. The lock is about
+	// to be dropped for the restore, and another AppendEntries could change the
+	// log in between — so the decision is taken below, under the same lock hold
+	// that acts on it.
+	r.mu.Unlock()
+
+	// Restore with no lock held: the payload is arbitrarily large and the
+	// restore is I/O.
+	if err := r.sm.RestoreFromSnapshot(ctx, req.Data); err != nil {
 		return &kvpb.InstallSnapshotResponse{Term: req.Term, Success: false},
 			fmt.Errorf("raft: InstallSnapshot restore: %w", err)
 	}
 
-	// Persist the snapshot.
+	// Persist the snapshot before recording its bounds, so a crash in between
+	// leaves a snapshot ahead of the state file rather than bounds pointing at a
+	// payload that was never written. New() resolves that direction.
 	snap := Snapshot{
 		LastIncludedIndex: req.LastIncludedIndex,
 		LastIncludedTerm:  req.LastIncludedTerm,
-		Data:              data,
+		Data:              cloneBytes(req.Data),
 	}
 	if err := r.snapshotStore.Save(snap); err != nil {
 		r.logger.Error("InstallSnapshot: save snapshot", "err", err)
+		return &kvpb.InstallSnapshotResponse{Term: req.Term, Success: false},
+			fmt.Errorf("raft: InstallSnapshot save: %w", err)
 	}
 
-	// Reset Raft log and update snapshot metadata under lock.
 	r.mu.Lock()
-	r.log = nil
+	// §7: if our log holds an entry at the snapshot's last included index with
+	// the same term, the entries after it are still valid and are kept.
+	// Otherwise the whole log goes — it describes a history the leader has
+	// already superseded.
+	localTerm, haveIndex := r.termAtLocked(req.LastIncludedIndex)
+	retainTail := haveIndex && localTerm == req.LastIncludedTerm
+
 	r.snapLastIndex = req.LastIncludedIndex
 	r.snapLastTerm = req.LastIncludedTerm
-	if err := r.persist.Save(r.currentTerm, r.votedFor, r.snapLastIndex, r.snapLastTerm); err != nil {
+	if retainTail {
+		r.normaliseLogLocked() // drops what the snapshot covers, keeps the rest
+	} else {
+		r.log = nil
+	}
+	// The snapshot's contents are committed and applied by definition, so both
+	// frontiers move up to its boundary.
+	if r.commitIndex < r.snapLastIndex {
+		r.commitIndex = r.snapLastIndex
+	}
+	if r.lastApplied < r.snapLastIndex {
+		r.lastApplied = r.snapLastIndex
+	}
+	if err := r.persistLocked(r.log); err != nil {
 		r.logger.Error("InstallSnapshot: persist state", "err", err)
 	}
 	r.mu.Unlock()
 
 	r.logger.Info("snapshot installed",
 		"last_index", req.LastIncludedIndex,
-		"last_term", req.LastIncludedTerm)
+		"last_term", req.LastIncludedTerm,
+		"retained_tail", retainTail)
 
 	return &kvpb.InstallSnapshotResponse{Term: req.Term, Success: true}, nil
 }
 
-// takeSnapshot captures a snapshot of the state machine and compacts the log.
+// takeSnapshot captures the state machine and compacts the log.
 // Runs in a goroutine; must not hold r.mu on entry.
 func (r *RaftNode) takeSnapshot(ctx context.Context) {
 	r.mu.Lock()
-	if len(r.log) == 0 {
+	// The cut point is lastApplied, not lastLogIndex. The payload reflects only
+	// what the state machine has consumed, so claiming a higher index would hand
+	// a follower a payload missing entries the index promises — and then discard
+	// those entries locally as compacted.
+	lastIdx := r.lastApplied
+	if lastIdx <= r.snapLastIndex {
+		r.mu.Unlock()
+		return // nothing applied since the last snapshot
+	}
+	lastTerm, ok := r.termAtLocked(lastIdx)
+	if !ok {
 		r.mu.Unlock()
 		return
 	}
-	lastIdx := r.lastLogIndex()
-	lastTerm := r.log[len(r.log)-1].Term
 	r.mu.Unlock()
 
-	data, err := r.store.Snapshot(ctx)
+	data, err := r.sm.SnapshotState(ctx)
 	if err != nil {
-		r.logger.Error("takeSnapshot: store.Snapshot failed", "err", err)
+		r.logger.Error("takeSnapshot: SnapshotState failed", "err", err)
 		return
 	}
 
@@ -775,48 +1095,19 @@ func (r *RaftNode) takeSnapshot(ctx context.Context) {
 	}
 
 	r.mu.Lock()
-	// Discard log entries up to and including lastIdx.
-	cutoff := r.logSliceIndex(lastIdx) + 1
-	if cutoff > 0 && cutoff <= len(r.log) {
-		r.log = r.log[cutoff:]
-	}
-	r.snapLastIndex = lastIdx
-	r.snapLastTerm = lastTerm
-	if err := r.persist.Save(r.currentTerm, r.votedFor, r.snapLastIndex, r.snapLastTerm); err != nil {
-		r.logger.Error("takeSnapshot: persist state", "err", err)
+	// Re-check under the lock: another snapshot may have advanced the boundary
+	// past this one while SnapshotState was running.
+	if lastIdx > r.snapLastIndex {
+		r.snapLastIndex = lastIdx
+		r.snapLastTerm = lastTerm
+		r.normaliseLogLocked() // discards entries up to and including lastIdx
+		if err := r.persistLocked(r.log); err != nil {
+			r.logger.Error("takeSnapshot: persist state", "err", err)
+		}
 	}
 	r.mu.Unlock()
 
 	r.logger.Info("snapshot taken", "last_index", lastIdx, "last_term", lastTerm)
-}
-
-// applyEntryLocked applies a single log entry to the store and appends to r.log.
-// Caller must hold r.mu.
-func (r *RaftNode) applyEntryLocked(ctx context.Context, entry *kvpb.LogEntry) {
-	var err error
-	switch entry.Op {
-	case "put":
-		// The assigned sequence is discarded: a Raft-applied entry is already
-		// ordered by its log index, and this path does not replicate.
-		_, err = r.store.Put(ctx, entry.Key, entry.Value)
-	case "delete":
-		_, err = r.store.Delete(ctx, entry.Key)
-	}
-	if err != nil {
-		r.logger.Error("failed to apply log entry", "op", entry.Op, "key", entry.Key, "error", err)
-	}
-
-	r.log = append(r.log, LogEntry{
-		Index: entry.Index,
-		Term:  entry.Term,
-		Op:    entry.Op,
-		Key:   entry.Key,
-		Value: entry.Value,
-	})
-
-	if len(r.log) >= r.snapshotThreshold {
-		go r.takeSnapshot(ctx)
-	}
 }
 
 // candidateLogUpToDateLocked returns true if the candidate's log is at least
@@ -879,6 +1170,22 @@ func (r *RaftNode) CurrentTerm() uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.currentTerm
+}
+
+// CommitIndex is the highest log index known to be committed. A proposer can
+// watch it against the index Propose returned to learn that its entry took
+// effect cluster-wide.
+func (r *RaftNode) CommitIndex() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.commitIndex
+}
+
+// LastLogIndex is the highest index this node stores, whether committed or not.
+func (r *RaftNode) LastLogIndex() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastLogIndex()
 }
 
 func (r *RaftNode) Leader() string {

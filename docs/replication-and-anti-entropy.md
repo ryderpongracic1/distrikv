@@ -144,6 +144,11 @@ degradation and a leaderless window that held; they do not show the two
 configurations equivalent under all conditions, and they say nothing at all about
 the asymmetric partition, which is not a fault the harness injects.
 
+The shipped build itself — `ef47847`, probe deleted rather than disabled — was
+then validated with the same suite: 8/8 PASS (`stop-restart` 4/4, `leader-kill`
+4/4) with `raft_last_applied_index` agreeing across all three nodes. See
+[chaos-harness.md](chaos-harness.md#post-removal-validation-the-shipped-build-2026-08-18).
+
 That last gap is exactly why the healthy-direction veto above exists rather than
 the alternative of accepting leader-vantage health outright. Keeping the write
 path's own outcomes as a veto is not a probe by another name: no dedicated traffic

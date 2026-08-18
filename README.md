@@ -70,7 +70,8 @@ the whole chaos suite run with the probe already off, including the first-ever
 convergence in the same range as the entire probe-on history. Nine runs on one
 machine, which is what they are worth — enough to show no degradation and to
 exercise the leaderless window, not enough to call the two configurations
-equivalent under all conditions.
+equivalent under all conditions. The shipped probe-deleted build (`ef47847`)
+subsequently passed the same suite 8/8 on the same hardware.
 
 - **Consistent hash ring** (`internal/cluster`) — 150 virtual positions per node on
   a `uint32` ring. `GetN(key, R)` returns the `R` distinct physical nodes that own

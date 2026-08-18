@@ -834,6 +834,31 @@ Read `health_transitions_committed` against `raft_last_applied_index` on all thr
 nodes when reading these runs, not against `health_transitions_proposed`: see
 [raft.md → Observables](raft.md).
 
+### Post-removal validation: the shipped build (2026-08-18)
+
+The P2 gate ran with the probe *disabled*; the removal itself shipped as main
+`ef47847`, where there is no probe code left to disable. The same suite was
+re-run against that build — Apple M4 Pro, Colima VM 8 CPU / 8 GB, fresh volumes,
+same flags — and passed 8/8, after the full race suite (16 packages, including
+the consensus-health and veto tests) passed on the same machine.
+
+| Gate | Runs | Convergence | Indeterminate writes |
+| --- | --- | --- | --- |
+| `stop-restart` | 4/4 PASS | 3.3–5.4s | 0, 0, 0, 0 |
+| `leader-kill` | 4/4 PASS | 5.3–6.0s | 15, 3, 20, 0 |
+
+The breaker's self-audit held again: pause episodes matched the windows that
+killed the runner's own target one-for-one, and the `leader-kill` run whose four
+victims never included node1 recorded zero pauses and zero indeterminate writes.
+After the runs, `raft_last_applied_index` agreed at 64 on all three nodes — the
+denominator to read `health_transitions_committed` against, since the per-node
+counters are in-memory and the nemesis restarts nodes.
+
+One reading note, recorded as an observation rather than a finding: `leader-kill`
+convergence sat at 5.3–6.0s here versus 1.1–4.4s in the probe-disabled P2 runs.
+Both ranges are inside the project's historical envelope, and at n=4 per
+configuration the difference is within run-to-run spread on this workload.
+
 ---
 
 ## Failure classification and fail-fast

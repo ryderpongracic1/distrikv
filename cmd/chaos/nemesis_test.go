@@ -788,11 +788,16 @@ func TestProvablyNeverSentUsesTypedErrors(t *testing.T) {
 		if !provablyNeverSent(dnsMiss) {
 			t.Error("an unresolvable host must classify as never sent")
 		}
-		// A DNS error that is not a name miss (a timeout, say) leaves the
-		// outcome unknown as far as this classifier is concerned.
+		// A DNS error that is not a name miss (a timeout, say) carries no phase
+		// information on its own, so this classifier declines to answer. Note
+		// that the same failure *inside a dial* does classify as never sent —
+		// see TestDialPhaseCoversCausesTheErrnoListDoesNot — because a
+		// *net.OpError with Op=="dial" states the phase, and net/http writes no
+		// request bytes before a connection exists. The distinction is the phase,
+		// not the cause.
 		dnsTimeout := &net.DNSError{Err: "i/o timeout", Name: "node2", IsTimeout: true}
 		if provablyNeverSent(dnsTimeout) {
-			t.Error("a DNS timeout is not evidence the request was never sent")
+			t.Error("a bare DNS timeout carries no phase, so it is not evidence the request was never sent")
 		}
 
 		sent := &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}

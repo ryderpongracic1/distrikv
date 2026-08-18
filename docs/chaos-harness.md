@@ -712,9 +712,33 @@ places: the log line, the `faults injected: N of M attempted` count, and its own
 row in the fault-window table. A misdirected kill is visible nowhere.
 
 The cost is real and accepted: when the target is the leader, the runner's
-operations fail for that outage. It is already modelled — failed operations are
-recorded as errors, and a write whose outcome is unknown becomes a pending
-operation the checker may place anywhere.
+operations fail for that outage. Most of those failures are provably harmless and
+cost the checker nothing; a minority are genuinely ambiguous, and confining them
+to the two instants of transition is what makes a `leader-kill` run reach a
+verdict at all. See
+[Failure classification and fail-fast](#failure-classification-and-fail-fast).
+
+#### Why it stops the leader rather than killing it
+
+`leader-kill` sends SIGTERM (`compose stop`), the same as `stop-restart`, and not
+SIGKILL. The graceful path is the one that produces *fewer* ambiguous writes, for
+a reason that is worth stating because the intuition runs the other way:
+
+- `http.Server.Shutdown` stops accepting **before** it drains. So the drain window
+  cannot accept a request it then dies holding — the failure mode a graceful stop
+  is usually suspected of. What it does instead is let requests already in a
+  handler finish and *answer*, turning writes that SIGKILL would have left
+  unknown into ordinary 200s and 503s.
+- SIGKILL adds nothing in exchange. It tears every in-flight request, and the
+  leaderless window — the thing this mode exists to produce — is the same either
+  way, because Raft learns of the loss from missed heartbeats, not from how the
+  process ended.
+
+`docker/docker-compose.yml` sets no `stop_grace_period`, so the compose default of
+10s applies; the node exits well inside it, which is why measured fault windows
+are `downtime + ~0.4s` of command overhead rather than `downtime + 10s`.
+
+### The P2 gate (pending)
 
 ### How the leader is resolved
 
@@ -751,13 +775,184 @@ anything:
 - `stop-restart` 4/4 — `linearizable: PASS`, `converged: true`
 - `kill-restart` control — the path that already worked must not regress
 - `leader-kill` 4/4 — plus `raft_terms` recovering to a flat value after each
-  forced election, and convergence times still in seconds
+  forced election, and convergence times still in seconds. Read its
+  `indeterminate writes` and `workload paused` rows together: see
+  [Failure classification and fail-fast](#failure-classification-and-fail-fast)
+  for what a healthy reading looks like
 
 A convergence blow-up under `leader-kill` with the probe off is the result that
 would say recovery detection got materially slower without it — measured, rather
 than assumed either way. Read `health_transitions_committed` against
 `raft_last_applied_index` on all three nodes when reading these runs, not against
 `health_transitions_proposed`: see [raft.md → Observables](raft.md).
+
+---
+
+## Failure classification and fail-fast
+
+`leader-kill` is the only mode that can take down the node the runner is driving,
+and the first time it ran it made the harness's own limit visible: the
+linearizability verdict came back `UNKNOWN (timeout)` twice on real hardware — at
+the 60s default and again at 300s — with 407 and 739 writes of unknown outcome
+across a 20-key space. Raising the budget was not the fix. Each unknown write is a
+*pending* operation that overlaps every later operation on its key, so a few
+hundred of them multiply the search space past what Porcupine can finish, at any
+budget.
+
+### The soundness constraint
+
+`KVModel` records a failed write as a **no-op**. So classifying a write that
+actually reached the server as failed tells the model the value was never stored,
+and a later *correct* read of that value then looks illegal: the checker reports an
+anomaly the cluster did not commit. The failure is silent and looks exactly like a
+real defect.
+
+Therefore a write may be recorded as a no-op **only when the runner can prove it
+never left the client**. Everything else is left pending. That is always safe and
+never wrong; it only costs search time. A slow checker is annoying; an unsound one
+is worthless, and this harness has caught 13 real defects precisely because its
+model never lies.
+
+### The taxonomy: the phase decides, not the cause
+
+Every failed write is bucketed by **how far it got**, because that is what
+determines what the store could possibly have seen. The report prints the tally
+under *write failures by phase*.
+
+| Bucket | What produced it | Modelled as |
+|---|---|---|
+| `503 refused-but-applied` | the ring-primary applied the write and could not replicate it | **applied** |
+| `502 forward never-sent` | the server said its forward to the primary never left | **no-op** |
+| `502 forward unknown` | a forward that may have been applied before its answer was lost | pending |
+| `other 5xx` | 500 — a ring-lookup failure *or* an already-durable store error | pending |
+| `dial failed (never sent)` | no connection ever existed | **no-op** |
+| `sent, no answer` | a connection existed; bytes may be on the wire | pending |
+| `cancelled by shutdown` | the runner's own context ended the call | pending |
+
+Two buckets become no-ops, and each has a proof behind it. The server's own
+verdict carries the 502 case (`forward_outcome` in the body — it has strictly more
+evidence than the client does). The other is the phase rule:
+
+> A `*net.OpError` whose `Op` is `"dial"` is a failure to *establish* the
+> connection, and `net/http` writes no request bytes until a connection exists.
+
+That covers a refused dial, a dial that timed out, an RST during the handshake,
+and local port exhaustion — whatever the cause, nothing reached a server. `"read"`
+and `"write"` belong to an established connection and are deliberately **not**
+matched. This is what a graceless outage mostly produces, and reading only the
+*cause* left every timed-out and reset-handshake dial as a pending operation the
+checker then had to search around.
+
+Ordering matters and is pinned by test: a status code decides before the transport
+does. A 503's body quotes the replication error underneath it, which during an
+outage reads `…connect: connection refused` from the fan-out to the dead replica.
+Classifying on message text first is how refused-but-applied writes were once
+declared "provably never sent".
+
+### Where the ambiguity actually comes from
+
+Measured against real sockets (`TestFailureTaxonomyAgainstRealEndpoints`):
+
+| Endpoint behaviour | Error the client sees | Bucket |
+|---|---|---|
+| nothing listening | `dial tcp …: connect: connection refused` | dial |
+| dial deadline expires | `dial tcp …: i/o timeout` | dial |
+| accepts, then closes | `EOF` | sent |
+| reads the request, never answers | `net/http: timeout awaiting response headers` | sent |
+| reads the request, then RSTs | `read tcp …: connection reset by peer` | sent |
+
+The third row is the whole problem. A published container port is not the
+container: something keeps accepting on the host port at each edge of an outage —
+and a restarting container accepts connections before it serves them. A request
+written into one of those returns `EOF`, and an `EOF` cannot prove the request was
+unread. At several thousand ops per second that window does not have to be long to
+produce hundreds of pending operations.
+
+This is irreducible by classification. The error genuinely is ambiguous, so the
+only remaining lever is to stop generating it.
+
+### Fail-fast (the workload circuit breaker)
+
+After `--fail-fast-after` consecutive **transport** failures (default 5), the
+workload pauses. A single elected worker probes `GET /status` every
+`--fail-fast-backoff` (default 250ms) and the workload resumes only when the probe
+**succeeds** — not when a timer expires, because a time-based resume would put the
+workload back on the wire during exactly the window where the container accepts
+without serving.
+
+Three properties are load-bearing:
+
+- **Only transport failures count.** Any 5xx is proof the target is serving, and
+  resets the run. This is what keeps the breaker entirely out of `stop-restart`
+  and `kill-restart`, where the target stays up and answers 503 tens of thousands
+  of times per run. Pinned by `TestFollowerOutageShapeNeverPausesTheWorkload`:
+  33,564 refused writes, zero pauses.
+- **`EOF` counts, not just refused dials.** The restarting-container window is
+  made of `EOF`s; a breaker that only counted refused dials would stay closed
+  through the one window that matters.
+- **It cannot affect a verdict.** The breaker decides whether an operation
+  *starts*. It holds no reference to the recorder, `finishWrite` takes no breaker
+  parameter, and an operation it refuses is never begun — so it contributes no
+  history events at all. It is not a failed write; it is a write that never
+  happened.
+
+The probe must stay read-only for the same reason: a probe that mutated the store
+would be a write the recorded history does not contain. `/status` reads no keys.
+
+**This changes the offered-load profile during an outage, on purpose**, which is
+standard for a chaos harness (Jepsen does the same) but must never be silent. The
+run says so in two places — a log line per episode:
+
+```
+target unreachable: pausing the workload after 5 consecutive transport failures
+  (episode 1) — probing every 250ms until it answers
+target reachable again: paused 752ms (episode 1) — resuming the workload
+```
+
+and a summary row:
+
+```
+  workload paused:         2 episode(s), 1.505s paused, 1471 op(s) not attempted
+```
+
+`--fail-fast-after=0` disables it and restores the previous offered-load profile
+exactly. That flag is the revert-check for every claim here.
+
+### Measured effect
+
+`TestLeaderKillShapeCollapsesIndeterminateWrites` runs the workload in-process
+against a gated proxy that reproduces the shape faithfully — live connections
+dropped when the backend goes away, new ones still accepted and closed — twice per
+run, with one flag as the only difference between arms:
+
+| Arm | ops | indeterminate writes | pauses | check |
+|---|---|---|---|---|
+| `--fail-fast-after=0` | 112,265 | **26,900** | — | not attempted |
+| `--fail-fast-after=5` | 59,511 | **16** | 2 / 1.505s | PASS in 115ms over 119,022 events |
+
+The residue is the genuine kill-instant tear: requests already on a connection when
+the backend went away. It scales with the worker count, not with outage duration —
+16 across two transitions at 6 workers.
+
+The test's backend is a mutex-guarded map, which is a *correct linearizable
+register* by construction. So the `PASS` is the soundness assertion, not a
+performance one: a `FAIL` there could only mean the runner recorded a write that
+happened as a write that did not.
+
+### What to expect from a leader-kill run now
+
+- **Indeterminate writes in the tens**, at roughly the worker count per fault
+  window that hits the target — not the 400–740 that made the verdict
+  unreachable.
+- **`workload paused: N episode(s)`** with roughly one episode per window that
+  takes the target down. Zero episodes on a run whose victims were never the
+  target is correct, not a failure to engage.
+- **A verdict inside the default 60s budget.** `UNKNOWN (timeout)` now means
+  something it could not mean before: not "the target died", but that the history
+  is genuinely too large or too ambiguous for a reason worth investigating. The
+  first thing to read is the *write failures by phase* table — a large `sent, no
+  answer` count with few pause episodes means the breaker is not engaging when it
+  should.
 
 ---
 

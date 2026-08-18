@@ -66,8 +66,11 @@
 //     rotation: the victim is always the resolved leader, and a leader outside
 //     the list makes the window skip rather than redirecting the kill.
 //   - The runner's own --target may be the node that dies. Operations fail for
-//     the duration of that outage, and are recorded as errors and indeterminate
-//     writes, which the checker already models.
+//     the duration of that outage. Most of those failures provably never left the
+//     client and cost the checker nothing; the ambiguous minority is confined to
+//     the transitions by --fail-fast-after, without which a leader-kill run's
+//     verdict is unreachable at any --check-timeout. See errclass.go, breaker.go
+//     and docs/chaos-harness.md.
 //
 // # Linearizability check
 //
@@ -98,7 +101,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -136,6 +138,13 @@ func main() {
 		nemesisInterval = flag.Duration("nemesis-interval", 10*time.Second, "delay between the end of one outage and the start of the next")
 		nemesisDowntime = flag.Duration("nemesis-downtime", 5*time.Second, "how long a victim stays down")
 		nemesisCompose  = flag.String("nemesis-compose-file", "docker/docker-compose.yml", "compose file the nemesis operates on")
+
+		// Fail-fast on an unreachable --target. Only matters when the nemesis can
+		// take the target down, which in practice means leader-kill. See
+		// breaker.go for why offered load is traded for a checkable history, and
+		// docs/chaos-harness.md for how to read the pause line it prints.
+		failFastAfter   = flag.Int("fail-fast-after", 5, "consecutive transport failures against --target before the workload pauses; 0 disables (restores the old offered-load profile)")
+		failFastBackoff = flag.Duration("fail-fast-backoff", 250*time.Millisecond, "how long the workload stays paused between probes of an unreachable --target")
 
 		// Convergence verification: did the cluster ever repair the writes it
 		// refused but kept? Default on for the fault-injecting nemeses, where
@@ -239,6 +248,14 @@ func main() {
 	}
 	client := clientpkg.NewWithTransport(clientpkg.Config{Host: *target}, transport)
 
+	// The breaker's probe is /status: it reads no keys, so it cannot put a
+	// mutation into the store that the recorded history does not contain. See
+	// newTargetBreaker.
+	breaker := newTargetBreaker(*failFastAfter, *failFastBackoff, func(ctx context.Context) error {
+		_, err := client.Status(ctx)
+		return err
+	}, log.Printf)
+
 	// Pre-generate the key space.
 	//
 	// Keys carry a per-run nonce, and warmup uses a disjoint set from
@@ -261,7 +278,10 @@ func main() {
 	log.Printf("warmup for %s …", *warmup)
 	warm := &counters{}
 	wctx, wcancel := context.WithTimeout(context.Background(), *warmup)
-	runWorkers(wctx, *workers, warmKeys, *putPct, *delPct, client, nil, warm)
+	// The breaker is deliberately not installed for warmup: no nemesis runs
+	// during warmup, so there is nothing for it to react to, and leaving it out
+	// keeps warmup's offered-load profile identical to every previous run's.
+	runWorkers(wctx, *workers, warmKeys, *putPct, *delPct, client, nil, warm, nil)
 	wcancel()
 	log.Printf("warmup done: %d ops, %d errors (not recorded)", warm.ops.Load(), warm.errors.Load())
 
@@ -288,7 +308,7 @@ func main() {
 		}()
 	}
 
-	runWorkers(mctx, *workers, keys, *putPct, *delPct, client, rec, measured)
+	runWorkers(mctx, *workers, keys, *putPct, *delPct, client, rec, measured, breaker)
 	interrupted := sigctx.Err() != nil
 	measuredFor := time.Since(measureStart)
 	mcancel()
@@ -343,6 +363,7 @@ func main() {
 	errs := measured.errors.Load()
 	indeterminate := measured.indeterminateWrites.Load()
 	refused := measured.refusedWrites.Load()
+	pauses := breaker.Stats()
 	injected := countInjected(windows)
 	log.Printf("ops=%d errors=%d events=%d faults=%d/%d; running linearizability check …",
 		ops, errs, rec.Len(), injected, len(windows))
@@ -402,26 +423,34 @@ func main() {
 
 	if *output == "json" {
 		type report struct {
-			Target              string              `json:"target"`
-			Duration            string              `json:"duration"`
-			MeasuredDuration    string              `json:"measured_duration"`
-			Interrupted         bool                `json:"interrupted"`
-			Workers             int                 `json:"workers"`
-			Keyspace            int                 `json:"keyspace"`
-			TotalOps            int64               `json:"total_ops"`
-			Errors              int64               `json:"errors"`
-			IndeterminateWrites int64               `json:"indeterminate_writes"`
-			RefusedWrites       int64               `json:"refused_writes"`
-			Events              int                 `json:"events"`
-			Linearizable        bool                `json:"linearizable"`
-			CheckTimedOut       bool                `json:"check_timed_out"`
-			CheckDuration       string              `json:"check_duration"`
-			Nemesis             string              `json:"nemesis"`
-			NemesisServices     []string            `json:"nemesis_services,omitempty"`
-			FaultsInjected      int                 `json:"faults_injected"`
-			FaultsAttempted     int                 `json:"faults_attempted"`
-			FaultWindows        []faultWindowReport `json:"fault_windows,omitempty"`
-			Convergence         convergenceResult   `json:"convergence"`
+			Target              string `json:"target"`
+			Duration            string `json:"duration"`
+			MeasuredDuration    string `json:"measured_duration"`
+			Interrupted         bool   `json:"interrupted"`
+			Workers             int    `json:"workers"`
+			Keyspace            int    `json:"keyspace"`
+			TotalOps            int64  `json:"total_ops"`
+			Errors              int64  `json:"errors"`
+			IndeterminateWrites int64  `json:"indeterminate_writes"`
+			RefusedWrites       int64  `json:"refused_writes"`
+			// WriteFailuresByPhase is the taxonomy behind IndeterminateWrites:
+			// which phase each failed write reached, and therefore what the store
+			// could have seen. Absent when no write failed.
+			WriteFailuresByPhase map[string]int64 `json:"write_failures_by_phase,omitempty"`
+			// WorkloadPauses reports the fail-fast episodes. Load offered during
+			// an outage is lower than the flags request while a pause is open, so
+			// this is part of the run's description, not a footnote.
+			WorkloadPauses  breakerStats        `json:"workload_pauses"`
+			Events          int                 `json:"events"`
+			Linearizable    bool                `json:"linearizable"`
+			CheckTimedOut   bool                `json:"check_timed_out"`
+			CheckDuration   string              `json:"check_duration"`
+			Nemesis         string              `json:"nemesis"`
+			NemesisServices []string            `json:"nemesis_services,omitempty"`
+			FaultsInjected  int                 `json:"faults_injected"`
+			FaultsAttempted int                 `json:"faults_attempted"`
+			FaultWindows    []faultWindowReport `json:"fault_windows,omitempty"`
+			Convergence     convergenceResult   `json:"convergence"`
 			// Counterexample is present only on a non-linearizable verdict that
 			// the per-key scan could localise.
 			Counterexample     *counterexampleReport `json:"counterexample,omitempty"`
@@ -430,26 +459,28 @@ func main() {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(report{
-			Target:              *target,
-			Duration:            duration.String(),
-			MeasuredDuration:    measuredFor.Round(time.Millisecond).String(),
-			Interrupted:         interrupted,
-			Workers:             *workers,
-			Keyspace:            *keyspace,
-			TotalOps:            ops,
-			Errors:              errs,
-			IndeterminateWrites: indeterminate,
-			RefusedWrites:       refused,
-			Events:              rec.Len(),
-			Linearizable:        ok && !timedOut,
-			CheckTimedOut:       timedOut,
-			CheckDuration:       elapsed.Round(time.Millisecond).String(),
-			Nemesis:             ncfg.Describe(),
-			NemesisServices:     ncfg.Services,
-			FaultsInjected:      injected,
-			FaultsAttempted:     len(windows),
-			FaultWindows:        faultWindowReports(windows, measureStart),
-			Convergence:         converge,
+			Target:               *target,
+			Duration:             duration.String(),
+			MeasuredDuration:     measuredFor.Round(time.Millisecond).String(),
+			Interrupted:          interrupted,
+			Workers:              *workers,
+			Keyspace:             *keyspace,
+			TotalOps:             ops,
+			Errors:               errs,
+			IndeterminateWrites:  indeterminate,
+			RefusedWrites:        refused,
+			WriteFailuresByPhase: measured.failureBreakdownMap(),
+			WorkloadPauses:       pauses,
+			Events:               rec.Len(),
+			Linearizable:         ok && !timedOut,
+			CheckTimedOut:        timedOut,
+			CheckDuration:        elapsed.Round(time.Millisecond).String(),
+			Nemesis:              ncfg.Describe(),
+			NemesisServices:      ncfg.Services,
+			FaultsInjected:       injected,
+			FaultsAttempted:      len(windows),
+			FaultWindows:         faultWindowReports(windows, measureStart),
+			Convergence:          converge,
 			Counterexample: buildCounterexampleReport(cx, counterexampleMeta{
 				Verdict:          result,
 				Target:           *target,
@@ -477,11 +508,26 @@ func main() {
 			fmt.Printf("%s\n", line)
 		}
 		fmt.Printf("  %-24s %d\n", "indeterminate writes:", indeterminate)
+		if pauses.Episodes > 0 {
+			// Named plainly, because it changes what "ops" means: the workload
+			// offered less load than the flags asked for, on purpose, and a
+			// reader comparing two runs has to know that.
+			fmt.Printf("  %-24s %d episode(s), %s paused, %d op(s) not attempted\n",
+				"workload paused:", pauses.Episodes,
+				pauses.Paused.Round(time.Millisecond), pauses.Skipped)
+		}
 		fmt.Printf("  %-24s %d\n", "events:", rec.Len())
 		fmt.Printf("  %-24s %s\n", "nemesis:", ncfg.Describe())
 		fmt.Printf("  %-24s %d of %d attempted\n", "faults injected:", injected, len(windows))
 		fmt.Printf("  %-24s %s\n", "check_duration:", elapsed.Round(time.Millisecond))
 		fmt.Printf("  %-24s %s\n", "linearizable:", result)
+		if breakdown := measured.failureBreakdown(); len(breakdown) > 0 {
+			fmt.Printf("%s\n", sep)
+			fmt.Printf("  write failures by phase (what the store could have seen):\n")
+			for _, line := range breakdown {
+				fmt.Printf("    %s\n", line)
+			}
+		}
 		if len(windows) > 0 {
 			fmt.Printf("%s\n", sep)
 			fmt.Printf("  fault windows (offsets from measurement start):\n")
@@ -572,8 +618,11 @@ func verdictNotes(exitCode int, refused, indeterminate int64, converge convergen
 			notes = append(notes,
 				fmt.Sprintf("      %d write(s) had an unknown outcome and are pending operations, each of", indeterminate),
 				"      which overlaps every later operation on its key — the most likely reason",
-				"      the search did not finish. A shorter run, or fewer ambiguous failures,",
-				"      brings it back inside the budget.")
+				"      the search did not finish. Raising the budget does not help much: a few",
+				"      hundred pending operations multiply the search space past any timeout.",
+				"      Read the write-failure breakdown above. A large \"sent, no answer\" count",
+				"      with few workload pauses means --fail-fast-after is not engaging while the",
+				"      target is unreachable; see docs/chaos-harness.md.")
 		}
 		return notes
 	default:
@@ -704,11 +753,62 @@ type counters struct {
 	// anyway: distrikv answers 503 for a mutation the ring-primary applied and
 	// could not replicate, and does not roll it back. See classifyWriteEffect.
 	refusedWrites atomic.Int64
+	// kinds counts *write* failures by taxonomy bucket, indexed by failureKind.
+	// It is what turns "739 indeterminate writes" from a number into a diagnosis:
+	// the two transport buckets separate the requests that provably never left
+	// from the ones that may have been read, and those have entirely different
+	// fixes. Reads are deliberately excluded — the indeterminate count they sit
+	// beside is about writes. Writes cancelled by the runner's own shutdown are
+	// excluded for the same reason they are excluded from `errors`: they describe
+	// the run ending, not the cluster.
+	kinds [kindCount]atomic.Int64
+}
+
+// recordKind accumulates one write failure into the taxonomy.
+func (c *counters) recordKind(k failureKind) {
+	if k == kindNone || int(k) >= len(c.kinds) {
+		return
+	}
+	c.kinds[k].Add(1)
+}
+
+// failureBreakdown renders the per-kind write-failure tally, in report order,
+// omitting buckets that never fired. Empty when no write failed.
+func (c *counters) failureBreakdown() []string {
+	var lines []string
+	for _, k := range writeFailureKinds {
+		n := c.kinds[k].Load()
+		if n == 0 {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%-26s %8d  → %s", k.String()+":", n, k.effect()))
+	}
+	return lines
+}
+
+// failureBreakdownMap is the JSON shape of the same tally.
+func (c *counters) failureBreakdownMap() map[string]int64 {
+	out := map[string]int64{}
+	for _, k := range writeFailureKinds {
+		if n := c.kinds[k].Load(); n > 0 {
+			out[k.String()] = n
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // runWorkers starts `n` goroutines that each issue operations until ctx is
 // cancelled.  If rec is nil, operations are executed but not recorded
 // (warmup mode).
+//
+// br may be nil, which disables fail-fast entirely. When it is not nil, a worker
+// asks it before every operation: a refused operation is not attempted, so it
+// produces no history event and is not counted as an op. Every operation that is
+// attempted is recorded and classified exactly as it would be without the
+// breaker — see breaker.go.
 func runWorkers(
 	ctx context.Context,
 	n int,
@@ -717,6 +817,7 @@ func runWorkers(
 	client *clientpkg.Client,
 	rec *linearizability.Recorder,
 	c *counters,
+	br *targetBreaker,
 ) {
 	var wg sync.WaitGroup
 	for w := 0; w < n; w++ {
@@ -729,6 +830,14 @@ func runWorkers(
 				case <-ctx.Done():
 					return
 				default:
+				}
+
+				if !br.Allow() {
+					// The target is not answering. Wait — or, if elected, probe
+					// it — and re-check rather than adding another ambiguous
+					// request to the history.
+					br.Wait(ctx)
+					continue
 				}
 
 				key := keys[rng.Intn(len(keys))]
@@ -744,7 +853,7 @@ func runWorkers(
 						cid = rec.BeginWorker(id, linearizability.Input{Op: "put", Key: key, Value: val})
 					}
 					err := client.Put(ctx, key, val)
-					finishWrite(ctx, rec, cid, err, c)
+					br.Record(finishWrite(ctx, rec, cid, err, c))
 
 				case roll < putPct+delPct:
 					var cid int
@@ -752,7 +861,7 @@ func runWorkers(
 						cid = rec.BeginWorker(id, linearizability.Input{Op: "delete", Key: key})
 					}
 					err := classifyDeleteErr(client.Delete(ctx, key))
-					finishWrite(ctx, rec, cid, err, c)
+					br.Record(finishWrite(ctx, rec, cid, err, c))
 
 				default: // get
 					var cid int
@@ -776,6 +885,10 @@ func runWorkers(
 						}
 						rec.End(cid, out)
 					}
+					// Reads feed the breaker too — a read that cannot reach the
+					// target is the same evidence about the target as a write
+					// that cannot — but they are left out of the write taxonomy.
+					br.Record(classifyFailure(err))
 					if err != nil && !isNotFound(err) && ctx.Err() == nil {
 						c.errors.Add(1)
 					}
@@ -786,9 +899,10 @@ func runWorkers(
 	wg.Wait()
 }
 
-// finishWrite records the outcome of a put or delete.
+// finishWrite records the outcome of a put or delete, and returns the taxonomy
+// bucket it fell into so the caller can feed the breaker.
 //
-// How the operation enters the history is decided by classifyWriteEffect: a
+// How the operation enters the history is decided by classifyFailure: a
 // write known to have landed is recorded as applied, one that provably never
 // left as a no-op, and one whose effect is unknown as a pending operation. Only
 // failures that are not shutdown artefacts are counted in the reported
@@ -801,11 +915,13 @@ func finishWrite(
 	cid int,
 	err error,
 	c *counters,
-) {
-	effect := classifyWriteEffect(err)
+) failureKind {
+	kind := classifyFailure(err)
+	effect := kind.effect()
 
 	if err != nil && ctx.Err() == nil {
 		c.errors.Add(1)
+		c.recordKind(kind)
 		switch effect {
 		case effectApplied:
 			c.refusedWrites.Add(1)
@@ -815,7 +931,7 @@ func finishWrite(
 	}
 
 	if rec == nil {
-		return
+		return kind
 	}
 	switch {
 	case err == nil:
@@ -829,252 +945,5 @@ func finishWrite(
 	default:
 		rec.EndUnknown(cid)
 	}
-}
-
-// classifyDeleteErr maps a delete outcome to what should be recorded.
-//
-// The server answers 404 when the key was already absent. That is not a failure
-// and not an unknown outcome: it leaves the store in exactly the state a
-// successful delete would, and the 404 is positive evidence the key was absent
-// at some instant inside the call, so recording the delete as applied is sound
-// and uses more of the available evidence than recording it as an error.
-//
-// This is sound only because the server emits 404 on DELETE exclusively for an
-// absent key (see handleDelete in internal/server). If a 404 ever comes to mean
-// something else — a route miss, "not the owner of this key" — this assertion
-// stops being valid and must change with it.
-func classifyDeleteErr(err error) error {
-	if isNotFound(err) {
-		return nil
-	}
-	return err
-}
-
-// writeEffect is what the runner concluded a failed write did to the store. It
-// decides how the operation enters the recorded history — see finishWrite.
-type writeEffect int
-
-const (
-	// effectApplied: the mutation took effect. Either the call succeeded, or it
-	// failed with positive evidence that the write landed anyway.
-	effectApplied writeEffect = iota
-	// effectNotApplied: the mutation provably did not take effect, so modelling
-	// it as a no-op is exact rather than merely convenient.
-	effectNotApplied
-	// effectUnknown: the mutation may or may not have taken effect. Neither
-	// no-op nor applied can be asserted; the operation is left pending.
-	effectUnknown
-)
-
-func (e writeEffect) String() string {
-	switch e {
-	case effectApplied:
-		return "applied"
-	case effectNotApplied:
-		return "not applied"
-	case effectUnknown:
-		return "unknown"
-	}
-	return fmt.Sprintf("writeEffect(%d)", int(e))
-}
-
-// classifyWriteEffect decides which of the three outcomes a write error carries.
-//
-// The status code decides first, and it decides from the chain: internal/client
-// returns *StatusError for a 5xx, so the code is matched with errors.As rather
-// than read out of the message.
-//
-//	503  the ring-primary applied the mutation to its own store and then failed
-//	     to replicate it. distrikv does not roll that back (see ErrReplication
-//	     in internal/server and "CAP Position" in docs/architecture.md), and reads are
-//	     served by the primary, so the write is present and readable. Applied.
-//	     Both client entry points report this identically: a forwarded write
-//	     returns the primary's status verbatim through ForwardKey.
-//	502  the write failed on its way to the primary, in forwardRequest. Two
-//	     causes hide behind one code: a request that provably never reached the
-//	     primary (never applied), and a ForwardKey RPC that failed in a way that
-//	     may have been applied before the response was lost. The server separates
-//	     them and says which in the body's forward_outcome field — see
-//	     classifyForwardOutcome.
-//	5xx  anything else: 500 covers both a ring-lookup failure (never applied)
-//	     and a local store error (possibly durable already). Unknown.
-//
-// Only when there is no status code at all — the request never got a response —
-// does the transport classification run.
-//
-// Ordering matters, and not only for tidiness. A 503's body carries the
-// replication error underneath it, which during an outage reads "…connect:
-// connection refused" from the fan-out to the dead replica. Classifying on the
-// message text first therefore declared refused-but-applied writes "provably
-// never sent" — the reason a stop-restart run reported 0 indeterminate writes
-// while failing.
-func classifyWriteEffect(err error) writeEffect {
-	if err == nil || isNotFound(err) {
-		return effectApplied
-	}
-
-	var se *clientpkg.StatusError
-	if errors.As(err, &se) {
-		switch se.StatusCode {
-		case http.StatusServiceUnavailable:
-			return effectApplied
-		case http.StatusBadGateway:
-			return classifyForwardOutcome(se.Body)
-		default:
-			return effectUnknown
-		}
-	}
-
-	if provablyNeverSent(err) {
-		return effectNotApplied
-	}
-	// Everything left is unknown, deliberately: a timeout, a reset mid-request,
-	// a cancelled context, an error shape this runner has never seen. Guessing
-	// "no-op" here is what produced false anomalies; leaving the operation
-	// pending asserts nothing.
-	return effectUnknown
-}
-
-// forwardOutcome values the server emits in a 502 body. They mirror the
-// constants in internal/server; this is the wire contract between the two.
-const (
-	forwardOutcomeNeverSent = "never-sent"
-	forwardOutcomeUnknown   = "unknown"
-)
-
-// forwardErrorBody is the 502 body shape written by internal/server's
-// writeForwardError. ForwardOutcome is a pointer so an *absent* field — an older
-// server that does not emit it — is distinguishable from one present with a value
-// this runner does not recognise. The two are treated differently: see
-// classifyForwardOutcome.
-type forwardErrorBody struct {
-	Error          string  `json:"error"`
-	ForwardOutcome *string `json:"forward_outcome"`
-}
-
-// classifyForwardOutcome decides what a 502 says about the store, reading the
-// server's typed verdict in preference to its prose.
-//
-// The server is the only party that can answer this. A gRPC RPC error is a
-// *status.Error carrying a code and a string and nothing else — it does not wrap
-// the transport failure underneath, so there is no chain to inspect even on the
-// server's side, let alone after the message has crossed two process boundaries
-// as text. What the server does have is the code that framed the message, which
-// is what separates a connection that was never established from a stream that
-// broke after the request went out. It makes that call and sends the answer;
-// this function just reads it. See classifyForwardError in internal/server.
-//
-// Three inputs, three answers, and the difference between the last two matters:
-//
-//   - field present and recognised → its verdict, trusted. The server made it
-//     with strictly more evidence than exists here.
-//   - field present but unrecognised → unknown, and the text is *not* consulted.
-//     A server that speaks this field is authoritative; falling back to a weaker
-//     signal that might contradict it would be worse than declining to answer.
-//   - field absent → the text scan, for a server predating the field. See
-//     neverSentText.
-//
-// Every path that is not a recognised never-sent ends in effectUnknown, so the
-// bounded-safe property holds: an unparseable, truncated, or unexpected body
-// leaves the operation pending rather than asserting a no-op.
-func classifyForwardOutcome(body string) writeEffect {
-	var parsed forwardErrorBody
-	if err := json.Unmarshal([]byte(body), &parsed); err == nil && parsed.ForwardOutcome != nil {
-		switch *parsed.ForwardOutcome {
-		case forwardOutcomeNeverSent:
-			return effectNotApplied
-		default:
-			// Includes forwardOutcomeUnknown and anything unrecognised.
-			return effectUnknown
-		}
-	}
-
-	if neverSentText(body) {
-		return effectNotApplied
-	}
-	return effectUnknown
-}
-
-// neverSentMarkers are transport failures that mean nothing was delivered: a
-// refused connection got no SYN-ACK, an unresolvable or unroutable host got no
-// packets at all. A connection that died *after* the request went out reads
-// differently ("EOF", "connection reset by peer", "transport is closing") and is
-// deliberately absent from this list.
-var neverSentMarkers = []string{
-	"connection refused",
-	"no such host",
-	"no route to host",
-	"network is unreachable",
-}
-
-// neverSentText reports whether an error message describes a transport failure
-// that delivered nothing.
-//
-// This is the text path. It is now a **compatibility fallback**, reached only for
-// a 502 body with no forward_outcome field — a server older than that field.
-// Against a current server the typed field always decides.
-//
-// It was load-bearing until the server learned to classify, and its limits are
-// worth recording, because they are what motivated moving the decision upstream.
-// Two of the four markers above could never fire on this path: gRPC reports an
-// unresolvable target as `name resolver error: produced zero addresses`, not "no
-// such host", and an unroutable address as a plain DeadlineExceeded rather than
-// anything naming a route. Reading a failure this far downstream means matching
-// wording chosen by a library two hops away for an audience of humans.
-//
-// It stays bounded in the safe direction either way: an unrecognised body is
-// unknown, so a rewording costs checker time, never a wrong verdict.
-func neverSentText(msg string) bool {
-	for _, s := range neverSentMarkers {
-		if strings.Contains(msg, s) {
-			return true
-		}
-	}
-	return false
-}
-
-// provablyNeverSent reports whether err means the request never reached a
-// server, so treating it as a no-op is exact rather than merely conservative.
-//
-// It is only consulted for an error with no HTTP status in it — a request that
-// never got a response at all. classifyWriteEffect handles status-carrying
-// errors before this runs, which is what keeps a 503 (applied) from being read
-// as "never sent" because its body quotes a refused replica connection.
-//
-// The typed checks are the contract, and they cover the errors this runner
-// actually produces: internal/client wraps a dial failure as
-// fmt.Errorf("%w: %w", ErrUnreachable, urlErr.Err), so the *net.OpError and the
-// refusing syscall.Errno underneath stay reachable through errors.Is and
-// errors.As. That is asserted end to end against a real refused dial in
-// TestProvablyNeverSentClassifiesRealClientErrors.
-//
-// The substring checks behind them are a last resort for an error that arrives
-// as text with no identity left to match — one that crossed a process boundary,
-// or came from a source outside this repo. They are deliberately kept because
-// misclassifying a never-sent write as unknown only costs checker time, whereas
-// the reverse would model a genuinely unknown outcome as a no-op. They are no
-// longer load-bearing for client errors.
-func provablyNeverSent(err error) bool {
-	// Typed: exact, and works for any error that preserves its chain.
-	for _, errno := range []syscall.Errno{
-		syscall.ECONNREFUSED,
-		syscall.EHOSTUNREACH,
-		syscall.ENETUNREACH,
-	} {
-		if errors.Is(err, errno) {
-			return true
-		}
-	}
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
-		return true
-	}
-
-	// Fallback: the message text, for errors that reach us with no chain.
-	return neverSentText(err.Error())
-}
-
-// isNotFound reports whether err represents a 404 / key-not-found response.
-func isNotFound(err error) bool {
-	return errors.Is(err, clientpkg.ErrNotFound)
+	return kind
 }

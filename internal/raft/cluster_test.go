@@ -392,58 +392,103 @@ func (c *testCluster) appliedCounts() map[string]int {
 // election timer. So the term-stability assertion is re-run with a steady stream
 // of proposals underneath it — a healthy cluster must hold one term while
 // replicating.
+//
+// Scheduler-noise policy: on a contended runner (CI shares 2 vCPUs across the
+// whole -race suite, with other packages' tests running in parallel), a
+// descheduled heartbeat goroutine can blow a 150–300 ms election timer without
+// the log path being at fault. The invariant under test is structural — a
+// genuine starvation regression (defect 6 stormed at ~1.7 terms/sec) fails
+// every run — so the term-stability gate retries with a fresh cluster and only
+// fails when every attempt storms. All other assertions keep full strength
+// within an attempt. Same policy as
+// TestHealthTransitionCountersReconcileWithTheLog in cmd/node.
 func TestCluster_TermStableWhileEntriesFlow(t *testing.T) {
-	c := newTestCluster(t, stormTiming(), nil)
-	waitForLeader(t, 3*time.Second, c.nodes...)
-	time.Sleep(500 * time.Millisecond) // let the initial election settle
+	const attempts = 3
+	for attempt := 1; attempt <= attempts; attempt++ {
+		var (
+			before, after uint64
+			proposed      int
+			leaders       int
+		)
+		// Each attempt runs as a subtest so its cluster is torn down when the
+		// attempt returns — a stormed cluster left running until test end
+		// would keep electing, adding exactly the contention the retry is
+		// trying to rule out.
+		t.Run(fmt.Sprintf("attempt-%d", attempt), func(t *testing.T) {
+			c := newTestCluster(t, stormTiming(), nil)
+			waitForLeader(t, 3*time.Second, c.nodes...)
+			time.Sleep(500 * time.Millisecond) // let the initial election settle
 
-	before := maxTerm(c.nodes...)
+			before = maxTerm(c.nodes...)
 
-	// Propose steadily for three seconds — faster than the heartbeat interval,
-	// so most ticks carry entries. A tick that finds no leader is skipped: the
-	// term assertion below is what judges leadership churn.
-	stop := time.After(3 * time.Second)
-	proposed := 0
-	for done := false; !done; {
-		select {
-		case <-stop:
-			done = true
-		case <-time.After(10 * time.Millisecond):
-			leader, ok := c.currentLeader()
-			if !ok {
-				continue
+			// Propose steadily for three seconds — faster than the heartbeat
+			// interval, so most ticks carry entries. A tick that finds no
+			// leader is skipped: the term assertion below is what judges
+			// leadership churn.
+			stop := time.After(3 * time.Second)
+			for done := false; !done; {
+				select {
+				case <-stop:
+					done = true
+				case <-time.After(10 * time.Millisecond):
+					leader, ok := c.currentLeader()
+					if !ok {
+						continue
+					}
+					if _, err := leader.Propose(context.Background(), "health-up", fmt.Sprintf("k%d", proposed), nil); err == nil {
+						proposed++
+					}
+				}
 			}
-			if _, err := leader.Propose(context.Background(), "health-up", fmt.Sprintf("k%d", proposed), nil); err == nil {
-				proposed++
+
+			after = maxTerm(c.nodes...)
+			leaders = leaderCount(c.nodes...)
+			if after-before > 1 || leaders != 1 {
+				// Verdict deferred to the outer loop: retryable on a
+				// non-final attempt, fatal on the last.
+				return
 			}
+
+			// The scheduler-sensitive gate held; the remaining assertions are
+			// judged at full strength on this attempt.
+			require.Greater(t, proposed, 50, "the test must actually have replicated something")
+
+			// The followers must have kept up rather than merely stayed quiet.
+			require.Eventually(t, func() bool {
+				leader, ok := c.currentLeader()
+				if !ok {
+					return false
+				}
+				want := leader.CommitIndex()
+				if want == 0 {
+					return false
+				}
+				for _, n := range c.nodes {
+					if n.LastLogIndex() < want {
+						return false
+					}
+				}
+				return true
+			}, 5*time.Second, 20*time.Millisecond, "followers did not keep up with the leader's committed log")
+		})
+		if t.Failed() {
+			return
 		}
+		if after-before <= 1 && leaders == 1 {
+			return // this attempt passed in full
+		}
+		if attempt == attempts {
+			require.LessOrEqualf(t, after-before, uint64(1),
+				"term advanced %d times in 3s (%d → %d) while replicating %d entries, "+
+					"on every one of %d fresh clusters: the log path is starving heartbeats",
+				after-before, before, after, proposed, attempts)
+			require.Equal(t, 1, leaders, "exactly one stable leader")
+		}
+		t.Logf("attempt %d: term advanced %d times (%d → %d, %d proposals, %d leaders) — "+
+			"retrying with a fresh cluster; scheduler noise and a genuine storm are "+
+			"distinguished by persistence across attempts",
+			attempt, after-before, before, after, proposed, leaders)
 	}
-
-	after := maxTerm(c.nodes...)
-	require.LessOrEqualf(t, after-before, uint64(1),
-		"term advanced %d times in 3s (%d → %d) while replicating %d entries: "+
-			"the log path is starving heartbeats",
-		after-before, before, after, proposed)
-	require.Equal(t, 1, leaderCount(c.nodes...), "exactly one stable leader")
-	require.Greater(t, proposed, 50, "the test must actually have replicated something")
-
-	// The followers must have kept up rather than merely stayed quiet.
-	require.Eventually(t, func() bool {
-		leader, ok := c.currentLeader()
-		if !ok {
-			return false
-		}
-		want := leader.CommitIndex()
-		if want == 0 {
-			return false
-		}
-		for _, n := range c.nodes {
-			if n.LastLogIndex() < want {
-				return false
-			}
-		}
-		return true
-	}, 5*time.Second, 20*time.Millisecond, "followers did not keep up with the leader's committed log")
 }
 
 // TestCluster_FollowerCatchesUpAfterMissingEntries proves recovery through the

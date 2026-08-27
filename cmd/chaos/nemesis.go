@@ -23,8 +23,15 @@ const (
 	nemesisLeaderKill = "leader-kill"
 )
 
-// nemesisModes lists every accepted --nemesis value, for error messages.
-var nemesisModes = []string{nemesisNone, nemesisKillRestart, nemesisStopRestart, nemesisLeaderKill}
+// nemesisFaultModes are the modes that inject a fault, and are what
+// parseNemesisFlags and newComposeNemesis both accept. nemesisModes adds
+// nemesisNone for error messages only: it is a valid --nemesis value but is
+// handled before either of those consults a mode, so accepting it as a fault
+// mode would let a run reach newComposeNemesis with nothing to disrupt.
+var (
+	nemesisFaultModes = []string{nemesisKillRestart, nemesisStopRestart, nemesisLeaderKill}
+	nemesisModes      = append([]string{nemesisNone}, nemesisFaultModes...)
+)
 
 // nemesisCommandTimeout bounds a single docker invocation. A `compose kill` is
 // near-instant and a `compose start` is a container start, so anything past
@@ -494,10 +501,10 @@ func parseNemesisFlags(mode, services, composeFile string, interval, downtime ti
 		}
 		return nemesisConfig{Mode: nemesisNone}, nil
 	}
-	// Validated against the same list the error message prints, so a mode added
-	// to nemesisModes cannot be accepted here and then rejected with a different
-	// message by newComposeNemesis.
-	if !slices.Contains(nemesisModes, mode) {
+	// Validated against the fault modes, which is exactly what newComposeNemesis
+	// accepts — so a mode cannot pass here and then be rejected there with a
+	// different message. nemesisNone returned above.
+	if !slices.Contains(nemesisFaultModes, mode) {
 		return nemesisConfig{}, fmt.Errorf("unknown --nemesis %q (want %s)",
 			mode, strings.Join(nemesisModes, ", "))
 	}

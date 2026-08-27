@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ryderpongracic1/distrikv/internal/cluster"
 	"github.com/ryderpongracic1/distrikv/internal/metrics"
 	"github.com/ryderpongracic1/distrikv/internal/raft"
 )
@@ -21,13 +20,18 @@ import (
 // to ship. At the docker-compose heartbeat interval of 150 ms these are ~450 ms
 // to declare a peer down and ~300 ms to declare it back.
 //
-// defaultHealthDownAfter is cluster.DefaultStableChecks, so the consensus signal
-// and the local one cannot disagree about how much evidence a transition needs.
+// These are the aggregator's own thresholds, deliberately independent of
+// cluster.PeerHealth's. The two trackers gate different transitions and cannot
+// be reconciled by sharing a constant: PeerHealth demotes a peer on the *first*
+// failed observation and spends its DefaultStableChecks budget on the recovery,
+// while the aggregator spends its evidence on the demotion — because a local
+// demotion only stops this node scheduling a catch-up pass, whereas a committed
+// "down" gates every ring-primary in the cluster. Binding either of these to
+// DefaultStableChecks would tie a down-threshold to an up-knob, so that damping
+// recovery flapping there would silently change how much evidence the leader
+// needs to declare a peer dead here.
 const (
-	// Tied to the local tracker's threshold by construction rather than by a
-	// comment: the two must agree about how much evidence a transition needs, or
-	// the consensus signal and the local one disagree about the same peer.
-	defaultHealthDownAfter = cluster.DefaultStableChecks
+	defaultHealthDownAfter = 3
 	defaultHealthUpAfter   = 2
 )
 

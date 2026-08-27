@@ -215,10 +215,13 @@ type RaftNode struct {
 	// is why mu must never be acquired before it.
 	applyMu sync.Mutex
 
-	// snapshotting is the single-flight guard for takeSnapshot. Atomic rather
-	// than guarded by mu because takeSnapshot drops mu across the capture, so
-	// the flag has to outlive the lock hold that sets it.
-	snapshotting atomic.Bool
+	// snapshotting is the single-flight slot for takeSnapshot, and
+	// snapshotPending records a request that arrived while the slot was held —
+	// which is served before the slot is released, never dropped. Both are
+	// atomic rather than guarded by mu because a capture drops mu across the
+	// state machine call, so the flags have to outlive the lock hold.
+	snapshotting    atomic.Bool
+	snapshotPending atomic.Bool
 
 	// peerHealth, when set, receives the outcome of every heartbeat RPC this
 	// node sends as leader. Guarded by mu. See SetPeerHealthObserver.
@@ -1129,20 +1132,50 @@ func (r *RaftNode) HandleInstallSnapshot(ctx context.Context, req *kvpb.InstallS
 	return &kvpb.InstallSnapshotResponse{Term: req.Term, Success: true}, nil
 }
 
-// takeSnapshot captures the state machine and compacts the log.
-// Runs in a goroutine; must not hold r.mu on entry.
+// takeSnapshot captures the state machine and compacts the log, one capture at a
+// time. Runs in a goroutine; must not hold r.mu on entry.
 //
-// Single-flight: the apply loop, an InstallSnapshot and a heartbeat response can
-// all reach the threshold check at once, and a second concurrent capture serialises
-// behind the first on SnapshotStore.mu only to have its result discarded by the
-// re-check below. Declining outright costs nothing — whatever it would have
-// captured, the run already in flight captures at least as much.
+// The apply loop, an InstallSnapshot and a heartbeat response can all reach the
+// threshold check at once, and concurrent captures serialise on SnapshotStore.mu
+// only for all but one to be discarded by captureSnapshot's re-check — each
+// having paid its own fsync. So a request that finds a capture running does not
+// run its own.
+//
+// It is not, however, dropped. A running capture fixed its cut point *before*
+// this request existed, so it compacts at most as far as this one would, and
+// discarding the request could leave the log over threshold with nothing left to
+// re-trigger it: on a leader applyCommitted runs only on a commit advance or a
+// Propose, never on an idle heartbeat, so if writes then stop the log stays
+// large indefinitely. The request is recorded instead, and whoever holds the
+// slot takes another pass before releasing it.
+//
+// The flag is set before the slot is contended for, which is what closes the
+// window between a holder's release and its re-check.
 func (r *RaftNode) takeSnapshot(ctx context.Context) {
-	if !r.snapshotting.CompareAndSwap(false, true) {
-		return
-	}
-	defer r.snapshotting.Store(false)
+	r.snapshotPending.Store(true)
+	for {
+		if !r.snapshotting.CompareAndSwap(false, true) {
+			return // a capture is running; it will see the pending flag
+		}
+		if !r.snapshotPending.Swap(false) {
+			r.snapshotting.Store(false)
+			return // another pass already covered this request
+		}
 
+		r.captureSnapshot(ctx)
+		r.snapshotting.Store(false)
+
+		if !r.snapshotPending.Load() {
+			return
+		}
+		// Someone asked while we were capturing, from a cut point newer than the
+		// one we just took. Go round again rather than leave it unserved.
+	}
+}
+
+// captureSnapshot takes one snapshot and compacts the log behind it. Callers go
+// through takeSnapshot, which serialises them.
+func (r *RaftNode) captureSnapshot(ctx context.Context) {
 	r.mu.Lock()
 	// The cut point is lastApplied, not lastLogIndex. The payload reflects only
 	// what the state machine has consumed, so claiming a higher index would hand

@@ -24,6 +24,13 @@ type testSM struct {
 	applyErr error
 	// snapshotErr, when non-nil, makes SnapshotState fail.
 	snapshotErr error
+
+	// snapshotGate, when non-nil, blocks SnapshotState until it is closed. It
+	// lets a test hold a capture open and ask what Raft does with a second
+	// request that arrives meanwhile.
+	snapshotGate chan struct{}
+	// snapshotCalls counts entries into SnapshotState, gate included.
+	snapshotCalls int
 }
 
 func newTestSM() *testSM { return &testSM{} }
@@ -51,6 +58,16 @@ func (s *testSM) record(entry LogEntry, replay bool) error {
 }
 
 func (s *testSM) SnapshotState(_ context.Context) ([]byte, error) {
+	// The gate is read and waited on outside the lock: a capture parked here
+	// must not block the applies a test makes while it is parked.
+	s.mu.Lock()
+	s.snapshotCalls++
+	gate := s.snapshotGate
+	s.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.snapshotErr != nil {
@@ -112,6 +129,13 @@ func (s *testSM) lastRestore() []byte {
 		return nil
 	}
 	return s.restores[len(s.restores)-1]
+}
+
+// snapshotCallCount reports how many times SnapshotState has been entered.
+func (s *testSM) snapshotCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshotCalls
 }
 
 func (s *testSM) setApplyErr(err error) {

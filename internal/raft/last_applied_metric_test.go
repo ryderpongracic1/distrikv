@@ -85,3 +85,75 @@ func TestRaft_LastAppliedIndexIsPublishedOnEveryAdvance(t *testing.T) {
 		"the gauge must follow a snapshot-driven jump too — the advance the state "+
 			"machine cannot see")
 }
+
+// TestRaft_SnapshotRequestDuringCaptureIsServedNotDropped pins the single-flight
+// slot's obligation.
+//
+// Declining a concurrent capture is the point of the slot — they serialise on
+// SnapshotStore.mu for all but one to be discarded, each having paid an fsync.
+// But the request behind it must not be lost with it: the running capture fixed
+// its cut point before the request existed, so it compacts less far, and nothing
+// re-triggers compaction on an idle leader. The log would sit over threshold for
+// good.
+//
+// Revert-check: make takeSnapshot `if !CAS { return }` with no pending flag, and
+// the call count drops to 1 and the boundary stops at 3.
+func TestRaft_SnapshotRequestDuringCaptureIsServedNotDropped(t *testing.T) {
+	ctx := context.Background()
+	sm := newTestSM()
+	sm.snapshotGate = make(chan struct{})
+
+	// Threshold left at its 1000 default so the apply path never triggers a
+	// capture of its own: this test drives the coordinator directly.
+	node := openNodeInDir(t, t.TempDir(), sm)
+	node.mu.Lock()
+	node.currentTerm = 2
+	node.mu.Unlock()
+
+	require.True(t, appendTo(t, node, &kvpb.AppendEntriesRequest{
+		Term: 2, LeaderId: "leader-1",
+		PrevLogIndex: 0, PrevLogTerm: 0,
+		Entries:      wireEntries(1, 2, 2, 2),
+		LeaderCommit: 3,
+	}).Success)
+
+	// A capture starts and parks inside SnapshotState, holding the slot.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		node.takeSnapshot(ctx)
+	}()
+	require.Eventually(t, func() bool { return sm.snapshotCallCount() == 1 },
+		2*time.Second, time.Millisecond, "the first capture never reached the state machine")
+
+	// Two more entries commit, so a capture starting now would cut at 5 rather
+	// than the 3 the parked one is holding.
+	require.True(t, appendTo(t, node, &kvpb.AppendEntriesRequest{
+		Term: 2, LeaderId: "leader-1",
+		PrevLogIndex: 3, PrevLogTerm: 2,
+		Entries:      wireEntries(4, 2, 2),
+		LeaderCommit: 5,
+	}).Success)
+
+	// This one finds the slot held. It must return without capturing — and
+	// without being forgotten.
+	node.takeSnapshot(ctx)
+	require.Equal(t, 1, sm.snapshotCallCount(),
+		"a request that finds the slot held must not start a second concurrent capture")
+
+	close(sm.snapshotGate)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the capture goroutine never returned")
+	}
+
+	require.Equal(t, 2, sm.snapshotCallCount(),
+		"the deferred request must be served before the slot is released")
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	require.Equal(t, uint64(5), node.snapLastIndex,
+		"the second pass must compact to the newer cut point; stopping at 3 means "+
+			"the request was dropped and the log stays over threshold")
+}

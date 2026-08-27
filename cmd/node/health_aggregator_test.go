@@ -45,16 +45,10 @@ func (f *fakeProposer) Propose(_ context.Context, op, key string, _ []byte) (uin
 	return uint64(len(f.proposed)), nil
 }
 
-func (f *fakeProposer) IsLeader() bool {
+func (f *fakeProposer) Leadership() (bool, uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.leader
-}
-
-func (f *fakeProposer) CurrentTerm() uint64 {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.term
+	return f.leader, f.term
 }
 
 func (f *fakeProposer) setLeader(leader bool, term uint64) {

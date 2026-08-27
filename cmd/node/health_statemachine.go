@@ -148,16 +148,11 @@ func (h *HealthStateMachine) ReplayApply(ctx context.Context, entry raft.LogEntr
 func (h *HealthStateMachine) apply(_ context.Context, entry raft.LogEntry, origin applyOrigin) error {
 	live := origin == originLive
 
-	// Recorded before every early return below, and for every op: this gauge
+	// metrics.RaftLastAppliedIndex is deliberately not published here. It
 	// describes how far through the log this node is, not what the health view
-	// says. It is the denominator HealthTransitionsCommitted has to be read
-	// against — see metrics.RaftLastAppliedIndex. A plain Store is correct because
-	// Raft's apply loop is serialised and hands entries over in index order, so
-	// the last write is the highest index.
-	if h.metrics != nil {
-		h.metrics.RaftLastAppliedIndex.Store(entry.Index)
-	}
-
+	// says, and lastApplied is Raft's own field: it also moves when a snapshot is
+	// restored or installed, which this state machine never sees. Raft reports it
+	// from every advance instead — see raft.setLastAppliedLocked.
 	var healthy bool
 	switch entry.Op {
 	case opHealthDown:

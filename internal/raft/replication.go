@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 
@@ -10,6 +11,11 @@ import (
 // This file holds the log machinery: durability, the §5.3 entry merge, the
 // §5.4.2 commit rule, the apply loop, and the proposal entry point. The RPC
 // handlers that drive it live in raft.go.
+//
+// Every entry value crossing into or out of the log is copied with bytes.Clone,
+// so that neither Raft's log nor a caller's buffer can be mutated through the
+// other. bytes.Clone(nil) is nil, which keeps an entry's absent value
+// distinguishable from an empty one on the wire.
 
 // --- Durability --------------------------------------------------------------
 
@@ -79,7 +85,7 @@ func (r *RaftNode) entriesFromLocked(from uint64) []*kvpb.LogEntry {
 			Term:  e.Term,
 			Op:    e.Op,
 			Key:   e.Key,
-			Value: cloneBytes(e.Value),
+			Value: bytes.Clone(e.Value),
 		})
 	}
 	return out
@@ -153,7 +159,7 @@ func (r *RaftNode) mergeEntriesLocked(prevLogIndex uint64, entries []*kvpb.LogEn
 			Term:  e.Term,
 			Op:    e.Op,
 			Key:   e.Key,
-			Value: cloneBytes(e.Value),
+			Value: bytes.Clone(e.Value),
 		})
 		changed = true
 	}
@@ -235,6 +241,14 @@ func (r *RaftNode) applyCommitted(ctx context.Context) {
 	r.applyMu.Lock()
 	defer r.applyMu.Unlock()
 
+	// The snapshot trigger is evaluated once, after the drain, rather than per
+	// entry. r.log does not shrink until takeSnapshot finishes, so a per-entry
+	// check reads "over threshold" on every iteration of a multi-entry drain and
+	// spawns a whole serialise-and-fsync for each one, all but the first of which
+	// takeSnapshot's own re-check discards. A restart makes that worst case the
+	// normal case: the persisted tail is replayed in a single drain.
+	defer r.maybeSnapshot(ctx)
+
 	for {
 		r.mu.Lock()
 		if r.lastApplied >= r.commitIndex {
@@ -245,7 +259,7 @@ func (r *RaftNode) applyCommitted(ctx context.Context) {
 		if next <= r.snapLastIndex {
 			// Compaction moved the frontier past us: everything up to the
 			// snapshot boundary is already reflected in the state machine.
-			r.lastApplied = r.snapLastIndex
+			r.setLastAppliedLocked(r.snapLastIndex)
 			r.mu.Unlock()
 			continue
 		}
@@ -280,7 +294,7 @@ func (r *RaftNode) applyCommitted(ctx context.Context) {
 
 		r.mu.Lock()
 		if r.lastApplied+1 == entry.Index {
-			r.lastApplied = entry.Index
+			r.setLastAppliedLocked(entry.Index)
 		} else {
 			// Unreachable while applyMu is doing its job: this loop is the only
 			// writer of lastApplied and it holds applyMu throughout. Logged
@@ -289,12 +303,21 @@ func (r *RaftNode) applyCommitted(ctx context.Context) {
 			r.logger.Error("raft: lastApplied moved under the apply loop",
 				"applied_index", entry.Index, "last_applied", r.lastApplied)
 		}
-		needSnapshot := len(r.log) >= r.snapshotThreshold
 		r.mu.Unlock()
+	}
+}
 
-		if needSnapshot {
-			go r.takeSnapshot(context.WithoutCancel(ctx))
-		}
+// maybeSnapshot starts a compaction if the log has grown past the threshold.
+//
+// Detached from the apply context deliberately: that deadline exists to abandon
+// a stale RPC, and letting it also abort compaction would make whether the log
+// is ever compacted depend on network timing.
+func (r *RaftNode) maybeSnapshot(ctx context.Context) {
+	r.mu.Lock()
+	need := len(r.log) >= r.snapshotThreshold
+	r.mu.Unlock()
+	if need {
+		go r.takeSnapshot(context.WithoutCancel(ctx))
 	}
 }
 
@@ -323,7 +346,7 @@ func (r *RaftNode) Propose(ctx context.Context, op, key string, value []byte) (u
 		Term:  r.currentTerm,
 		Op:    op,
 		Key:   key,
-		Value: cloneBytes(value),
+		Value: bytes.Clone(value),
 	}
 
 	// Copy-then-persist-then-install, so a failed write leaves no trace of an
@@ -346,18 +369,4 @@ func (r *RaftNode) Propose(ctx context.Context, op, key string, value []byte) (u
 	r.applyCommitted(ctx)
 
 	return entry.Index, nil
-}
-
-// --- Misc -------------------------------------------------------------------
-
-// cloneBytes copies b so that neither Raft's log nor a caller's buffer can be
-// mutated through the other. nil stays nil, which keeps a delete entry's absent
-// value distinguishable from an empty one on the wire.
-func cloneBytes(b []byte) []byte {
-	if b == nil {
-		return nil
-	}
-	out := make([]byte, len(b))
-	copy(out, b)
-	return out
 }

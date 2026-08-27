@@ -265,22 +265,3 @@ func (b *targetBreaker) releaseProbe() {
 	b.probing = false
 	b.mu.Unlock()
 }
-
-// answeredByTarget reports whether this kind means a server answered. Every 5xx
-// does; a request that never got a response does not.
-func (k failureKind) answeredByTarget() bool {
-	switch k {
-	case kindNone, kindRefusedApplied, kindForwardNeverSent, kindForwardUnknown, kindStatusOther:
-		return true
-	}
-	return false
-}
-
-// countsAgainstTarget reports whether this kind is evidence the target itself is
-// not serving. Both transport kinds are: a refused dial says so directly, and an
-// EOF from an accepting socket with nothing behind it says so too — that second
-// one is the shape a restarting container produces, and the reason the breaker
-// counts more than just refused dials.
-func (k failureKind) countsAgainstTarget() bool {
-	return k == kindDial || k == kindSent
-}

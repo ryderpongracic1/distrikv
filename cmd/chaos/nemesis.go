@@ -332,6 +332,14 @@ type composeNemesis struct {
 	// run executes one docker invocation and returns its combined output.
 	// Tests replace it; the real implementation is execDocker.
 	run func(ctx context.Context, args ...string) ([]byte, error)
+
+	// services caches the compose file's service list. The list is fixed for the
+	// life of a run — the compose file is not reread — and `compose config`
+	// parses and validates the whole file, so the second caller pays a fork and
+	// several hundred milliseconds of startup for an answer already in hand.
+	servicesOnce sync.Once
+	services     []string
+	servicesErr  error
 }
 
 // newComposeNemesis builds a nemesis for mode, which must be one of the
@@ -379,11 +387,10 @@ func (n *composeNemesis) Preflight(ctx context.Context, victims []string) error 
 	if _, err := n.compose(ctx, "ps"); err != nil {
 		return err
 	}
-	out, err := n.definedServices(ctx)
+	defined, err := n.definedServices(ctx)
 	if err != nil {
 		return err
 	}
-	defined := out
 	var unknown []string
 	for _, v := range victims {
 		if !slices.Contains(defined, v) {
@@ -397,15 +404,20 @@ func (n *composeNemesis) Preflight(ctx context.Context, victims []string) error 
 	return nil
 }
 
-// definedServices lists the services the compose file declares. Split out of
-// Preflight because leader-kill needs the same list to check that the node ID
-// the cluster reports as leader is a service this nemesis can address.
+// definedServices lists the services the compose file declares, fetching it at
+// most once. Split out of Preflight because leader-kill needs the same list to
+// check that the node ID the cluster reports as leader is a service this nemesis
+// can address.
 func (n *composeNemesis) definedServices(ctx context.Context) ([]string, error) {
-	out, err := n.compose(ctx, "config", "--services")
-	if err != nil {
-		return nil, err
-	}
-	return parseServiceList(string(out)), nil
+	n.servicesOnce.Do(func() {
+		out, err := n.compose(ctx, "config", "--services")
+		if err != nil {
+			n.servicesErr = err
+			return
+		}
+		n.services = parseServiceList(string(out))
+	})
+	return n.services, n.servicesErr
 }
 
 // compose runs `docker compose -f <file> <args...>`.
@@ -457,15 +469,15 @@ func (c nemesisConfig) Describe() string {
 	if !c.Enabled() {
 		return nemesisNone
 	}
+	// "among" rather than "on" for leader-kill: the victim is the current leader,
+	// and the service list is the fence the kill must stay inside, not the set the
+	// faults are spread over.
+	where := "on"
 	if c.Mode == nemesisLeaderKill {
-		// "among" rather than "on": the victim is the current leader, and the
-		// service list is the fence the kill must stay inside, not the set the
-		// faults are spread over.
-		return fmt.Sprintf("%s among [%s] interval=%s downtime=%s",
-			c.Mode, strings.Join(c.Services, ","), c.Interval, c.Downtime)
+		where = "among"
 	}
-	return fmt.Sprintf("%s on [%s] interval=%s downtime=%s",
-		c.Mode, strings.Join(c.Services, ","), c.Interval, c.Downtime)
+	return fmt.Sprintf("%s %s [%s] interval=%s downtime=%s",
+		c.Mode, where, strings.Join(c.Services, ","), c.Interval, c.Downtime)
 }
 
 // parseNemesisFlags validates the --nemesis* flags. Any error it returns is a
@@ -482,7 +494,10 @@ func parseNemesisFlags(mode, services, composeFile string, interval, downtime ti
 		}
 		return nemesisConfig{Mode: nemesisNone}, nil
 	}
-	if mode != nemesisKillRestart && mode != nemesisStopRestart && mode != nemesisLeaderKill {
+	// Validated against the same list the error message prints, so a mode added
+	// to nemesisModes cannot be accepted here and then rejected with a different
+	// message by newComposeNemesis.
+	if !slices.Contains(nemesisModes, mode) {
 		return nemesisConfig{}, fmt.Errorf("unknown --nemesis %q (want %s)",
 			mode, strings.Join(nemesisModes, ", "))
 	}

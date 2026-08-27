@@ -159,6 +159,31 @@ func (k failureKind) effect() writeEffect {
 	}
 }
 
+// answeredByTarget reports whether this kind means a server answered. Every 5xx
+// does; a request that never got a response does not.
+//
+// This and countsAgainstTarget below are the breaker's reading of the same phase
+// taxonomy effect() reads, and they live here with it rather than in breaker.go:
+// split across files, a kind added to the list above could be classified for the
+// checker and silently fall through both of these to "neither", leaving the
+// breaker blind to a transport failure it was written to catch.
+func (k failureKind) answeredByTarget() bool {
+	switch k {
+	case kindNone, kindRefusedApplied, kindForwardNeverSent, kindForwardUnknown, kindStatusOther:
+		return true
+	}
+	return false
+}
+
+// countsAgainstTarget reports whether this kind is evidence the target itself is
+// not serving. Both transport kinds are: a refused dial says so directly, and an
+// EOF from an accepting socket with nothing behind it says so too — that second
+// one is the shape a restarting container produces, and the reason the breaker
+// counts more than just refused dials.
+func (k failureKind) countsAgainstTarget() bool {
+	return k == kindDial || k == kindSent
+}
+
 // writeFailureKinds is every kind a failed write can carry, in report order.
 // kindNone is excluded: it is not a failure.
 var writeFailureKinds = []failureKind{

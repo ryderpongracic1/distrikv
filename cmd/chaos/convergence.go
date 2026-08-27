@@ -96,13 +96,15 @@ func checkConvergence(ctx context.Context, cfg convergenceConfig, keys []string,
 	ring := cluster.New()
 	addrByNode := make(map[string]string, len(cfg.Nodes))
 	for _, addr := range cfg.Nodes {
-		id, err := fetchNodeID(ctx, hc, addr)
+		// Only the node ID is wanted here; fetchNodeStatus is the single reader of
+		// /status, and it already rejects an empty one.
+		st, err := fetchNodeStatus(ctx, hc, addr)
 		if err != nil {
 			res.Unreachable = append(res.Unreachable, fmt.Sprintf("%s (%v)", addr, err))
 			continue
 		}
-		ring.AddNode(id, addr)
-		addrByNode[id] = addr
+		ring.AddNode(st.NodeID, addr)
+		addrByNode[st.NodeID] = addr
 	}
 	if len(res.Unreachable) > 0 {
 		// A node that cannot be asked cannot be shown to have converged. Saying
@@ -222,35 +224,6 @@ func compareReplicas(
 
 	sort.Strings(divergent)
 	return divergent, reads, examples, nil
-}
-
-// fetchNodeID reads a node's own ID from /status.
-func fetchNodeID(ctx context.Context, hc *http.Client, addr string) (string, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://"+addr+"/status", nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer drain(resp)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status %d", resp.StatusCode)
-	}
-	var body struct {
-		NodeID string `json:"node_id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return "", err
-	}
-	if body.NodeID == "" {
-		return "", fmt.Errorf("empty node_id")
-	}
-	return body.NodeID, nil
 }
 
 // localGet reads one key from one node's own store, without forwarding.

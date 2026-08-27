@@ -93,7 +93,7 @@ func newLeaderWithLog(t *testing.T, term uint64, leaderTerms []uint64, followerT
 // replicationRound runs exactly one replication round to one peer.
 func replicationRound(leader *RaftNode, peer PeerClient) {
 	leader.mu.Lock()
-	a, _ := leader.appendArgsForLocked(peer.NodeID)
+	a := leader.appendArgsForLocked(peer.NodeID)
 	leader.mu.Unlock()
 	leader.sendAppendEntries(context.Background(), peer, a)
 }

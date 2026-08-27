@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ryderpongracic1/distrikv/internal/cluster"
 	"github.com/ryderpongracic1/distrikv/internal/metrics"
 	"github.com/ryderpongracic1/distrikv/internal/raft"
 )
@@ -20,11 +21,13 @@ import (
 // to ship. At the docker-compose heartbeat interval of 150 ms these are ~450 ms
 // to declare a peer down and ~300 ms to declare it back.
 //
-// defaultHealthDownAfter matches cluster.DefaultStableChecks so the consensus
-// signal and the local one do not disagree about how much evidence a transition
-// needs.
+// defaultHealthDownAfter is cluster.DefaultStableChecks, so the consensus signal
+// and the local one cannot disagree about how much evidence a transition needs.
 const (
-	defaultHealthDownAfter = 3
+	// Tied to the local tracker's threshold by construction rather than by a
+	// comment: the two must agree about how much evidence a transition needs, or
+	// the consensus signal and the local one disagree about the same peer.
+	defaultHealthDownAfter = cluster.DefaultStableChecks
 	defaultHealthUpAfter   = 2
 )
 
@@ -35,8 +38,12 @@ type healthProposer interface {
 	// Propose appends an entry to the leader's log. Returns raft.ErrNotLeader on
 	// a non-leader.
 	Propose(ctx context.Context, op, key string, value []byte) (uint64, error)
-	IsLeader() bool
-	CurrentTerm() uint64
+
+	// Leadership reports leadership and the term together, in one read. The
+	// aggregator needs them as a pair — the counters belong to one leadership
+	// epoch — and taking them separately can straddle a step-down and produce an
+	// epoch that never existed.
+	Leadership() (leading bool, term uint64)
 }
 
 // committedHealthView is the aggregator's read of the state its own proposals
@@ -165,8 +172,7 @@ func (a *healthAggregator) ObserveHeartbeat(nodeID string, ok bool) {
 	// released the Raft lock by the time it calls an observer, so calling back in
 	// is safe; doing it outside a.mu keeps the two locks from ever being held
 	// together in either order.
-	leading := a.raft.IsLeader()
-	term := a.raft.CurrentTerm()
+	leading, term := a.raft.Leadership()
 
 	a.mu.Lock()
 	if !leading {

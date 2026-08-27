@@ -181,10 +181,14 @@ func TestHealthSMLiveTransitionAfterReplayStillAnnounces(t *testing.T) {
 }
 
 // TestHealthSMReplayStillCountsAppliedEntries pins what the gate does *not*
-// suppress. The counters describe how far through the log this node is, not what
+// suppress. The counter describes how far through the log this node is, not what
 // it announced, and a restart that replayed a hundred entries must say so — that
-// is the reading raft_last_applied_index exists to give, and the reason a silent
-// restart is explicable rather than mysterious.
+// is the reading it exists to give, and the reason a silent restart is
+// explicable rather than mysterious.
+//
+// Its denominator, raft_last_applied_index, is Raft's to publish and is pinned
+// there (TestRaft_LastAppliedIndexIsPublishedOnEveryAdvance): it also moves when
+// a snapshot is restored, which this state machine never sees.
 func TestHealthSMReplayStillCountsAppliedEntries(t *testing.T) {
 	ctx := context.Background()
 	sm, m, _ := replayGateSM(t, "node1")
@@ -201,10 +205,6 @@ func TestHealthSMReplayStillCountsAppliedEntries(t *testing.T) {
 	if got := m.HealthTransitionsCommitted.Load(); got != 2 {
 		t.Errorf("health_transitions_committed = %d, want 2: a replayed entry is "+
 			"still an applied entry", got)
-	}
-	if got := m.RaftLastAppliedIndex.Load(); got != 8 {
-		t.Errorf("raft_last_applied_index = %d, want 8: the gauge tracks the log "+
-			"position regardless of origin", got)
 	}
 }
 

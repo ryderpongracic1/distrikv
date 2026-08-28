@@ -241,13 +241,28 @@ func (r *RaftNode) applyCommitted(ctx context.Context) {
 	r.applyMu.Lock()
 	defer r.applyMu.Unlock()
 
-	// The snapshot trigger is evaluated once, after the drain, rather than per
-	// entry. r.log does not shrink until takeSnapshot finishes, so a per-entry
-	// check reads "over threshold" on every iteration of a multi-entry drain and
-	// spawns a whole serialise-and-fsync for each one, all but the first of which
-	// takeSnapshot's own re-check discards. A restart makes that worst case the
-	// normal case: the persisted tail is replayed in a single drain.
-	defer r.maybeSnapshot(ctx)
+	// The snapshot trigger fires once per drain that applied something, rather
+	// than once per entry.
+	//
+	// Per entry is wasteful: r.log does not shrink until takeSnapshot finishes,
+	// so the check reads "over threshold" on every iteration of a multi-entry
+	// drain and spawns a whole serialise-and-fsync for each one, all but the
+	// first of which is discarded. A restart makes that the normal case, since
+	// the persisted tail is replayed in a single drain.
+	//
+	// But unconditionally per drain is worse in a different direction. Every
+	// AppendEntries calls applyCommitted, heartbeats included, and a heartbeat
+	// applies nothing — so an idle follower sitting over the threshold with a
+	// snapshot store that keeps failing (ENOSPC, a read-only mount: snapLastIndex
+	// never advances, the log never shrinks) would attempt a fresh capture on
+	// every heartbeat, forever. Gating on applied keeps the batching and restores
+	// the old property that a drain which applied nothing triggers nothing.
+	applied := false
+	defer func() {
+		if applied {
+			r.maybeSnapshot(ctx)
+		}
+	}()
 
 	for {
 		r.mu.Lock()
@@ -291,6 +306,12 @@ func (r *RaftNode) applyCommitted(ctx context.Context) {
 				"replay", replay, "error", err)
 			return
 		}
+
+		// An entry reached the state machine, so the log has grown since the last
+		// compaction and a capture may now be worth taking. Deliberately not set
+		// by the snapLastIndex jump above: that advance means a snapshot has just
+		// happened, not that one is owed.
+		applied = true
 
 		r.mu.Lock()
 		if r.lastApplied+1 == entry.Index {

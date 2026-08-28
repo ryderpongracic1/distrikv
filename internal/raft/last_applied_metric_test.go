@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sync/atomic"
@@ -156,4 +157,68 @@ func TestRaft_SnapshotRequestDuringCaptureIsServedNotDropped(t *testing.T) {
 	require.Equal(t, uint64(5), node.snapLastIndex,
 		"the second pass must compact to the newer cut point; stopping at 3 means "+
 			"the request was dropped and the log stays over threshold")
+}
+
+// TestRaft_HeartbeatThatAppliesNothingDoesNotRetrySnapshots guards the trigger's
+// other direction.
+//
+// Moving the snapshot check out of the per-entry loop is right, but firing it
+// once per applyCommitted call regardless is not: every AppendEntries calls
+// applyCommitted, heartbeats included, and a heartbeat applies nothing. An idle
+// follower over the threshold whose snapshot store keeps failing — so
+// snapLastIndex never advances and the log never shrinks — would then attempt a
+// fresh serialise-and-fsync on every heartbeat, indefinitely.
+//
+// Revert-check: make the trigger `defer r.maybeSnapshot(ctx)` unconditionally
+// and the Never assertion trips as the heartbeats roll in.
+func TestRaft_HeartbeatThatAppliesNothingDoesNotRetrySnapshots(t *testing.T) {
+	sm := newTestSM()
+	// A snapshot store that cannot make progress: the log stays over threshold,
+	// so nothing self-corrects and a per-call trigger would spin forever.
+	sm.snapshotErr = errors.New("no space left on device")
+
+	node, err := New(Config{
+		NodeID:             "n1",
+		DataDir:            t.TempDir(),
+		ElectionTimeoutMin: 150 * time.Millisecond,
+		ElectionTimeoutMax: 300 * time.Millisecond,
+		HeartbeatInterval:  75 * time.Millisecond,
+		SnapshotThreshold:  1,
+	}, nil, sm, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err)
+
+	node.mu.Lock()
+	node.currentTerm = 2
+	node.mu.Unlock()
+
+	// A drain that applies entries does trigger a capture — which fails, leaving
+	// the log above the threshold.
+	require.True(t, appendTo(t, node, &kvpb.AppendEntriesRequest{
+		Term: 2, LeaderId: "leader-1",
+		PrevLogIndex: 0, PrevLogTerm: 0,
+		Entries:      wireEntries(1, 2, 2),
+		LeaderCommit: 2,
+	}).Success)
+	require.Eventually(t, func() bool { return sm.snapshotCallCount() >= 1 },
+		2*time.Second, time.Millisecond, "a drain that applied entries should attempt a capture")
+
+	node.mu.Lock()
+	overThreshold := len(node.log) >= node.snapshotThreshold && node.lastApplied > node.snapLastIndex
+	node.mu.Unlock()
+	require.True(t, overThreshold, "test premise: the log must still be over threshold and uncompacted")
+
+	settled := sm.snapshotCallCount()
+
+	// Now the heartbeats: same commit index, no entries, nothing to apply.
+	for range 20 {
+		require.True(t, appendTo(t, node, &kvpb.AppendEntriesRequest{
+			Term: 2, LeaderId: "leader-1",
+			PrevLogIndex: 2, PrevLogTerm: 2,
+			LeaderCommit: 2,
+		}).Success)
+	}
+
+	require.Never(t, func() bool { return sm.snapshotCallCount() > settled },
+		500*time.Millisecond, 10*time.Millisecond,
+		"a heartbeat applies nothing, so it must not re-attempt a capture that is already failing")
 }

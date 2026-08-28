@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 
 	"github.com/ryderpongracic1/distrikv/internal/metrics"
@@ -31,6 +32,7 @@ const footerSize = 16
 // ascending key order. Call Close to finalize and sync the file.
 type SSTableWriter struct {
 	f          *os.File
+	path       string // full path; Close fsyncs its directory
 	bw         *bufio.Writer
 	blockEnc   *blockEncoder
 	index      []IndexEntry
@@ -48,6 +50,7 @@ func NewSSTableWriter(path string, expectedKeys int) (*SSTableWriter, error) {
 	}
 	return &SSTableWriter{
 		f:          f,
+		path:       path,
 		bw:         bufio.NewWriterSize(f, 256*1024),
 		blockEnc:   newBlockEncoder(),
 		filter:     NewBloomFilter(expectedKeys),
@@ -85,7 +88,16 @@ func (w *SSTableWriter) flushBlock() error {
 	return nil
 }
 
-// Close flushes remaining data, writes the index/filter/footer, then syncs.
+// Close flushes remaining data, writes the index/filter/footer, then syncs both
+// the file and the directory holding it.
+//
+// The directory sync is not belt-and-braces. Creating the file is a directory
+// operation, so f.Sync alone leaves a fully-written SSTable that a crash can
+// erase by losing the entry naming it. Every caller records the file in the
+// manifest as soon as Close returns, and Manifest.writeAll now makes that
+// record durable — so without this the durable manifest could name an SSTable
+// that no longer exists, and NewLSMTree hard-errors on a live file it cannot
+// open. Close returning nil has to mean the file is findable, not just written.
 func (w *SSTableWriter) Close() error {
 	if err := w.flushBlock(); err != nil {
 		w.f.Close()
@@ -149,7 +161,13 @@ func (w *SSTableWriter) Close() error {
 		w.f.Close()
 		return fmt.Errorf("sstable: sync: %w", err)
 	}
-	return w.f.Close()
+	if err := w.f.Close(); err != nil {
+		return fmt.Errorf("sstable: close: %w", err)
+	}
+	if err := syncDir(filepath.Dir(w.path)); err != nil {
+		return fmt.Errorf("sstable: sync dir: %w", err)
+	}
+	return nil
 }
 
 func (w *SSTableWriter) writeBuf(data []byte) error {

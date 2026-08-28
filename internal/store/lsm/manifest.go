@@ -233,6 +233,33 @@ func (m *Manifest) Remove(baseName string) error {
 	return m.writeAll()
 }
 
+// RemoveAll marks several SSTables as deleted in a single atomic manifest
+// rewrite. An empty or nil baseNames is a no-op and writes nothing.
+//
+// It exists for compaction, which retires its whole input set at once. Remove
+// rewrites, fsyncs, renames and then fsyncs the directory per call — two fsyncs
+// each, for the 5 to 13 inputs a merge takes in this engine's configuration —
+// where the same set costs one rewrite and two fsyncs recorded together.
+//
+// Batching also tightens the crash story rather than loosening it. Removing one
+// file at a time lets a crash land between two of them, with the manifest half
+// updated against a data directory that is half unlinked. With one rewrite a
+// crash on either side of it is consistent: before, every input is still named
+// and still present; after, the unlinked files are simply unreferenced — the
+// same harmless leak the per-file loop already produces between a Remove and
+// its os.Remove.
+func (m *Manifest) RemoveAll(baseNames []string) error {
+	if len(baseNames) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, baseName := range baseNames {
+		m.events = append(m.events, ManifestEvent{Type: "remove", Path: baseName})
+	}
+	return m.writeAll()
+}
+
 // LiveFiles returns live SSTable events in ascending SSTSeq order (oldest first).
 func (m *Manifest) LiveFiles() []ManifestEvent {
 	m.mu.Lock()
@@ -324,10 +351,11 @@ func (m *Manifest) writeAll() error {
 	//     lost rename means the SSTable is invisible AND the WAL that held the
 	//     same writes is gone: silent, unrecoverable data loss for every key in
 	//     that memtable.
-	//   - Compact unlinks each input SSTable right after recording its Remove.
-	//     A lost rename leaves a manifest naming files that are no longer on
-	//     disk; OpenSSTableReader then fails and NewLSMTree returns an error,
-	//     so the node does not start at all.
+	//   - Compact unlinks its input SSTables right after recording their
+	//     removal, and only if that record was written. A lost rename leaves a
+	//     manifest naming files that are no longer on disk; OpenSSTableReader
+	//     then fails and NewLSMTree returns an error, so the node does not
+	//     start at all.
 	//
 	// So the stale view is not merely behind — it is inconsistent with the
 	// on-disk file set, because both callers delete real data on the strength

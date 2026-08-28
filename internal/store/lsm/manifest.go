@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 )
@@ -307,6 +308,32 @@ func (m *Manifest) writeAll() error {
 	}
 	if err := os.Rename(tmp, m.path); err != nil {
 		return fmt.Errorf("manifest: rename: %w", err)
+	}
+	// The rename is the commit point, and a rename is a directory operation:
+	// f.Sync above guarantees only the file's *contents*. Without this the new
+	// manifest can be durable under its temporary name while the directory
+	// entry naming it is still in the page cache, so a crash here loses the
+	// rename and OpenManifest reads the previous manifest.
+	//
+	// Nothing recovers that. OpenManifest is the only way the live SSTable set
+	// is reconstructed — there is no rebuild-by-scanning-the-data-directory
+	// path — and both callers destroy the redundant copy immediately after this
+	// function returns nil:
+	//
+	//   - flushMemtable removes the flushed WAL (lsm.go) once Add succeeds. A
+	//     lost rename means the SSTable is invisible AND the WAL that held the
+	//     same writes is gone: silent, unrecoverable data loss for every key in
+	//     that memtable.
+	//   - Compact unlinks each input SSTable right after recording its Remove.
+	//     A lost rename leaves a manifest naming files that are no longer on
+	//     disk; OpenSSTableReader then fails and NewLSMTree returns an error,
+	//     so the node does not start at all.
+	//
+	// So the stale view is not merely behind — it is inconsistent with the
+	// on-disk file set, because both callers delete real data on the strength
+	// of a manifest write that had not been made durable.
+	if err := syncDir(filepath.Dir(m.path)); err != nil {
+		return fmt.Errorf("manifest: sync dir: %w", err)
 	}
 	return nil
 }

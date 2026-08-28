@@ -46,8 +46,8 @@ func TestSyncDir_MakesARenameDurableWithoutBreakingWriteAll(t *testing.T) {
 		if err := m.Add("sst-00000002.sst", 2, 0, 20); err != nil {
 			t.Fatalf("Add: %v", err)
 		}
-		if err := m.Remove("sst-00000001.sst"); err != nil {
-			t.Fatalf("Remove: %v", err)
+		if err := m.RemoveAll([]string{"sst-00000001.sst"}); err != nil {
+			t.Fatalf("RemoveAll: %v", err)
 		}
 
 		reopened, err := OpenManifest(path)

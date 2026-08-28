@@ -120,9 +120,12 @@ type healthNode struct {
 }
 
 type raftHarness struct {
-	t     *testing.T
-	nodes map[string]*healthNode
-	ids   []string
+	t      *testing.T
+	nodes  map[string]*healthNode
+	ids    []string
+	cancel context.CancelFunc
+	done   chan struct{}
+	stop   sync.Once
 
 	mu   sync.Mutex
 	down map[string]bool
@@ -233,12 +236,25 @@ func newRaftHarness(t *testing.T, hysteresis healthAggregatorConfig) *raftHarnes
 		go func() { defer wg.Done(); n.raft.Run(ctx) }()
 		go func() { defer wg.Done(); n.agg.Run(ctx) }()
 	}
-	t.Cleanup(func() {
-		cancel()
+	h.cancel = cancel
+	h.done = make(chan struct{})
+	go func() {
 		wg.Wait()
-	})
+		close(h.done)
+	}()
+	t.Cleanup(h.shutdown)
 
 	return h
+}
+
+// shutdown synchronously stops a harness. It is safe to call before the
+// registered cleanup, which is essential for tests that retry with a fresh
+// cluster: an abandoned cluster must not keep campaigning in the background.
+func (h *raftHarness) shutdown() {
+	h.stop.Do(func() {
+		h.cancel()
+		<-h.done
+	})
 }
 
 // leader blocks until exactly one node claims leadership and every node agrees on
@@ -268,18 +284,26 @@ func (h *raftHarness) leader(timeout time.Duration) (leader *healthNode, followe
 	return nil, nil
 }
 
-// awaitHealth waits for a node's committed view of peerID to reach want.
-func awaitHealth(t *testing.T, n *healthNode, peerID string, want bool, timeout time.Duration) {
-	t.Helper()
+// waitHealth waits for a node's committed view of peerID to reach want without
+// failing the test. Callers with a retryable harness premise can inspect the
+// error; ordinary assertions use awaitHealth below.
+func waitHealth(n *healthNode, peerID string, want bool, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if n.sm.Healthy(peerID) == want {
-			return
+			return nil
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("%s still reports Healthy(%s)=%v after %s, want %v",
+	return fmt.Errorf("%s still reports Healthy(%s)=%v after %s, want %v",
 		n.id, peerID, n.sm.Healthy(peerID), timeout, want)
+}
+
+func awaitHealth(t *testing.T, n *healthNode, peerID string, want bool, timeout time.Duration) {
+	t.Helper()
+	if err := waitHealth(n, peerID, want, timeout); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // ---------------------------------------------------------------------------

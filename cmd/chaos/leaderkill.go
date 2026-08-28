@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -154,12 +156,34 @@ func (r *leaderResolver) resolveOnce(ctx context.Context) (string, leaderEvidenc
 	}
 	var selfClaims []claim
 	named := make(map[string]struct{})
-	reachable, unreachable := 0, 0
+	reachable := 0
 
-	for _, addr := range r.addrs {
-		st, err := r.fetch(ctx, addr)
-		if err != nil {
-			unreachable++
+	// Asked concurrently, so a round costs the slowest node rather than the sum.
+	// A leader-kill run's steady state includes a node that is down or still
+	// restarting, and each of those burns the full per-node timeout: sequentially
+	// one such node consumes the whole retryFor budget, so the retry loop
+	// degenerates to a single attempt and a fault window is skipped that a
+	// concurrent round would have resolved.
+	statuses := make([]nodeStatus, len(r.addrs))
+	ok := make([]bool, len(r.addrs))
+	var wg sync.WaitGroup
+	for i, addr := range r.addrs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			st, err := r.fetch(ctx, addr)
+			if err != nil {
+				return
+			}
+			statuses[i], ok[i] = st, true
+		}()
+	}
+	wg.Wait()
+
+	// Folded in address order, so the outcome does not depend on which node
+	// answered first.
+	for i, st := range statuses {
+		if !ok[i] {
 			continue
 		}
 		reachable++
@@ -193,7 +217,8 @@ func (r *leaderResolver) resolveOnce(ctx context.Context) (string, leaderEvidenc
 	if len(named) == 0 {
 		return "", "", fmt.Sprintf("%d node(s) answered and none named a leader — election in progress", reachable)
 	}
-	return "", "", fmt.Sprintf("reachable nodes disagree on the leader (%s)", strings.Join(sortedKeys(named), ", "))
+	return "", "", fmt.Sprintf("reachable nodes disagree on the leader (%s)",
+		strings.Join(slices.Sorted(maps.Keys(named)), ", "))
 }
 
 // fetchNodeStatus reads one node's /status.
@@ -268,14 +293,4 @@ func preflightLeaderKill(ctx context.Context, r *leaderResolver, definedServices
 			"match the node IDs /status reports", leader, strings.Join(definedServices, ", "))
 	}
 	return nil
-}
-
-// sortedKeys is a deterministic rendering of a set, for messages.
-func sortedKeys(m map[string]struct{}) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }

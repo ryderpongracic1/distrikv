@@ -494,3 +494,10 @@ type metricsAdapter struct{ m *metrics.Metrics }
 
 func (a *metricsAdapter) IncRaftTerms()       { a.m.RaftTerms.Add(1) }
 func (a *metricsAdapter) IncLeaderElections() { a.m.LeaderElections.Add(1) }
+
+// SetLastAppliedIndex records how far through the Raft log the state machine has
+// been fed. A plain Store is correct because Raft's apply loop is serialised and
+// advances lastApplied monotonically, so the last write is the highest index.
+func (a *metricsAdapter) SetLastAppliedIndex(index uint64) {
+	a.m.RaftLastAppliedIndex.Store(index)
+}

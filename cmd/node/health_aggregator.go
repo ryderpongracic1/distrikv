@@ -20,9 +20,16 @@ import (
 // to ship. At the docker-compose heartbeat interval of 150 ms these are ~450 ms
 // to declare a peer down and ~300 ms to declare it back.
 //
-// defaultHealthDownAfter matches cluster.DefaultStableChecks so the consensus
-// signal and the local one do not disagree about how much evidence a transition
-// needs.
+// These are the aggregator's own thresholds, deliberately independent of
+// cluster.PeerHealth's. The two trackers gate different transitions and cannot
+// be reconciled by sharing a constant: PeerHealth demotes a peer on the *first*
+// failed observation and spends its DefaultStableChecks budget on the recovery,
+// while the aggregator spends its evidence on the demotion — because a local
+// demotion only stops this node scheduling a catch-up pass, whereas a committed
+// "down" gates every ring-primary in the cluster. Binding either of these to
+// DefaultStableChecks would tie a down-threshold to an up-knob, so that damping
+// recovery flapping there would silently change how much evidence the leader
+// needs to declare a peer dead here.
 const (
 	defaultHealthDownAfter = 3
 	defaultHealthUpAfter   = 2
@@ -35,8 +42,12 @@ type healthProposer interface {
 	// Propose appends an entry to the leader's log. Returns raft.ErrNotLeader on
 	// a non-leader.
 	Propose(ctx context.Context, op, key string, value []byte) (uint64, error)
-	IsLeader() bool
-	CurrentTerm() uint64
+
+	// Leadership reports leadership and the term together, in one read. The
+	// aggregator needs them as a pair — the counters belong to one leadership
+	// epoch — and taking them separately can straddle a step-down and produce an
+	// epoch that never existed.
+	Leadership() (leading bool, term uint64)
 }
 
 // committedHealthView is the aggregator's read of the state its own proposals
@@ -165,8 +176,7 @@ func (a *healthAggregator) ObserveHeartbeat(nodeID string, ok bool) {
 	// released the Raft lock by the time it calls an observer, so calling back in
 	// is safe; doing it outside a.mu keeps the two locks from ever being held
 	// together in either order.
-	leading := a.raft.IsLeader()
-	term := a.raft.CurrentTerm()
+	leading, term := a.raft.Leadership()
 
 	a.mu.Lock()
 	if !leading {

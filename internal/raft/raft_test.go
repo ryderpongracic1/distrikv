@@ -47,8 +47,9 @@ func newTestNodeWithSM(t *testing.T) (*RaftNode, *testSM) {
 // noopMetrics satisfies metricsInterface without recording anything.
 type noopMetrics struct{}
 
-func (n *noopMetrics) IncRaftTerms()       {}
-func (n *noopMetrics) IncLeaderElections() {}
+func (n *noopMetrics) IncRaftTerms()                {}
+func (n *noopMetrics) IncLeaderElections()          {}
+func (n *noopMetrics) SetLastAppliedIndex(_ uint64) {}
 
 // stubKVClient is a minimal kvpb.KVServiceClient for injecting vote responses.
 type stubKVClient struct {

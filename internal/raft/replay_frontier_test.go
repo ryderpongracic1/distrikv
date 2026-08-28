@@ -35,7 +35,7 @@ func TestReplayFrontier_PersistedEntriesReplayLiveEntriesDoNot(t *testing.T) {
 
 	// --- First incarnation: three entries arrive committed and are applied live.
 	first := newTestSM()
-	node := newNodeInDir(t, dir, first)
+	node := openNodeInDir(t, dir, first)
 	node.mu.Lock()
 	node.currentTerm = 2
 	node.mu.Unlock()
@@ -124,7 +124,7 @@ func TestReplayFrontier_SnapshotBoundaryLeavesNoReplayWindow(t *testing.T) {
 	dir := t.TempDir()
 
 	first := newTestSM()
-	node := newNodeInDir(t, dir, first)
+	node := openNodeInDir(t, dir, first)
 	node.mu.Lock()
 	node.currentTerm = 3
 	node.mu.Unlock()

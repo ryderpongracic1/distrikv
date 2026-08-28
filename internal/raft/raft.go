@@ -36,12 +36,14 @@
 package raft
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	kvpb "github.com/ryderpongracic1/distrikv/proto/kvpb"
@@ -213,6 +215,14 @@ type RaftNode struct {
 	// is why mu must never be acquired before it.
 	applyMu sync.Mutex
 
+	// snapshotting is the single-flight slot for takeSnapshot, and
+	// snapshotPending records a request that arrived while the slot was held —
+	// which is served before the slot is released, never dropped. Both are
+	// atomic rather than guarded by mu because a capture drops mu across the
+	// state machine call, so the flags have to outlive the lock hold.
+	snapshotting    atomic.Bool
+	snapshotPending atomic.Bool
+
 	// peerHealth, when set, receives the outcome of every heartbeat RPC this
 	// node sends as leader. Guarded by mu. See SetPeerHealthObserver.
 	peerHealth PeerHealthObserver
@@ -228,10 +238,16 @@ type RaftNode struct {
 	leaderStop   chan struct{}
 }
 
-// metricsInterface is the subset of metrics.Metrics that RaftNode increments.
+// metricsInterface is the subset of metrics.Metrics that RaftNode maintains.
 type metricsInterface interface {
 	IncRaftTerms()
 	IncLeaderElections()
+
+	// SetLastAppliedIndex publishes how far through the log the state machine
+	// has been fed. Raft reports it rather than the state machine because
+	// lastApplied is Raft's own field: it also moves when a snapshot is
+	// restored or installed, which the state machine cannot see.
+	SetLastAppliedIndex(index uint64)
 }
 
 // New creates a RaftNode and loads any persisted state from disk.
@@ -319,7 +335,7 @@ func New(cfg Config, peers []PeerClient, sm StateMachine, m metricsInterface, lo
 	// state machine once the leader tells us they are committed, which is why
 	// Apply must be idempotent.
 	r.commitIndex = r.snapLastIndex
-	r.lastApplied = r.snapLastIndex
+	r.setLastAppliedLocked(r.snapLastIndex)
 
 	// Everything the log holds right now predates this process, so applying any
 	// of it is a replay rather than an observation. Entries appended from here on
@@ -596,6 +612,13 @@ type appendArgs struct {
 	// handler only adjusts nextIndex if it still holds that value, so two RPCs
 	// in flight to the same peer cannot decrement it twice for one mismatch.
 	nextIndexSent uint64
+
+	// needSnapshot says the entry this peer asks for next has been compacted
+	// away, so an InstallSnapshot must go out alongside this AppendEntries. It
+	// lives here because it is decided from nextIndex under the same lock hold
+	// as the rest of the payload, and must not be re-derived once the lock is
+	// dropped.
+	needSnapshot bool
 }
 
 // broadcastHeartbeat sends an AppendEntries to every peer — carrying whatever
@@ -617,28 +640,27 @@ func (r *RaftNode) broadcastHeartbeat(ctx context.Context) {
 		return
 	}
 	peers := r.peers
-	args := make(map[string]appendArgs, len(peers))
-	needSnapshot := make(map[string]bool, len(peers))
-
-	for _, p := range peers {
-		a, need := r.appendArgsForLocked(p.NodeID)
-		args[p.NodeID] = a
-		needSnapshot[p.NodeID] = need
+	// Indexed positionally against peers rather than keyed by node ID: the whole
+	// payload for one peer is one appendArgs, and pairing it with its peer by
+	// slice position is structural, where a map key is an invariant a reader has
+	// to check.
+	args := make([]appendArgs, len(peers))
+	for i, p := range peers {
+		args[i] = r.appendArgsForLocked(p.NodeID)
 	}
 	r.mu.Unlock()
 
-	for _, peer := range peers {
-		peer := peer
-		a := args[peer.NodeID]
+	for i, peer := range peers {
+		a := args[i]
 		go r.sendAppendEntries(ctx, peer, a)
-		if needSnapshot[peer.NodeID] {
+		if a.needSnapshot {
 			go r.sendInstallSnapshot(ctx, peer, a.term)
 		}
 	}
 }
 
-// appendArgsForLocked builds the AppendEntries payload owed to one peer, and
-// reports whether that peer also needs a snapshot.
+// appendArgsForLocked builds the AppendEntries payload owed to one peer,
+// including whether that peer also needs a snapshot.
 //
 // A peer needs a snapshot only when the entry it asks for next has already been
 // compacted away. nextIndex == snapLastIndex+1 is the fully-caught-up case:
@@ -646,16 +668,17 @@ func (r *RaftNode) broadcastHeartbeat(ctx context.Context) {
 // snapLastTerm, so a plain AppendEntries carries everything the peer needs.
 //
 // Caller must hold r.mu.
-func (r *RaftNode) appendArgsForLocked(peerID string) (a appendArgs, needSnapshot bool) {
+func (r *RaftNode) appendArgsForLocked(peerID string) appendArgs {
 	next := r.nextIndex[peerID]
 	if next < 1 {
 		next = 1 // log indices start at 1; guard against an unseeded peer
 	}
 
-	a = appendArgs{
+	a := appendArgs{
 		term:          r.currentTerm,
 		leaderCommit:  r.commitIndex,
 		nextIndexSent: next,
+		needSnapshot:  next <= r.snapLastIndex,
 	}
 
 	if prevTerm, ok := r.termAtLocked(next - 1); ok {
@@ -672,7 +695,7 @@ func (r *RaftNode) appendArgsForLocked(peerID string) (a appendArgs, needSnapsho
 		a.prevLogTerm = r.snapLastTerm
 	}
 
-	return a, next <= r.snapLastIndex
+	return a
 }
 
 // sendAppendEntries sends one AppendEntries to one peer and folds the reply into
@@ -1065,7 +1088,7 @@ func (r *RaftNode) HandleInstallSnapshot(ctx context.Context, req *kvpb.InstallS
 	snap := Snapshot{
 		LastIncludedIndex: req.LastIncludedIndex,
 		LastIncludedTerm:  req.LastIncludedTerm,
-		Data:              cloneBytes(req.Data),
+		Data:              bytes.Clone(req.Data),
 	}
 	if err := r.snapshotStore.Save(snap); err != nil {
 		r.logger.Error("InstallSnapshot: save snapshot", "err", err)
@@ -1094,7 +1117,7 @@ func (r *RaftNode) HandleInstallSnapshot(ctx context.Context, req *kvpb.InstallS
 		r.commitIndex = r.snapLastIndex
 	}
 	if r.lastApplied < r.snapLastIndex {
-		r.lastApplied = r.snapLastIndex
+		r.setLastAppliedLocked(r.snapLastIndex)
 	}
 	if err := r.persistLocked(r.log); err != nil {
 		r.logger.Error("InstallSnapshot: persist state", "err", err)
@@ -1109,9 +1132,50 @@ func (r *RaftNode) HandleInstallSnapshot(ctx context.Context, req *kvpb.InstallS
 	return &kvpb.InstallSnapshotResponse{Term: req.Term, Success: true}, nil
 }
 
-// takeSnapshot captures the state machine and compacts the log.
-// Runs in a goroutine; must not hold r.mu on entry.
+// takeSnapshot captures the state machine and compacts the log, one capture at a
+// time. Runs in a goroutine; must not hold r.mu on entry.
+//
+// The apply loop, an InstallSnapshot and a heartbeat response can all reach the
+// threshold check at once, and concurrent captures serialise on SnapshotStore.mu
+// only for all but one to be discarded by captureSnapshot's re-check — each
+// having paid its own fsync. So a request that finds a capture running does not
+// run its own.
+//
+// It is not, however, dropped. A running capture fixed its cut point *before*
+// this request existed, so it compacts at most as far as this one would, and
+// discarding the request could leave the log over threshold with nothing left to
+// re-trigger it: on a leader applyCommitted runs only on a commit advance or a
+// Propose, never on an idle heartbeat, so if writes then stop the log stays
+// large indefinitely. The request is recorded instead, and whoever holds the
+// slot takes another pass before releasing it.
+//
+// The flag is set before the slot is contended for, which is what closes the
+// window between a holder's release and its re-check.
 func (r *RaftNode) takeSnapshot(ctx context.Context) {
+	r.snapshotPending.Store(true)
+	for {
+		if !r.snapshotting.CompareAndSwap(false, true) {
+			return // a capture is running; it will see the pending flag
+		}
+		if !r.snapshotPending.Swap(false) {
+			r.snapshotting.Store(false)
+			return // another pass already covered this request
+		}
+
+		r.captureSnapshot(ctx)
+		r.snapshotting.Store(false)
+
+		if !r.snapshotPending.Load() {
+			return
+		}
+		// Someone asked while we were capturing, from a cut point newer than the
+		// one we just took. Go round again rather than leave it unserved.
+	}
+}
+
+// captureSnapshot takes one snapshot and compacts the log behind it. Callers go
+// through takeSnapshot, which serialises them.
+func (r *RaftNode) captureSnapshot(ctx context.Context) {
 	r.mu.Lock()
 	// The cut point is lastApplied, not lastLogIndex. The payload reflects only
 	// what the state machine has consumed, so claiming a higher index would hand
@@ -1192,10 +1256,20 @@ func (r *RaftNode) lastLogTerm() uint64 {
 	return r.log[len(r.log)-1].Term
 }
 
-// lastLogIndexAndTermLocked returns (lastIndex, lastTerm). Caller must hold r.mu.
-// Kept for backward compatibility with existing callers.
-func (r *RaftNode) lastLogIndexAndTermLocked() (index, term uint64) {
-	return r.lastLogIndex(), r.lastLogTerm()
+// setLastAppliedLocked moves lastApplied and publishes it as a metric.
+//
+// The two go together everywhere, which is why they go together here: the gauge
+// is meant to be the denominator the committed-transition counter is read
+// against (see metrics.RaftLastAppliedIndex), and that only holds if every
+// advance is reported — including the ones that skip the log entirely, when a
+// snapshot moves the frontier straight to its boundary.
+//
+// Caller must hold r.mu, or hold no reference to the node yet (as in New).
+func (r *RaftNode) setLastAppliedLocked(index uint64) {
+	r.lastApplied = index
+	if r.metrics != nil {
+		r.metrics.SetLastAppliedIndex(index)
+	}
 }
 
 func (r *RaftNode) randomElectionTimeout() time.Duration {
@@ -1217,6 +1291,21 @@ func (r *RaftNode) CurrentTerm() uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.currentTerm
+}
+
+// Leadership reports whether this node is the leader and the term it holds that
+// belief in, read under one lock hold.
+//
+// The pair is what a caller acting on leadership actually needs, and reading it
+// as one is not merely cheaper than IsLeader() followed by CurrentTerm(): those
+// two can straddle a step-down and report a leadership that never existed in
+// that term. It is called once per heartbeat outcome per peer, on the heartbeat
+// goroutine, so halving the acquisitions of a mutex the leader path is already
+// contending for is worth an accessor of its own.
+func (r *RaftNode) Leadership() (leading bool, term uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.role == Leader, r.currentTerm
 }
 
 // CommitIndex is the highest log index known to be committed. A proposer can

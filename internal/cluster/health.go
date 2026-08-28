@@ -61,14 +61,14 @@ type peerState struct {
 	consecOK   int
 	lastChange time.Time
 
-	// sawReplication and lastReplicationOK record this node's most recent
-	// replication RPC outcome for the peer, which is *positive local evidence*
-	// about reachability rather than the absence of bad news. `healthy` cannot
-	// serve that purpose: a peer starts healthy and an untracked node reports
-	// healthy, so "healthy" also means "no opinion". LastReplicationSucceeded
-	// distinguishes the two, which is what lets the anti-entropy engine veto a
-	// committed "down" only when this node has actually reached the peer.
-	sawReplication    bool
+	// lastReplicationOK records this node's most recent replication RPC outcome
+	// for the peer, which is *positive local evidence* about reachability rather
+	// than the absence of bad news. `healthy` cannot serve that purpose: a peer
+	// starts healthy and an untracked node reports healthy, so "healthy" also
+	// means "no opinion". This field distinguishes the two, which is what lets
+	// the anti-entropy engine veto a committed "down" only when this node has
+	// actually reached the peer — and it starts false, so a peer no replication
+	// has been attempted to carries no evidence at all.
 	lastReplicationOK bool
 }
 
@@ -162,7 +162,7 @@ func (ph *PeerHealth) LastReplicationSucceeded(nodeID string) bool {
 	if !ok {
 		return false
 	}
-	return st.sawReplication && st.lastReplicationOK
+	return st.lastReplicationOK
 }
 
 func (ph *PeerHealth) observe(nodeID string, ok, fromReplication bool) {
@@ -173,7 +173,6 @@ func (ph *PeerHealth) observe(nodeID string, ok, fromReplication bool) {
 		return
 	}
 	if fromReplication {
-		st.sawReplication = true
 		st.lastReplicationOK = ok
 	}
 

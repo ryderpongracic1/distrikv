@@ -20,7 +20,10 @@ import (
 // dropped entirely and a fresh node is opened over the same data directory, so
 // anything the tests then see came off the disk.
 
-// openNodeInDir opens a node over an existing data directory — the restart path.
+// openNodeInDir opens a node over a data directory the caller owns. It is both
+// the first-open and the restart path — the same call either way, which is the
+// point: a restart in these tests is nothing but calling this again on the same
+// directory.
 func openNodeInDir(t *testing.T, dir string, sm StateMachine) *RaftNode {
 	t.Helper()
 	cfg := Config{
@@ -33,13 +36,6 @@ func openNodeInDir(t *testing.T, dir string, sm StateMachine) *RaftNode {
 	node, err := New(cfg, nil, sm, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.NoError(t, err)
 	return node
-}
-
-// newNodeInDir opens a fresh node in a directory the caller owns, so the same
-// directory can be reopened later.
-func newNodeInDir(t *testing.T, dir string, sm StateMachine) *RaftNode {
-	t.Helper()
-	return openNodeInDir(t, dir, sm)
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +51,7 @@ func newNodeInDir(t *testing.T, dir string, sm StateMachine) *RaftNode {
 // leader that never heard the answer.
 func TestPersistence_AcknowledgedEntrySurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
-	node := newNodeInDir(t, dir, newTestSM())
+	node := openNodeInDir(t, dir, newTestSM())
 
 	node.mu.Lock()
 	node.currentTerm = 4
@@ -92,7 +88,7 @@ func TestPersistence_AcknowledgedEntrySurvivesRestart(t *testing.T) {
 // history the leader has already overwritten.
 func TestPersistence_TruncationSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
-	node := newNodeInDir(t, dir, newTestSM())
+	node := openNodeInDir(t, dir, newTestSM())
 
 	node.mu.Lock()
 	node.currentTerm = 5
@@ -123,7 +119,7 @@ func TestPersistence_TruncationSurvivesRestart(t *testing.T) {
 // leader's own copy toward the majority that commits it.
 func TestPersistence_ProposedEntrySurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
-	leader := newNodeInDir(t, dir, newTestSM())
+	leader := openNodeInDir(t, dir, newTestSM())
 
 	leader.mu.Lock()
 	leader.role = Leader
@@ -152,7 +148,7 @@ func TestPersistence_ProposedEntrySurvivesRestart(t *testing.T) {
 // merely documented.
 func TestPersistence_CommitFrontierStartsAtSnapshotBoundary(t *testing.T) {
 	dir := t.TempDir()
-	node := newNodeInDir(t, dir, newTestSM())
+	node := openNodeInDir(t, dir, newTestSM())
 
 	node.mu.Lock()
 	node.currentTerm = 2
@@ -434,4 +430,43 @@ func TestTakeSnapshot_NoopWhenNothingApplied(t *testing.T) {
 	_, ok, err := node.snapshotStore.Load()
 	require.NoError(t, err)
 	require.False(t, ok, "no snapshot should have been written")
+}
+
+// ---------------------------------------------------------------------------
+// Rename durability
+// ---------------------------------------------------------------------------
+
+// TestSyncDir_MakesARenameDurableWithoutBreakingSave guards the directory fsync
+// that both Save paths depend on.
+//
+// The crash it defends against — the file durable under its temporary name while
+// the directory entry naming it is still in the page cache, so Load reads the
+// previous state after Save returned nil — cannot be produced in a unit test.
+// What can, and is the real regression risk, is the opposite failure: fsync on a
+// directory handle is not portable, and a platform that rejects it would turn
+// *every* Save into an error and wedge the node completely. So this pins that
+// syncDir succeeds on a real directory, and still reports a failure as one.
+func TestSyncDir_MakesARenameDurableWithoutBreakingSave(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(t, syncDir(dir), "fsync on a directory handle must work on this platform")
+	require.Error(t, syncDir(filepath.Join(dir, "no-such-dir")),
+		"a directory that cannot be synced must be reported, not swallowed")
+
+	// And the state path still round-trips, with the save counted only on the
+	// fully durable path.
+	ps := newPersistentState(filepath.Join(dir, "raft-state"))
+	require.NoError(t, ps.Save(persistedState{
+		CurrentTerm: 7,
+		VotedFor:    "n2",
+		Log:         []LogEntry{{Index: 1, Term: 7, Op: "health-down", Key: "n3"}},
+	}))
+	require.Equal(t, uint64(1), ps.saveCount())
+
+	got, err := ps.Load()
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), got.CurrentTerm)
+	require.Equal(t, "n2", got.VotedFor)
+	require.Len(t, got.Log, 1)
+	require.Equal(t, "n3", got.Log[0].Key)
 }

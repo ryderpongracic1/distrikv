@@ -431,3 +431,42 @@ func TestTakeSnapshot_NoopWhenNothingApplied(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ok, "no snapshot should have been written")
 }
+
+// ---------------------------------------------------------------------------
+// Rename durability
+// ---------------------------------------------------------------------------
+
+// TestSyncDir_MakesARenameDurableWithoutBreakingSave guards the directory fsync
+// that both Save paths depend on.
+//
+// The crash it defends against — the file durable under its temporary name while
+// the directory entry naming it is still in the page cache, so Load reads the
+// previous state after Save returned nil — cannot be produced in a unit test.
+// What can, and is the real regression risk, is the opposite failure: fsync on a
+// directory handle is not portable, and a platform that rejects it would turn
+// *every* Save into an error and wedge the node completely. So this pins that
+// syncDir succeeds on a real directory, and still reports a failure as one.
+func TestSyncDir_MakesARenameDurableWithoutBreakingSave(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(t, syncDir(dir), "fsync on a directory handle must work on this platform")
+	require.Error(t, syncDir(filepath.Join(dir, "no-such-dir")),
+		"a directory that cannot be synced must be reported, not swallowed")
+
+	// And the state path still round-trips, with the save counted only on the
+	// fully durable path.
+	ps := newPersistentState(filepath.Join(dir, "raft-state"))
+	require.NoError(t, ps.Save(persistedState{
+		CurrentTerm: 7,
+		VotedFor:    "n2",
+		Log:         []LogEntry{{Index: 1, Term: 7, Op: "health-down", Key: "n3"}},
+	}))
+	require.Equal(t, uint64(1), ps.saveCount())
+
+	got, err := ps.Load()
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), got.CurrentTerm)
+	require.Equal(t, "n2", got.VotedFor)
+	require.Len(t, got.Log, 1)
+	require.Equal(t, "n3", got.Log[0].Key)
+}

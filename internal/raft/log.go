@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 )
@@ -105,7 +106,35 @@ func (p *PersistentState) Save(st persistedState) error {
 	if err := os.Rename(tmp, p.path); err != nil {
 		return fmt.Errorf("raft: persist rename: %w", err)
 	}
+	// The rename is the commit point, and it is a directory operation: syncing
+	// the file only guarantees its *contents*. Without this the entry can be on
+	// disk under the temporary name while the directory entry pointing at it is
+	// still in the page cache, so a crash here loses the rename and Load reads
+	// the previous state — after Save returned nil and a follower ACKed on the
+	// strength of it. That is the promise in this method's doc comment, and Raft
+	// safety rests on it.
+	if err := syncDir(filepath.Dir(p.path)); err != nil {
+		return fmt.Errorf("raft: persist sync dir: %w", err)
+	}
 	p.saves.Add(1)
+	return nil
+}
+
+// syncDir fsyncs a directory, making a rename within it durable.
+//
+// Raft cannot borrow store.writeFileAtomic, which does the same thing one
+// package over: this package is deliberately free of any dependency on the data
+// path (see the package doc, deviation 1), and that is worth more than the
+// duplicated dozen lines.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open %q: %w", dir, err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("sync %q: %w", dir, err)
+	}
 	return nil
 }
 

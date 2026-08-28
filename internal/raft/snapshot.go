@@ -44,8 +44,14 @@ func NewSnapshotStore(dir string, logger *slog.Logger) *SnapshotStore {
 	}
 }
 
-// Save gob-encodes snap to disk atomically. On crash between write and rename
-// the old snapshot file is preserved.
+// Save gob-encodes snap to disk atomically, returning only once the snapshot is
+// durable. On crash between write and rename the old snapshot file is preserved.
+//
+// The ordering both callers rely on is that this returns before the bounds are
+// recorded in the state file, so a crash in between leaves a snapshot ahead of
+// the recorded snapLastIndex rather than bounds pointing at a payload that was
+// never written — the direction New() knows how to resolve. That only holds if
+// "durable" includes the rename, hence the directory sync.
 func (ss *SnapshotStore) Save(snap Snapshot) error {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
@@ -69,6 +75,9 @@ func (ss *SnapshotStore) Save(snap Snapshot) error {
 	}
 	if err := os.Rename(tmp, ss.path); err != nil {
 		return fmt.Errorf("snapshot: rename: %w", err)
+	}
+	if err := syncDir(filepath.Dir(ss.path)); err != nil {
+		return fmt.Errorf("snapshot: sync dir: %w", err)
 	}
 	return nil
 }

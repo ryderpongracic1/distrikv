@@ -220,6 +220,19 @@ func (c *Compactor) Compact(ctx context.Context, readers []*SSTableReader) (*SST
 	}
 
 	// Remove old SSTables from the manifest and unlink their files from disk.
+	// One RemoveAll records the whole input set in a single manifest rewrite
+	// instead of paying a rewrite and two fsyncs per input file.
+	//
+	// The unlink is conditional on that write succeeding, and must stay that
+	// way. Unlinking a file the manifest still names is unrecoverable at
+	// startup: OpenManifest is the only thing that reconstructs the live file
+	// set — there is no rebuild-by-scanning-the-data-directory path — so
+	// OpenSSTableReader fails on the missing file and NewLSMTree returns an
+	// error, and the node does not start at all. Leaving the inputs on disk
+	// when the manifest cannot be written is the safe direction: the manifest
+	// still names them, so they are still readable and the store still opens.
+	// It costs their disk space until a later compaction retires them, which is
+	// strictly better than a store that will not start.
 	//
 	// We do NOT close the SSTableReader file descriptors here.  Closing them
 	// inside Compact() would race with concurrent Get calls that snapshotted
@@ -230,13 +243,18 @@ func (c *Compactor) Compact(ctx context.Context, readers []*SSTableReader) (*SST
 	// r.Release() on the old readers after swapping them out of l0/l1, and
 	// any concurrent Gets that acquired a reference before the swap will close
 	// the fd when they call their deferred Release().
-	for _, r := range readers {
-		baseName := filepath.Base(r.path)
-		if err := c.manifest.Remove(baseName); err != nil {
-			c.logger.Error("compaction: manifest remove failed", "file", baseName, "err", err)
-		}
-		if err := os.Remove(r.path); err != nil && !os.IsNotExist(err) {
-			c.logger.Warn("compaction: remove old SSTable", "path", r.path, "err", err)
+	baseNames := make([]string, len(readers))
+	for i, r := range readers {
+		baseNames[i] = filepath.Base(r.path)
+	}
+	if err := c.manifest.RemoveAll(baseNames); err != nil {
+		c.logger.Error("compaction: manifest remove failed; leaving input SSTables on disk",
+			"files", baseNames, "err", err)
+	} else {
+		for _, r := range readers {
+			if err := os.Remove(r.path); err != nil && !os.IsNotExist(err) {
+				c.logger.Warn("compaction: remove old SSTable", "path", r.path, "err", err)
+			}
 		}
 	}
 

@@ -1,6 +1,7 @@
 package lsm
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -225,29 +226,21 @@ func (m *Manifest) LastLiveKeys() (int64, bool) {
 	return 0, false
 }
 
-// Remove marks an SSTable as deleted and rewrites the manifest atomically.
-func (m *Manifest) Remove(baseName string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.events = append(m.events, ManifestEvent{Type: "remove", Path: baseName})
-	return m.writeAll()
-}
-
-// RemoveAll marks several SSTables as deleted in a single atomic manifest
-// rewrite. An empty or nil baseNames is a no-op and writes nothing.
+// RemoveAll marks SSTables as deleted in a single atomic manifest rewrite. An
+// empty or nil baseNames is a no-op and writes nothing.
 //
-// It exists for compaction, which retires its whole input set at once. Remove
-// rewrites, fsyncs, renames and then fsyncs the directory per call — two fsyncs
-// each, for the 5 to 13 inputs a merge takes in this engine's configuration —
-// where the same set costs one rewrite and two fsyncs recorded together.
+// It is the only removal API: compaction, its one caller, retires its whole
+// input set at once, and the whole set costs one rewrite and two fsyncs
+// recorded together. Retiring files one at a time would pay a rewrite, a
+// rename and two fsyncs each, for the 5 to 13 inputs a merge takes in this
+// engine's configuration.
 //
 // Batching also tightens the crash story rather than loosening it. Removing one
 // file at a time lets a crash land between two of them, with the manifest half
 // updated against a data directory that is half unlinked. With one rewrite a
 // crash on either side of it is consistent: before, every input is still named
-// and still present; after, the unlinked files are simply unreferenced — the
-// same harmless leak the per-file loop already produces between a Remove and
-// its os.Remove.
+// and still present; after, the unlinked files are simply unreferenced — a
+// harmless leak, since nothing reads a file the manifest does not name.
 func (m *Manifest) RemoveAll(baseNames []string) error {
 	if len(baseNames) == 0 {
 		return nil
@@ -318,12 +311,21 @@ func (m *Manifest) writeAll() error {
 		return fmt.Errorf("manifest: create tmp: %w", err)
 	}
 
-	enc := json.NewEncoder(f)
+	// Buffered because json.Encoder.Encode issues one write(2) per value, and
+	// the manifest is rewritten in full on every flush and every compaction —
+	// unbuffered, that is one syscall per event per rewrite. Same buffer size
+	// as the SSTable writer (sstable.go), which writes far less often.
+	bw := bufio.NewWriterSize(f, 256*1024)
+	enc := json.NewEncoder(bw)
 	for _, ev := range m.events {
 		if err := enc.Encode(ev); err != nil {
 			f.Close()
 			return fmt.Errorf("manifest: encode event: %w", err)
 		}
+	}
+	if err := bw.Flush(); err != nil {
+		f.Close()
+		return fmt.Errorf("manifest: flush: %w", err)
 	}
 
 	if err := f.Sync(); err != nil {

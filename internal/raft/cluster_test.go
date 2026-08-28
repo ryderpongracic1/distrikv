@@ -393,6 +393,15 @@ func (c *testCluster) appliedCounts() map[string]int {
 // of proposals underneath it — a healthy cluster must hold one term while
 // replicating.
 //
+// Proposals are backpressured on commitment. Propose only waits for local
+// durability, so issuing another proposal every 10 ms regardless of replication
+// progress creates an unbounded log-replication queue. Under -race that offered
+// load can itself monopolise the Raft lock and disk, manufacturing the heartbeat
+// starvation this test is meant to detect. Keeping at most one uncommitted entry
+// still exercises the live entry-bearing heartbeat path continuously. It also
+// makes genuine starvation fail more directly: without heartbeats the pending
+// entry never commits, throughput collapses, and followers start elections.
+//
 // Scheduler-noise policy: on a contended runner (CI shares 2 vCPUs across the
 // whole -race suite, with other packages' tests running in parallel), a
 // descheduled heartbeat goroutine can blow a 150–300 ms election timer without
@@ -420,19 +429,34 @@ func TestCluster_TermStableWhileEntriesFlow(t *testing.T) {
 			time.Sleep(500 * time.Millisecond) // let the initial election settle
 
 			before = maxTerm(c.nodes...)
+			proposed = 0
 
-			// Propose steadily for three seconds — faster than the heartbeat
-			// interval, so most ticks carry entries. A tick that finds no
-			// leader is skipped: the term assertion below is what judges
-			// leadership churn.
-			stop := time.After(3 * time.Second)
+			// Offer work twice per heartbeat interval, but do not offer the next
+			// entry until the previous one commits. This keeps entries flowing
+			// without allowing replication RPCs to accumulate behind an
+			// ever-growing log. A tick that finds no leader is skipped: the term
+			// assertion below is what judges leadership churn.
+			stop := time.NewTimer(3 * time.Second)
+			defer stop.Stop()
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
 			for done := false; !done; {
 				select {
-				case <-stop:
+				case <-stop.C:
 					done = true
-				case <-time.After(10 * time.Millisecond):
+				case <-ticker.C:
 					leader, ok := c.currentLeader()
 					if !ok {
+						continue
+					}
+					// Derive backpressure from the current leader's log rather
+					// than retaining an index returned by a previous leader. An
+					// index alone does not identify the same entry after a term
+					// change: the new leader may have truncated or replaced that
+					// suffix. The live log/commit gap remains meaningful across
+					// leadership changes and permits at most one outstanding
+					// proposal from this loop.
+					if leader.LastLogIndex() > leader.CommitIndex() {
 						continue
 					}
 					if _, err := leader.Propose(context.Background(), "health-up", fmt.Sprintf("k%d", proposed), nil); err == nil {
@@ -451,7 +475,11 @@ func TestCluster_TermStableWhileEntriesFlow(t *testing.T) {
 
 			// The scheduler-sensitive gate held; the remaining assertions are
 			// judged at full strength on this attempt.
-			require.Greater(t, proposed, 50, "the test must actually have replicated something")
+			// Backpressure deliberately limits the offered load to one
+			// uncommitted entry. Twenty commits in three seconds still proves
+			// sustained entry-bearing heartbeats while leaving enough headroom
+			// for the full -race suite running packages in parallel.
+			require.Greater(t, proposed, 20, "the test must sustain replicated entries")
 
 			// The followers must have kept up rather than merely stayed quiet.
 			require.Eventually(t, func() bool {

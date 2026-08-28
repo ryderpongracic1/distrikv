@@ -14,14 +14,11 @@ import (
 // Regression: a compaction whose manifest update fails must not unlink its
 // input SSTables.
 //
-// The manifest is the only thing that reconstructs the live file set at
-// startup — there is no rebuild-by-scanning-the-data-directory path — so a
-// manifest naming an SSTable that is not on disk is fatal, not degraded:
-// OpenSSTableReader fails, NewLSMTree returns an error, and the node does not
-// start. Before the fix, Compact logged the failed manifest removal and then
-// unlinked the file anyway, producing exactly that state. Leaving the inputs on
-// disk instead costs their space until a later compaction retires them, and the
-// store still opens.
+// A manifest naming an SSTable that is not on disk is fatal rather than
+// degraded — Manifest.writeAll sets out why. Before the fix, Compact logged the
+// failed manifest removal and then unlinked the file anyway, producing exactly
+// that state. Leaving the inputs on disk instead costs their space until the
+// node restarts, and the store still opens.
 //
 // To revert-check: in Compact, unlink the input files unconditionally rather
 // than only when RemoveAll succeeded. Both tests below must then fail.
@@ -43,36 +40,8 @@ func TestCompact_FailedManifestRemoveKeepsInputFiles(t *testing.T) {
 		t.Fatalf("OpenManifest: %v", err)
 	}
 
-	// Three input SSTables of tombstones only, each recorded in the manifest as
-	// a compaction would find them.
 	const inputs = 3
-	readers := make([]*SSTableReader, inputs)
-	paths := make([]string, inputs)
-	for i := 0; i < inputs; i++ {
-		name := fmt.Sprintf("sst-%08d.sst", i+1)
-		paths[i] = filepath.Join(dir, name)
-
-		w, err := NewSSTableWriter(paths[i], 4)
-		if err != nil {
-			t.Fatalf("NewSSTableWriter %s: %v", name, err)
-		}
-		seq := uint64(i + 1)
-		if err := w.Write(Entry{Key: fmt.Sprintf("k-%d", i), Tombstone: true, SeqNum: seq}); err != nil {
-			t.Fatalf("Write %s: %v", name, err)
-		}
-		if err := w.Close(); err != nil {
-			t.Fatalf("SSTableWriter.Close %s: %v", name, err)
-		}
-		if err := manifest.Add(name, seq, 0, seq); err != nil {
-			t.Fatalf("manifest.Add %s: %v", name, err)
-		}
-		r, err := OpenSSTableReader(paths[i], seq)
-		if err != nil {
-			t.Fatalf("OpenSSTableReader %s: %v", name, err)
-		}
-		defer r.Close()
-		readers[i] = r
-	}
+	readers := seedInputs(t, dir, manifest, inputs, tombstonesOnly)
 
 	// Wedge every subsequent manifest write: writeAll starts by creating
 	// <path>.tmp, and os.Create on an existing directory fails.
@@ -91,10 +60,10 @@ func TestCompact_FailedManifestRemoveKeepsInputFiles(t *testing.T) {
 	}
 
 	// The point of the test: the manifest write failed, so nothing may be gone.
-	for i, p := range paths {
-		if _, err := os.Stat(p); err != nil {
+	for i, r := range readers {
+		if _, err := os.Stat(r.path); err != nil {
 			t.Errorf("input %d (%s) was unlinked after a failed manifest remove: %v; "+
-				"the manifest still names it, so the store will not open", i, filepath.Base(p), err)
+				"the manifest still names it, so the store will not open", i, filepath.Base(r.path), err)
 		}
 	}
 
@@ -130,33 +99,7 @@ func TestCompact_SuccessfulManifestRemoveUnlinksInputs(t *testing.T) {
 	}
 
 	const inputs = 3
-	readers := make([]*SSTableReader, inputs)
-	paths := make([]string, inputs)
-	for i := 0; i < inputs; i++ {
-		name := fmt.Sprintf("sst-%08d.sst", i+1)
-		paths[i] = filepath.Join(dir, name)
-
-		w, err := NewSSTableWriter(paths[i], 4)
-		if err != nil {
-			t.Fatalf("NewSSTableWriter %s: %v", name, err)
-		}
-		seq := uint64(i + 1)
-		if err := w.Write(Entry{Key: fmt.Sprintf("k-%d", i), Value: []byte("v"), SeqNum: seq}); err != nil {
-			t.Fatalf("Write %s: %v", name, err)
-		}
-		if err := w.Close(); err != nil {
-			t.Fatalf("SSTableWriter.Close %s: %v", name, err)
-		}
-		if err := manifest.Add(name, seq, 0, seq); err != nil {
-			t.Fatalf("manifest.Add %s: %v", name, err)
-		}
-		r, err := OpenSSTableReader(paths[i], seq)
-		if err != nil {
-			t.Fatalf("OpenSSTableReader %s: %v", name, err)
-		}
-		defer r.Close()
-		readers[i] = r
-	}
+	readers := seedInputs(t, dir, manifest, inputs, liveKeys)
 
 	c := NewCompactor(dir, manifest, discardLogger(), inputs, func() uint64 { return 99 })
 	out, err := c.Compact(context.Background(), readers)
@@ -168,10 +111,10 @@ func TestCompact_SuccessfulManifestRemoveUnlinksInputs(t *testing.T) {
 	}
 	defer out.Close()
 
-	for i, p := range paths {
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
+	for i, r := range readers {
+		if _, err := os.Stat(r.path); !os.IsNotExist(err) {
 			t.Errorf("input %d (%s) still on disk after a successful compaction: stat err = %v",
-				i, filepath.Base(p), err)
+				i, filepath.Base(r.path), err)
 		}
 	}
 
@@ -180,7 +123,8 @@ func TestCompact_SuccessfulManifestRemoveUnlinksInputs(t *testing.T) {
 		t.Fatalf("live files after compaction = %+v, want only the merged output", live)
 	}
 
-	// Every merged key must be readable from the output.
+	// The inputs were unlinked, so the output must carry what they held —
+	// otherwise this test would pass on a compaction that deleted live data.
 	for i := 0; i < inputs; i++ {
 		if e, found, err := out.Get(fmt.Sprintf("k-%d", i)); err != nil || !found || string(e.Value) != "v" {
 			t.Errorf("output.Get(k-%d) = (%+v, %v, %v), want the merged entry", i, e, found, err)
@@ -244,6 +188,60 @@ func TestManifestRemoveAll_BatchesAndSkipsEmpty(t *testing.T) {
 		t.Fatal("RemoveAll with a name returned nil while the manifest was unwritable, want an error")
 	}
 }
+
+// seedInputs writes n single-entry SSTables into dir, records each one in m as
+// a compaction would find them, and returns open readers over them.
+//
+// tombstonesOnly selects inputs that merge to an empty output, which is what
+// lets a test reach the removal step at all: a non-empty merge writes an output
+// SSTable and fails at its manifest Add first, returning before any input is
+// retired.
+func seedInputs(t *testing.T, dir string, m *Manifest, n int, tombstones bool) []*SSTableReader {
+	t.Helper()
+
+	readers := make([]*SSTableReader, n)
+	for i := range n {
+		name := fmt.Sprintf("sst-%08d.sst", i+1)
+		path := filepath.Join(dir, name)
+		seq := uint64(i + 1)
+
+		w, err := NewSSTableWriter(path, 4)
+		if err != nil {
+			t.Fatalf("NewSSTableWriter %s: %v", name, err)
+		}
+		e := Entry{Key: fmt.Sprintf("k-%d", i), SeqNum: seq}
+		if tombstones {
+			e.Tombstone = true
+		} else {
+			e.Value = []byte("v")
+		}
+		if err := w.Write(e); err != nil {
+			t.Fatalf("Write %s: %v", name, err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("SSTableWriter.Close %s: %v", name, err)
+		}
+		if err := m.Add(name, seq, 0, seq); err != nil {
+			t.Fatalf("manifest.Add %s: %v", name, err)
+		}
+
+		r, err := OpenSSTableReader(path, seq)
+		if err != nil {
+			t.Fatalf("OpenSSTableReader %s: %v", name, err)
+		}
+		// t.Cleanup, not defer: the reader must outlive this helper.
+		t.Cleanup(func() { r.Close() })
+		readers[i] = r
+	}
+	return readers
+}
+
+// Named arguments for seedInputs' tombstones parameter, so the call sites say
+// which kind of input they are building rather than passing a bare bool.
+const (
+	tombstonesOnly = true
+	liveKeys       = false
+)
 
 // discardLogger returns a logger that writes nowhere, for tests that exercise
 // error paths Compact deliberately only logs.

@@ -224,14 +224,18 @@ func (c *Compactor) Compact(ctx context.Context, readers []*SSTableReader) (*SST
 	// instead of paying a rewrite and two fsyncs per input file.
 	//
 	// The unlink is conditional on that write succeeding, and must stay that
-	// way. Unlinking a file the manifest still names is unrecoverable at
-	// startup: OpenManifest is the only thing that reconstructs the live file
-	// set — there is no rebuild-by-scanning-the-data-directory path — so
-	// OpenSSTableReader fails on the missing file and NewLSMTree returns an
-	// error, and the node does not start at all. Leaving the inputs on disk
-	// when the manifest cannot be written is the safe direction: the manifest
-	// still names them, so they are still readable and the store still opens.
-	// It costs their disk space until a later compaction retires them, which is
+	// way: unlinking a file the manifest still names is unrecoverable at
+	// startup, for the reasons Manifest.writeAll sets out. Leaving the inputs
+	// on disk when the manifest cannot be written is the safe direction — the
+	// manifest still names them, so they stay readable and the store still
+	// opens.
+	//
+	// Nothing reclaims them in this process, though. installCompactionResult
+	// drops the input readers from l0 and replaces l1 outright, and compaction
+	// draws its inputs only from those, so a later merge can never pick the
+	// leaked files up again. They are re-adopted at the next open, which
+	// rebuilds the level state from the manifest that still names them. So the
+	// cost of this branch is their disk space until the node restarts — still
 	// strictly better than a store that will not start.
 	//
 	// We do NOT close the SSTableReader file descriptors here.  Closing them

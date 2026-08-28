@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -148,13 +149,47 @@ func settleAppliesQuiet(t *testing.T, h *raftHarness, quiet, timeout time.Durati
 // oneFaultCycle isolates a node until the leader's committed view marks it down,
 // then heals it until the view marks it up again — the in-process equivalent of
 // one stop-restart nemesis fault window.
-func oneFaultCycle(t *testing.T, h *raftHarness, leader *healthNode, victimID string) {
-	t.Helper()
-
+func oneFaultCycle(h *raftHarness, leader *healthNode, victimID string) error {
 	h.isolate(victimID)
-	awaitHealth(t, leader, victimID, false, 3*time.Second)
+	// Always restore the link when a transition times out. This keeps failure
+	// cleanup deterministic.
+	defer h.heal(victimID)
+	if err := waitHealth(leader, victimID, false, 3*time.Second); err != nil {
+		return err
+	}
 	h.heal(victimID)
-	awaitHealth(t, leader, victimID, true, 3*time.Second)
+	return waitHealth(leader, victimID, true, 3*time.Second)
+}
+
+func oneStableLeaderFaultCycle(h *raftHarness, leader *healthNode, leaderTerm uint64, victimID string) error {
+	h.isolate(victimID)
+	defer h.heal(victimID)
+	if err := waitHealthFromLeader(leader, leaderTerm, victimID, false, 3*time.Second); err != nil {
+		return err
+	}
+	h.heal(victimID)
+	return waitHealthFromLeader(leader, leaderTerm, victimID, true, 3*time.Second)
+}
+
+// waitHealthFromLeader makes stable leadership an explicit harness premise.
+// Checking it during the wait avoids turning a legitimate mid-cycle election
+// into a misleading health timeout (or accepting a node that later regained
+// leadership as though leadership had never moved).
+func waitHealthFromLeader(leader *healthNode, leaderTerm uint64, peerID string, want bool, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		leading, term := leader.raft.Leadership()
+		if !leading || term != leaderTerm {
+			return fmt.Errorf("%s lost stable leadership in term %d while waiting for Healthy(%s)=%v (leading=%v, term=%d)",
+				leader.id, leaderTerm, peerID, want, leading, term)
+		}
+		if leader.sm.Healthy(peerID) == want {
+			return nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return fmt.Errorf("%s still reports Healthy(%s)=%v after %s, want %v",
+		leader.id, peerID, leader.sm.Healthy(peerID), timeout, want)
 }
 
 // reconcileFaults is the number of fault cycles the reconciliation test drives.
@@ -190,19 +225,32 @@ func TestHealthTransitionCountersReconcileWithTheLog(t *testing.T) {
 		h = newRaftHarness(t, healthAggregatorConfig{DownAfter: 3, UpAfter: 2})
 		var followers []*healthNode
 		leader, followers = h.leader(5 * time.Second)
+		leaderTerm := leader.raft.CurrentTerm()
 
 		victim = followers[0]
 		bystander = followers[1]
 
+		var premiseErr error
 		for i := 0; i < reconcileFaults; i++ {
-			oneFaultCycle(t, h, leader, victim.id)
+			if err := oneStableLeaderFaultCycle(h, leader, leaderTerm, victim.id); err != nil {
+				premiseErr = fmt.Errorf("fault cycle %d: %w", i+1, err)
+				break
+			}
+		}
+		if premiseErr != nil {
+			h.shutdown()
+			if attempt == attempts {
+				t.Fatalf("stable-leader premise failed in all %d attempts: %v", attempts, premiseErr)
+			}
+			t.Logf("attempt %d: %v; retrying with a fresh harness", attempt, premiseErr)
+			continue
 		}
 		settleAppliesQuiet(t, h, 250*time.Millisecond, 10*time.Second)
 
 		// Leadership must not have moved, or "the leader proposed every entry"
 		// is not the invariant under test. This is the premise the live-cluster
 		// arithmetic assumed and could not check.
-		if h.nodes[leader.id].raft.IsLeader() {
+		if leading, term := h.nodes[leader.id].raft.Leadership(); leading && term == leaderTerm {
 			break
 		}
 		if attempt == attempts {
@@ -210,6 +258,7 @@ func TestHealthTransitionCountersReconcileWithTheLog(t *testing.T) {
 				"unstable for this invariant or elections are genuinely storming", leader.id, attempts)
 		}
 		t.Logf("attempt %d: %s lost leadership mid-run (catch-up election after heal); retrying with a fresh harness", attempt, leader.id)
+		h.shutdown()
 	}
 	const faults = reconcileFaults
 
@@ -304,7 +353,9 @@ func TestHealthEntriesApplyExactlyOncePerNode(t *testing.T) {
 	// Enough cycles that a heartbeat response, an AppendEntries and a Propose are
 	// all in flight against overlapping commit advances.
 	for i := 0; i < 4; i++ {
-		oneFaultCycle(t, h, leader, followers[i%len(followers)].id)
+		if err := oneFaultCycle(h, leader, followers[i%len(followers)].id); err != nil {
+			t.Fatalf("fault cycle %d: %v", i+1, err)
+		}
 	}
 	settleAppliesQuiet(t, h, 250*time.Millisecond, 15*time.Second)
 
@@ -344,58 +395,95 @@ func TestHealthEntriesApplyExactlyOncePerNode(t *testing.T) {
 // internal/raft and the term-counter assertion fails; drop the self-ID guard in
 // HealthStateMachine.Apply and the committed accounting assertion fails.
 func TestCommittedCountsEntriesThisNodeDidNotPropose(t *testing.T) {
-	h := newRaftHarness(t, healthAggregatorConfig{DownAfter: 2, UpAfter: 2})
-	first, _ := h.leader(5 * time.Second)
+	const attempts = 5
+	var (
+		h                      *raftHarness
+		first, second          *healthNode
+		firstTerm, termsBefore uint64
+		electionsBefore        uint64
+	)
+	for attempt := 1; ; attempt++ {
+		h = newRaftHarness(t, healthAggregatorConfig{DownAfter: 2, UpAfter: 2})
+		first, _ = h.leader(5 * time.Second)
 
-	firstTerm := first.raft.CurrentTerm()
-	termsBefore := first.metrics.RaftTerms.Load()
-	electionsBefore := first.metrics.LeaderElections.Load()
+		firstTerm = first.raft.CurrentTerm()
+		termsBefore = first.metrics.RaftTerms.Load()
+		electionsBefore = first.metrics.LeaderElections.Load()
 
-	// A transition under the first leader, so it has authored entries of its own.
-	victim := ""
-	for _, id := range h.ids {
-		if id != first.id {
-			victim = id
-			break
-		}
-	}
-	oneFaultCycle(t, h, first, victim)
-	settleAppliesQuiet(t, h, 200*time.Millisecond, 10*time.Second)
-	if first.metrics.HealthTransitionsProposed.Load() == 0 {
-		t.Fatal("first leader proposed nothing; nothing to attribute")
-	}
-
-	// Move leadership by isolating the leader, then heal it so it rejoins as a
-	// follower and resumes applying what the new leader commits.
-	h.isolate(first.id)
-	var second *healthNode
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) && second == nil {
+		// A transition under the first leader, so it has authored entries of its own.
+		victim := ""
 		for _, id := range h.ids {
-			if id != first.id && h.nodes[id].raft.IsLeader() {
-				second = h.nodes[id]
+			if id != first.id {
+				victim = id
+				break
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if second == nil {
-		t.Fatal("no new leader elected after isolating the first one")
-	}
-	h.heal(first.id)
+		premiseErr := oneStableLeaderFaultCycle(h, first, firstTerm, victim)
+		if premiseErr == nil {
+			settleAppliesQuiet(t, h, 200*time.Millisecond, 10*time.Second)
+			if first.metrics.HealthTransitionsProposed.Load() == 0 {
+				premiseErr = fmt.Errorf("first leader proposed nothing")
+			}
+		}
 
-	// A transition authored by the new leader, in its own higher term.
-	third := ""
-	for _, id := range h.ids {
-		if id != first.id && id != second.id {
-			third = id
+		// Move leadership by isolating the leader, then heal it so it rejoins as a
+		// follower and resumes applying what the new leader commits.
+		if premiseErr == nil {
+			h.isolate(first.id)
+			deadline := time.Now().Add(8 * time.Second)
+			for time.Now().Before(deadline) && second == nil {
+				for _, id := range h.ids {
+					if id != first.id && h.nodes[id].raft.IsLeader() {
+						second = h.nodes[id]
+					}
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if second == nil {
+				premiseErr = fmt.Errorf("no new leader elected after isolating %s", first.id)
+			}
+			h.heal(first.id)
+		}
+
+		// A transition authored by the new leader, in its own higher term. Stable
+		// leadership here is a premise because otherwise entry authorship is
+		// ambiguous rather than a failure of the counter invariant.
+		if premiseErr == nil {
+			third := ""
+			for _, id := range h.ids {
+				if id != first.id && id != second.id {
+					third = id
+					break
+				}
+			}
+			secondTerm := second.raft.CurrentTerm()
+			premiseErr = oneStableLeaderFaultCycle(h, second, secondTerm, third)
+			if premiseErr == nil {
+				settleAppliesQuiet(t, h, 200*time.Millisecond, 10*time.Second)
+			}
+		}
+
+		// LeaderElections is durable evidence that the original node transiently
+		// won again even if it is a follower by the final IsLeader check. That
+		// invalidates attribution for this attempt. RaftTerms drift alone is not
+		// retried: the unchanged metric assertion below must catch that regression.
+		if premiseErr == nil && first.metrics.LeaderElections.Load() != electionsBefore {
+			premiseErr = fmt.Errorf("%s transiently regained leadership (leader_elections %d → %d)",
+				first.id, electionsBefore, first.metrics.LeaderElections.Load())
+		}
+		if premiseErr == nil && first.raft.IsLeader() {
+			premiseErr = fmt.Errorf("%s regained leadership", first.id)
+		}
+		if premiseErr == nil {
 			break
 		}
-	}
-	oneFaultCycle(t, h, second, third)
-	settleAppliesQuiet(t, h, 200*time.Millisecond, 10*time.Second)
 
-	if h.nodes[first.id].raft.IsLeader() {
-		t.Skip("the first node regained leadership; this test needs it to stay a follower")
+		h.shutdown()
+		if attempt == attempts {
+			t.Fatalf("leadership-transfer premise failed in all %d attempts: %v", attempts, premiseErr)
+		}
+		t.Logf("attempt %d: %v; retrying with a fresh harness", attempt, premiseErr)
+		second = nil
 	}
 
 	// The committed log, read from the node that owns it.

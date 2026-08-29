@@ -77,7 +77,10 @@ func (f *fakeReplicator) reset() {
 // stubRaft satisfies RaftInterface. Only ID and CurrentTerm are exercised by
 // these tests; the RPC handlers are never reached because no Raft traffic is
 // generated.
-type stubRaft struct{ id string }
+type stubRaft struct {
+	id       string
+	noLeader bool
+}
 
 func (s stubRaft) HandleRequestVote(context.Context, *kvpb.RequestVoteRequest) (*kvpb.RequestVoteResponse, error) {
 	return nil, errors.New("stubRaft: not exercised")
@@ -97,9 +100,14 @@ func (s stubRaft) HandleInstallSnapshot(context.Context, *kvpb.InstallSnapshotRe
 
 func (s stubRaft) IsLeader() bool      { return true }
 func (s stubRaft) CurrentTerm() uint64 { return 1 }
-func (s stubRaft) Leader() string      { return s.id }
-func (s stubRaft) RoleString() string  { return "leader" }
-func (s stubRaft) ID() string          { return s.id }
+func (s stubRaft) Leader() string {
+	if s.noLeader {
+		return ""
+	}
+	return s.id
+}
+func (s stubRaft) RoleString() string { return "leader" }
+func (s stubRaft) ID() string         { return s.id }
 
 // ---------------------------------------------------------------------------
 // Harness

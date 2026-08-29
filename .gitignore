@@ -10,6 +10,8 @@ bin/
 *.test
 *.out
 coverage.html
+benchmark-results/
+dist/
 
 # macOS
 .DS_Store

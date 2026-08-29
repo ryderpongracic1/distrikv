@@ -19,9 +19,16 @@ GET    /keys/{key}
 DELETE /keys/{key}
 GET    /status       → {node_id, leader, term, role, key_count, key_count_approximate}
 GET    /metrics      → atomic counters (put_total, get_miss, wal_writes, raft_terms, …)
+GET    /metrics/prometheus → the same values in Prometheus text format
+GET    /healthz      → process liveness
+GET    /readyz       → 200 only after this node knows the Raft leader
 ```
 
 All error responses: `{"error": "..."}`.
+
+Every response includes `X-Request-ID`. A caller-supplied ID up to 128 bytes is
+preserved; otherwise the node generates one and includes it in structured
+request-completion logs.
 
 **`DELETE` is idempotent and never returns 404.** The storage engine writes tombstones blindly, so deleting a key that does not exist returns `200 {"status":"ok"}`. The previous behaviour — a `Get` before the `Delete` to synthesise a 404 — was removed because it was racy (another writer could insert or remove the key between the two calls, so the answer was never authoritative) and cost a full read-path traversal through the memtable, every L0 SSTable and L1 on every delete. This matches RocksDB, Cassandra and DynamoDB `DeleteItem`. `distrikv-cli delete <key>` therefore reports success for keys that were never there; use `get` first if you need to know.
 
@@ -35,6 +42,7 @@ export HTTP_ADDR=:8001
 export GRPC_ADDR=:9001
 export DATA_DIR=/tmp/distrikv
 export PEERS=""
+export REPLICA_COUNT=1
 
 mkdir -p /tmp/distrikv
 go run ./cmd/node
@@ -49,8 +57,7 @@ A first-class CLI tool that wraps the HTTP API — no direct gRPC, no internal i
 ### Install
 
 ```bash
-go install github.com/ryderpongracic1/distrikv/cmd/cli@latest
-# binary is named distrikv-cli
+go install github.com/ryderpongracic1/distrikv/cmd/distrikv-cli@latest
 ```
 
 Or build locally:
@@ -128,11 +135,11 @@ Errors always go to stderr — stdout is never polluted regardless of output mod
 ```bash
 docker compose -f docker/docker-compose.yml up
 
-# Using distrikv-cli (recommended):
-distrikv-cli put hello world
-distrikv-cli get hello
-distrikv-cli status --all --peers localhost:8002,localhost:8003
-distrikv-cli metrics --watch
+# Using the locally built CLI:
+./bin/distrikv-cli put hello world
+./bin/distrikv-cli get hello
+./bin/distrikv-cli status --all --peers localhost:8002,localhost:8003
+./bin/distrikv-cli metrics --watch
 
 # Or raw curl:
 curl -X PUT  localhost:8001/keys/hello -d '{"value":"world"}'

@@ -153,10 +153,14 @@ curl        localhost:8002/keys/hello
 curl        localhost:8001/status
 curl        localhost:8001/metrics
 
-# Or with the CLI
-distrikv-cli put hello world
-distrikv-cli status --all --peers localhost:8002,localhost:8003
+# Or with the locally built CLI
+./bin/distrikv-cli put hello world
+./bin/distrikv-cli status --all --peers localhost:8002,localhost:8003
 ```
+
+Run `make demo` for a complete build, readiness, replicated CRUD, status, and
+Prometheus smoke test. It leaves the cluster running and prints the cleanup
+command.
 
 **Benchmark it** — run the load generator from inside the cluster's network; a
 host port forward measures the plumbing, not the store:
@@ -206,6 +210,7 @@ The deep material lives in [`docs/`](docs/):
 | [raft.md](docs/raft.md) | Raft's scope: leader election, heartbeats, a complete §5.3/§5.4.2 log, and the node-health transitions it carries |
 | [chaos-harness.md](docs/chaos-harness.md) | The Porcupine model, the nemesis, the convergence gate, the counterexample output, and every measured run |
 | [benchmarks.md](docs/benchmarks.md) | Every table, including the etcd ceiling comparison with its durability confound stated rather than corrected |
+| [benchmarking-macos.md](docs/benchmarking-macos.md) | Reproducible Apple Silicon setup, workload matrix, artifact capture, and publication checklist |
 | [defect-log.md](docs/defect-log.md) | Fourteen real defects, numbered, with the evidence that exposed each one |
 | [api-and-cli.md](docs/api-and-cli.md) | The HTTP REST surface and `distrikv-cli` |
 | [development.md](docs/development.md) | Running the tests, repository layout, code-quality conventions |
@@ -241,4 +246,4 @@ fix, and the test that pins it.
 
 An audio overview of distrikv's distributed systems design — generated with [Google NotebookLM](https://notebooklm.google/). Thanks Google!
 
-[![distrikv NotebookLM overview](https://drive.google.com/thumbnail?id=12ibGA01jQrEr-3HEpLdM_G-kAlQxX379&sz=w1280)](https://drive.google.com/file/d/12ibGA01jQrEr-3HEpLdM_G-kAlQxX379/view?usp=sharing)
+[![distrikv NotebookLM overview](docs/assets/notebooklm-overview.jpg)](https://drive.google.com/file/d/12ibGA01jQrEr-3HEpLdM_G-kAlQxX379/view?usp=sharing)

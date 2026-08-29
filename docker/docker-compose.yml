@@ -20,6 +20,11 @@ services:
       - "9001:9001"
     volumes:
       - node1-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8001/readyz"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
 
   node2:
     build:
@@ -42,6 +47,11 @@ services:
       - "9002:9002"
     volumes:
       - node2-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8002/readyz"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
 
   node3:
     build:
@@ -64,6 +74,11 @@ services:
       - "9003:9003"
     volumes:
       - node3-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8003/readyz"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
 
 volumes:
   node1-data:

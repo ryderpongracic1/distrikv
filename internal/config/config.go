@@ -65,13 +65,13 @@ type PeerConfig struct {
 //	NODE_ID   — unique node name, e.g. "node1"
 //	HTTP_ADDR — HTTP listen address, e.g. ":8001"
 //	GRPC_ADDR — gRPC listen address, e.g. ":9001"
-//	WAL_PATH  — path to the WAL file, e.g. "/data/wal.log"
 //	DATA_DIR  — base directory for persistent state
 //	PEERS     — comma-separated "id=grpcaddr" pairs,
 //	            e.g. "node2=node2:9002,node3=node3:9003"
 //
 // Optional variables:
 //
+//	WAL_PATH               — legacy compatibility value; the LSM engine stores WAL segments under DATA_DIR
 //	REPLICA_COUNT          — default 2
 //	ELECTION_TIMEOUT_MIN   — default 150ms  (Go duration string)
 //	ELECTION_TIMEOUT_MAX   — default 300ms
@@ -154,6 +154,30 @@ func LoadFromEnv() (*Config, error) {
 	if cfg.ElectionTimeoutMin >= cfg.ElectionTimeoutMax {
 		return nil, fmt.Errorf("config: ELECTION_TIMEOUT_MIN (%v) must be less than ELECTION_TIMEOUT_MAX (%v)",
 			cfg.ElectionTimeoutMin, cfg.ElectionTimeoutMax)
+	}
+	if cfg.ElectionTimeoutMin <= 0 || cfg.ElectionTimeoutMax <= 0 || cfg.HeartbeatInterval <= 0 {
+		return nil, fmt.Errorf("config: Raft timing values must all be positive")
+	}
+	if cfg.HeartbeatInterval >= cfg.ElectionTimeoutMin {
+		return nil, fmt.Errorf("config: HEARTBEAT_INTERVAL (%v) must be less than ELECTION_TIMEOUT_MIN (%v)",
+			cfg.HeartbeatInterval, cfg.ElectionTimeoutMin)
+	}
+	if cfg.ReplicaCount > len(cfg.Peers)+1 {
+		return nil, fmt.Errorf("config: REPLICA_COUNT (%d) exceeds cluster size (%d)",
+			cfg.ReplicaCount, len(cfg.Peers)+1)
+	}
+
+	seenPeerIDs := map[string]bool{cfg.NodeID: true}
+	seenPeerAddrs := make(map[string]bool, len(cfg.Peers))
+	for _, peer := range cfg.Peers {
+		if seenPeerIDs[peer.ID] {
+			return nil, fmt.Errorf("config: duplicate or self PEERS id %q", peer.ID)
+		}
+		if seenPeerAddrs[peer.GRPCAddr] {
+			return nil, fmt.Errorf("config: duplicate PEERS address %q", peer.GRPCAddr)
+		}
+		seenPeerIDs[peer.ID] = true
+		seenPeerAddrs[peer.GRPCAddr] = true
 	}
 
 	return cfg, nil

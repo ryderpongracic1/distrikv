@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -13,7 +14,15 @@ import (
 	"github.com/ryderpongracic1/distrikv/internal/config"
 )
 
+// version is injected by release builds with -X main.version=<tag>.
+var version = "dev"
+
 func main() {
+	if len(os.Args) == 2 && (os.Args[1] == "version" || os.Args[1] == "--version") {
+		fmt.Printf("distrikv-node %s\n", version)
+		return
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -23,6 +32,18 @@ func main() {
 		logger.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
+	logger.Info("configuration loaded",
+		"version", version,
+		"node_id", cfg.NodeID,
+		"http_addr", cfg.HTTPAddr,
+		"grpc_addr", cfg.GRPCAddr,
+		"data_dir", cfg.DataDir,
+		"peer_count", len(cfg.Peers),
+		"replica_count", cfg.ReplicaCount,
+		"election_timeout_min", cfg.ElectionTimeoutMin,
+		"election_timeout_max", cfg.ElectionTimeoutMax,
+		"heartbeat_interval", cfg.HeartbeatInterval,
+	)
 
 	// Top-level context — cancelled on SIGINT or SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

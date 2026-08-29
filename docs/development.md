@@ -37,7 +37,7 @@ distrikv/
 │   ├── node/
 │   │   ├── main.go          # Entrypoint: config → Node → Run
 │   │   └── node.go          # Node struct: wires all subsystems, owns shutdown order
-│   ├── cli/
+│   ├── distrikv-cli/
 │   │   └── main.go          # distrikv-cli entrypoint (ldflags version injection)
 │   ├── bench/
 │   │   └── main.go          # Open-loop load generator; HDR histograms + engine counters

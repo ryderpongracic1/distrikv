@@ -155,9 +155,8 @@ func TestGetCmd_BadArgs_None(t *testing.T) {
 
 // ── put ───────────────────────────────────────────────────────────────────────
 
-// withStdinPipe replaces os.Stdin with a pipe that delivers content,
-// restoring the original on cleanup. Test processes run without a terminal
-// so the put command always reads from stdin; positional args cannot be used.
+// withStdinPipe replaces os.Stdin with a pipe that delivers content and restores
+// the original on cleanup.
 func withStdinPipe(t *testing.T, content string) {
 	t.Helper()
 	r, w, err := os.Pipe()
@@ -188,6 +187,26 @@ func TestPutCmd_StdinValue(t *testing.T) {
 	assert.Equal(t, "bar", gotVal)
 	assert.Contains(t, out.String(), "foo")
 	assert.Contains(t, out.String(), "bar")
+}
+
+func TestPutCmd_PositionalValueWinsWithNonTerminalStdin(t *testing.T) {
+	withStdinPipe(t, "ignored-pipe-value\n")
+	var got string
+	c, _, _ := newTestCLI(&mockClient{
+		putFn: func(_ context.Context, key, value string) error {
+			got = value
+			return nil
+		},
+	})
+	c.Root().SetArgs([]string{"put", "foo", "explicit"})
+	require.NoError(t, c.Execute())
+	assert.Equal(t, "explicit", got)
+}
+
+func TestPutCmd_TooManyArgs(t *testing.T) {
+	c, _, _ := newTestCLI(&mockClient{})
+	c.Root().SetArgs([]string{"put", "foo", "bar", "extra"})
+	extractCLIError(t, c.Execute(), cli.ExitBadArgs)
 }
 
 func TestPutCmd_ServerError(t *testing.T) {

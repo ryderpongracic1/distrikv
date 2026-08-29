@@ -26,26 +26,23 @@ Value can be provided as a positional argument or piped via stdin:
 }
 
 func (c *CLI) runPut(cmd *cobra.Command, args []string) error {
-	if len(args) < 1 {
-		return badArgs("put requires at least 1 argument (key)")
+	if len(args) < 1 || len(args) > 2 {
+		return badArgs("put requires <key> <value>, or <key> with a value piped via stdin")
 	}
 	key := args[0]
 
-	stdinIsPipe := !isTerminal(int(os.Stdin.Fd()))
-
-	if stdinIsPipe && len(args) > 1 {
-		return badArgs("value must come from stdin or positional argument, not both")
-	}
-
 	var value string
-	if stdinIsPipe {
+	if len(args) == 2 {
+		// Prefer an explicit positional value even when stdin is not a terminal.
+		// CI runners and shell scripts commonly attach /dev/null as stdin; treating
+		// that as piped data made the documented form unusable outside a TTY.
+		value = args[1]
+	} else if !isTerminal(int(os.Stdin.Fd())) {
 		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return &CLIError{Msg: "failed to read stdin: " + err.Error(), Code: ExitServerError}
 		}
 		value = strings.TrimRight(string(data), "\r\n")
-	} else if len(args) >= 2 {
-		value = args[1]
 	} else {
 		return badArgs("put requires a value argument (or pipe via stdin)")
 	}

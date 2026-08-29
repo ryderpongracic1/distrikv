@@ -54,3 +54,29 @@ jobs:
 
       - name: Test (race detector)
         run: go test ./... -race -count=1
+
+  compose-smoke:
+    name: three-node Docker smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build cluster and exercise CLI
+        run: ./scripts/quickstart.sh
+
+      - name: Show cluster logs on failure
+        if: failure()
+        run: docker compose -f docker/docker-compose.yml logs --no-color --tail=200
+
+      - name: Stop cluster
+        if: always()
+        run: docker compose -f docker/docker-compose.yml down -v

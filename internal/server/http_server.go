@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -85,10 +87,13 @@ func NewHTTPServer(
 	mux.HandleFunc("DELETE /keys/{key}", h.handleDelete)
 	mux.HandleFunc("GET /status", h.handleStatus)
 	mux.HandleFunc("GET /metrics", h.handleMetrics)
+	mux.HandleFunc("GET /metrics/prometheus", h.handlePrometheusMetrics)
+	mux.HandleFunc("GET /healthz", h.handleHealth)
+	mux.HandleFunc("GET /readyz", h.handleReady)
 
 	h.srv = &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      h.withRequestLogging(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
@@ -262,6 +267,10 @@ func (h *HTTPServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // handleMetrics implements GET /metrics
 func (h *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, h.metricsSnapshot())
+}
+
+func (h *HTTPServer) metricsSnapshot() map[string]uint64 {
 	snap := h.metrics.Snapshot()
 	snap["key_count"] = uint64(h.store.KeyCount())
 	snap["raft_term"] = h.raft.CurrentTerm()
@@ -272,7 +281,107 @@ func (h *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	snap["delete_total"] = dels
 	snap["wal_writes"] = walWrites
 
-	writeJSON(w, snap)
+	return snap
+}
+
+// handlePrometheusMetrics exposes the same values as /metrics in Prometheus's
+// text exposition format. The JSON endpoint remains stable for the CLI and
+// benchmark harness.
+func (h *HTTPServer) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
+	snap := h.metricsSnapshot()
+	keys := make([]string, 0, len(snap))
+	for key := range snap {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	for _, key := range keys {
+		metricType := "counter"
+		if prometheusGaugeMetrics[key] {
+			metricType = "gauge"
+		}
+		name := "distrikv_" + key
+		fmt.Fprintf(w, "# TYPE %s %s\n%s %d\n", name, metricType, name, snap[key])
+	}
+}
+
+var prometheusGaugeMetrics = map[string]bool{
+	"anti_entropy_full_sync_required": true,
+	"key_count":                       true,
+	"l0_file_count":                   true,
+	"raft_last_applied_index":         true,
+	"raft_term":                       true,
+	"replica_epoch_regressed":         true,
+	"write_amp_factor_milli":          true,
+}
+
+func (h *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]string{"status": "ok", "node_id": h.raft.ID()})
+}
+
+func (h *HTTPServer) handleReady(w http.ResponseWriter, r *http.Request) {
+	leader := h.raft.Leader()
+	if leader == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "not_ready", "reason": "raft leader unknown"})
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ready", "node_id": h.raft.ID(), "leader": leader})
+}
+
+type responseStatusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *responseStatusWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *responseStatusWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (h *HTTPServer) withRequestLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := r.Header.Get("X-Request-ID")
+		if requestID == "" || len(requestID) > 128 {
+			requestID = newRequestID()
+		}
+		w.Header().Set("X-Request-ID", requestID)
+
+		start := time.Now()
+		observed := &responseStatusWriter{ResponseWriter: w}
+		next.ServeHTTP(observed, r)
+		status := observed.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		h.logger.Info("request completed",
+			"request_id", requestID,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", status,
+			"duration", time.Since(start),
+		)
+	})
+}
+
+func newRequestID() string {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err == nil {
+		return fmt.Sprintf("%x", id[:])
+	}
+	return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
 }
 
 // ---------------------------------------------------------------------------

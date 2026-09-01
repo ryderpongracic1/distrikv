@@ -722,6 +722,90 @@ Three things the Mac validation adds over the DevSpaces measurement (below):
    forward hop, not by cache hits/misses. Cache misses trade a `ReadAt` syscall
    for a sharded map lookup but both are sub-microsecond relative to the network.
 
+#### Repetition (2026-09-01, same three patterns, fresh volumes, 500k-key prefill)
+
+A second run of the configuration above, following the
+[macOS runbook](benchmarking-macos.md) §5 rather than the ad-hoc command in the
+code block. It is recorded here because the checklist in that runbook asks for
+repetitions, and because two of its numbers diverge from the first run in ways
+worth keeping.
+
+**Provenance, stated rather than implied.** These figures were produced and
+reported by a separate measurement session; the raw JSON, stderr and cluster
+logs were written to a local result directory that was **not archived into this
+repository**. What follows is the reported summary, not a re-derivation from
+retained artifacts. Treat it as a second observation of the same configuration —
+enough to say the first run reproduces, not enough to satisfy the runbook's
+archival bullet.
+
+Prefill phase — 500,000 keys × 256 B, written once each:
+
+| Prefill | This run | 2026-08-17 |
+| --- | ---: | ---: |
+| Keys written / failed | 500,000 / **0** | 500,000 / 0 |
+| Throughput | 1,655 keys/s | 3,071 keys/s |
+| `compactions_total` | **5** | 6 |
+| Flushed data | 100.6 MB | — |
+| Compacted data | 274.3 MB | 314.5 MB |
+| Write amplification (WAF) | **3.727×** | 4.28× |
+| Retries / failures | 194 / **0** | 0 / 0 |
+
+The 194 retries are transient `503 ErrWriteStalled` backpressure absorbed by the
+prefill's retry budget, which is what that budget is for; zero keys failed, so
+the read windows measure a fully written keyspace. Replica key counts summed to
+345,856 + 344,026 + 310,118 = **1,000,000**, exactly 500,000 keys at RF=2, and
+all nodes reported the same leader and term with no full-sync or epoch-regression
+flags.
+
+Read phase — 60 s read-only windows at 4,000 QPS target, 0 errors and no
+saturation on all three, achieved QPS within 0.25% of target:
+
+| Read pattern | Achieved QPS | p50 | p99 | p999 | **cache hit rate** | 08-17 hit rate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Zipf, 500k present keys | 4,005 | 0.726 ms | 2.843 ms | 3.871 ms | **97.53%** | 97.2% |
+| Uniform, 500k present keys | 4,010 | 0.760 ms | 3.079 ms | 19.375 ms | **71.41%** | 70.9% |
+| Uniform, 1M range / ~50% absent | 3,996 | 0.749 ms | 2.991 ms | 11.207 ms | 70.98% | 71.1% |
+
+The negative-lookup window saw 39,775 misses across 79,385 node1 reads (50.1%,
+matching the intended half-absent keyspace), 191,879 `bloom_misses`, and 4
+false positives — a `bloom_fp_rate` of **0.0103%**, two orders of magnitude
+under the 1% design target and consistent with the 0.01% the first run reported.
+
+**What reproduces.** All three cache hit rates land within 0.6 points of the
+first run, in the same order, and the Zipf-vs-uniform gap is 26 points both
+times. The FP rate agrees. Prefill integrity and replica accounting are exact.
+On the engine ratios this configuration is repeatable.
+
+**Two divergences that are not explained here.**
+
+1. **Prefill throughput is 1.86× lower** (1,655 vs 3,071 keys/s) with a *lower*
+   WAF (3.727× vs 4.28×) and one fewer compaction. Lower write amplification
+   would ordinarily accompany *more* throughput, not less, so the two runs
+   differ in something the summary does not capture — most likely host state
+   (thermal, page cache, or competing load), which neither run recorded. This
+   is why the runbook asks for an environment capture beside every series.
+2. **`bloom_misses` is 4.8× higher** on the negative window (191,879 vs 39,755)
+   while `bloom_hits` is essentially unchanged (~38.8k vs 39.1k). That
+   asymmetry is informative: a present key stops at the first filter that says
+   *maybe*, so it costs about one probe, while an absent key is probed against
+   every live SSTable. Misses per absent read therefore approximate the number
+   of SSTables consulted — about 1.0 in the first run against about 4.8 here.
+   The plausible reading is that the first run's six compactions had merged the
+   set down to roughly one file by the measurement window, while this run's five
+   left more L0 residency. That is a hypothesis consistent with both summaries,
+   **not a measurement**: neither run recorded `l0_file_count` at the start of
+   the read window, which is the counter that would settle it. Record it next
+   time.
+
+Neither divergence touches the hit-rate or FP conclusions, which are ratios
+taken within a single run.
+
+**Publication status: n=2, not publishable as a median.** The runbook's
+checklist asks for three repetitions from fresh volumes with raw artifacts
+archived. This series brings the configuration to two observations with no
+archived artifacts, so these numbers may be cited individually, labelled by
+date, but must not be averaged into a README table yet.
+
 #### Earlier measurement (2026-08-17, 3-node cluster, Linux dev container, 200k-key prefill)
 
 **Read this table for the engine ratios, not for throughput.** All three nodes

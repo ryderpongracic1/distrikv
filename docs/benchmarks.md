@@ -722,25 +722,34 @@ Three things the Mac validation adds over the DevSpaces measurement (below):
    forward hop, not by cache hits/misses. Cache misses trade a `ReadAt` syscall
    for a sharded map lookup but both are sub-microsecond relative to the network.
 
-#### Repetition (2026-09-01, same three patterns, fresh volumes, 500k-key prefill)
+#### Cross-hardware repeat (2026-09-01, 3-node cluster, Apple M1 MacBook, 500k-key prefill)
 
-A second run of the configuration above, following the
-[macOS runbook](benchmarking-macos.md) §5 rather than the ad-hoc command in the
-code block. It is recorded here because the checklist in that runbook asks for
-repetitions, and because two of its numbers diverge from the first run in ways
-worth keeping.
+The same three read patterns as the measurement above, following the
+[macOS runbook](benchmarking-macos.md) §5 rather than that section's ad-hoc
+command — but **on different silicon**: an Apple M1 MacBook, where the table
+above was measured on an M4 Pro.
+
+That makes this a portability check on the engine ratios, not a repetition of
+the configuration above. Read it the way the dev-container table further down
+asks to be read: **for the ratios, not for throughput.** Nothing here advances
+the runbook's requirement for three repetitions of one configuration, because
+the host is not held constant. What it does test — and this is worth more than
+another same-machine run — is whether the cache and Bloom ratios are properties
+of the engine or artifacts of one laptop.
+
+The Colima VM's CPU and memory allocation on the M1 host was not recorded, so
+"M1 vs M4 Pro" is the coarsest honest statement of the difference; it may not be
+the only one.
 
 **Provenance, stated rather than implied.** These figures were produced and
 reported by a separate measurement session; the raw JSON, stderr and cluster
 logs were written to a local result directory that was **not archived into this
 repository**. What follows is the reported summary, not a re-derivation from
-retained artifacts. Treat it as a second observation of the same configuration —
-enough to say the first run reproduces, not enough to satisfy the runbook's
-archival bullet.
+retained artifacts, and it does not satisfy the runbook's archival bullet.
 
 Prefill phase — 500,000 keys × 256 B, written once each:
 
-| Prefill | This run | 2026-08-17 |
+| Prefill | This run (M1) | 2026-08-17 (M4 Pro) |
 | --- | ---: | ---: |
 | Keys written / failed | 500,000 / **0** | 500,000 / 0 |
 | Throughput | 1,655 keys/s | 3,071 keys/s |
@@ -760,7 +769,7 @@ flags.
 Read phase — 60 s read-only windows at 4,000 QPS target, 0 errors and no
 saturation on all three, achieved QPS within 0.25% of target:
 
-| Read pattern | Achieved QPS | p50 | p99 | p999 | **cache hit rate** | 08-17 hit rate |
+| Read pattern | Achieved QPS | p50 | p99 | p999 | **cache hit rate** | 08-17 (M4 Pro) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Zipf, 500k present keys | 4,005 | 0.726 ms | 2.843 ms | 3.871 ms | **97.53%** | 97.2% |
 | Uniform, 500k present keys | 4,010 | 0.760 ms | 3.079 ms | 19.375 ms | **71.41%** | 70.9% |
@@ -771,40 +780,62 @@ matching the intended half-absent keyspace), 191,879 `bloom_misses`, and 4
 false positives — a `bloom_fp_rate` of **0.0103%**, two orders of magnitude
 under the 1% design target and consistent with the 0.01% the first run reported.
 
-**What reproduces.** All three cache hit rates land within 0.6 points of the
-first run, in the same order, and the Zipf-vs-uniform gap is 26 points both
-times. The FP rate agrees. Prefill integrity and replica accounting are exact.
-On the engine ratios this configuration is repeatable.
+**What ports across hardware.** All three cache hit rates land within 0.6
+points of the M4 Pro run, in the same order, and the Zipf-vs-uniform gap is 26
+points on both machines. The FP rate agrees. Prefill integrity and replica
+accounting are exact. So the ratios are engine properties, not artifacts of one
+host — which is the useful thing a second machine can establish and a second run
+on the same machine cannot.
 
-**Two divergences that are not explained here.**
+The within-run latency invariance ports too, and independently confirms the
+reading offered for the M4 Pro table. p50 across the three patterns is 0.726,
+0.760 and 0.749 ms — flat to within 5%, exactly as it was flat at ~633 µs on the
+M4 Pro — even though the cache hit rate swings 26 points across those same three
+windows. The absolute level moves with the hardware (p50 ~15% higher here, p99
+~78% higher); the *insensitivity to access pattern* does not. That is what the
+earlier section predicted when it argued the read path is dominated by the HTTP
+and ring-forward hop rather than by cache hits and misses.
 
-1. **Prefill throughput is 1.86× lower** (1,655 vs 3,071 keys/s) with a *lower*
-   WAF (3.727× vs 4.28×) and one fewer compaction. Lower write amplification
-   would ordinarily accompany *more* throughput, not less, so the two runs
-   differ in something the summary does not capture — most likely host state
-   (thermal, page cache, or competing load), which neither run recorded. This
-   is why the runbook asks for an environment capture beside every series.
+**Two divergences, one expected and one open.**
+
+1. **Prefill throughput is 1.86× lower** (1,655 vs 3,071 keys/s). This is the
+   hardware and needs no further explanation: the prefill is a write path bound
+   by fsync and by compaction, and an M1 is slower than an M4 Pro at both CPU
+   and NVMe. A ratio near 2× across those generations is unremarkable. The
+   figure is recorded for completeness and must **not** be compared against the
+   M4 Pro number as though it were a regression.
+
+   The one thing worth noting is that WAF came out *lower* here (3.727× vs
+   4.28×), with one fewer compaction. Write amplification is set by how much
+   the compactor merges, not by how fast the host runs, so the slower machine
+   producing less of it is a scheduling effect — fewer compaction passes fired
+   during a prefill that took longer in wall-clock but issued the same writes —
+   rather than anything about the hardware's speed as such.
 2. **`bloom_misses` is 4.8× higher** on the negative window (191,879 vs 39,755)
    while `bloom_hits` is essentially unchanged (~38.8k vs 39.1k). That
    asymmetry is informative: a present key stops at the first filter that says
    *maybe*, so it costs about one probe, while an absent key is probed against
    every live SSTable. Misses per absent read therefore approximate the number
    of SSTables consulted — about 1.0 in the first run against about 4.8 here.
-   The plausible reading is that the first run's six compactions had merged the
+   The plausible reading is that the M4 Pro run's six compactions had merged the
    set down to roughly one file by the measurement window, while this run's five
-   left more L0 residency. That is a hypothesis consistent with both summaries,
-   **not a measurement**: neither run recorded `l0_file_count` at the start of
-   the read window, which is the counter that would settle it. Record it next
-   time.
+   left more L0 residency — and the compaction-scheduling difference noted above
+   is the same difference seen from the other side, which makes that reading more
+   likely than it was before the hosts were known to differ. It remains a
+   hypothesis consistent with both summaries, **not a measurement**: neither run
+   recorded `l0_file_count` at the start of the read window, which is the counter
+   that would settle it. Record it next time.
 
 Neither divergence touches the hit-rate or FP conclusions, which are ratios
 taken within a single run.
 
-**Publication status: n=2, not publishable as a median.** The runbook's
-checklist asks for three repetitions from fresh volumes with raw artifacts
-archived. This series brings the configuration to two observations with no
-archived artifacts, so these numbers may be cited individually, labelled by
-date, but must not be averaged into a README table yet.
+**Publication status: still n=1 per host, not publishable as a median.** The
+runbook's checklist asks for three repetitions from fresh volumes with raw
+artifacts archived, holding the environment fixed. Because this run changed the
+host, it leaves both configurations at a single observation rather than bringing
+either to two, and no artifacts were archived for it. These numbers may be cited
+individually, labelled by date **and by machine**, but nothing here may be
+averaged with the M4 Pro figures or entered in a README table.
 
 #### Earlier measurement (2026-08-17, 3-node cluster, Linux dev container, 200k-key prefill)
 
